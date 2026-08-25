@@ -23,6 +23,34 @@ class InitRepositoryTests(unittest.TestCase):
             self.repository,
             ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"),
         )
+        (self.repository / ".ephy" / "project.yaml").write_text(
+            """schema_version: 1
+
+project:
+  id: "ephy-repository-template"
+  family: "ephy"
+  type: "template"
+  status: "active"
+  visibility: "private"
+  description: "Test template identity"
+
+relations:
+  parent: "ephy"
+  depends_on: []
+  integrates_with: []
+  runs_on: []
+
+data_policy:
+  classification: "internal"
+  personal_data_in_git: "prohibited"
+  secrets_in_git: "prohibited"
+""",
+            encoding="utf-8",
+        )
+        (self.repository / "README.md").write_text(
+            "<!-- ephy-template-source -->\n# Ephy Repository Template\n",
+            encoding="utf-8",
+        )
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
@@ -106,6 +134,46 @@ class InitRepositoryTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("invalid choice", result.stderr)
         self.assertEqual(metadata_path.read_bytes(), before)
+
+    def test_root_meta_project_can_be_initialized_without_parent(self) -> None:
+        arguments = self.valid_arguments("ephy")
+        arguments[arguments.index("extension")] = "meta"
+        result = self.run_init(*arguments, "--no-parent")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        metadata = (self.repository / ".ephy" / "project.yaml").read_text(
+            encoding="utf-8"
+        )
+        readme = (self.repository / "README.md").read_text(encoding="utf-8")
+        self.assertIn("parent: null", metadata)
+        self.assertIn("None — ecosystem root", readme)
+
+        validation = subprocess.run(
+            [
+                sys.executable,
+                str(VALIDATE_SCRIPT),
+                "--root",
+                str(self.repository),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(validation.returncode, 0, validation.stderr)
+
+    def test_parent_and_no_parent_are_mutually_exclusive(self) -> None:
+        arguments = self.valid_arguments("ephy")
+        arguments[arguments.index("extension")] = "meta"
+        result = self.run_init(
+            *arguments, "--parent", "ephy-root", "--no-parent"
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not allowed with argument", result.stderr)
+
+    def test_self_parent_is_rejected(self) -> None:
+        result = self.run_init(*self.valid_arguments("ephy"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must not reference the project itself", result.stderr)
 
     def test_reinitialization_requires_force(self) -> None:
         first = self.run_init(*self.valid_arguments("ephy-first"))

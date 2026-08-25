@@ -192,7 +192,11 @@ def write_atomic(path: Path, content: str) -> None:
 
 def initialize(root: Path, args: argparse.Namespace) -> None:
     project_id = validate_identifier(args.project_id, "project ID")
-    parent = validate_identifier(args.parent, "parent")
+    parent = None if args.no_parent else validate_identifier(args.parent, "parent")
+    if parent == project_id:
+        raise InitializationError("parent must not reference the project itself")
+    if parent is None and args.project_type != "meta":
+        raise InitializationError("--no-parent is reserved for an ecosystem root meta project")
     description = validate_text(args.description, "description")
     depends_on = validate_relation_list(args.depends_on, "depends_on")
     integrates_with = validate_relation_list(
@@ -254,7 +258,9 @@ def initialize(root: Path, args: argparse.Namespace) -> None:
         "@@PROJECT_TYPE@@": args.project_type,
         "@@PROJECT_STATUS@@": args.status,
         "@@PROJECT_VISIBILITY@@": args.visibility,
-        "@@PROJECT_PARENT@@": parent,
+        "@@PROJECT_PARENT@@": (
+            "None — ecosystem root" if parent is None else parent
+        ),
         "@@DEPENDS_ON_MARKDOWN@@": markdown_relation_list(depends_on),
         "@@INTEGRATES_WITH_MARKDOWN@@": markdown_relation_list(integrates_with),
         "@@RUNS_ON_MARKDOWN@@": markdown_relation_list(runs_on),
@@ -287,7 +293,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--status", choices=PROJECT_STATUSES, default="active")
     parser.add_argument("--visibility", choices=VISIBILITIES, default="private")
     parser.add_argument("--classification", choices=DATA_CLASSIFICATIONS, default="internal")
-    parser.add_argument("--parent", default="ephy")
+    parent_group = parser.add_mutually_exclusive_group()
+    parent_group.add_argument("--parent", default="ephy")
+    parent_group.add_argument(
+        "--no-parent",
+        action="store_true",
+        help="set relations.parent to null for an ecosystem root meta project",
+    )
     parser.add_argument("--depends-on", action="append", default=[], metavar="PROJECT_ID")
     parser.add_argument(
         "--integrates-with", action="append", default=[], metavar="PROJECT_ID"

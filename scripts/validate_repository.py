@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 import re
 import sys
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from init_repository import (
     DATA_CLASSIFICATIONS,
@@ -199,6 +199,37 @@ def validate_id_list(value: Any, field: str, errors: list[str]) -> None:
         validate_id(item, f"{field}[{index}]", errors)
 
 
+def validate_parent_graph(parents: Mapping[str, str | None]) -> list[str]:
+    """Detect invalid self-parents and cycles in a project-to-parent mapping."""
+    errors: list[str] = []
+    for project_id, parent in sorted(parents.items()):
+        if parent == project_id:
+            errors.append(f"parent graph: {project_id} must not reference itself")
+
+    visited: set[str] = set()
+    for start in sorted(parents):
+        if start in visited:
+            continue
+        path: list[str] = []
+        positions: dict[str, int] = {}
+        current: str | None = start
+        while current is not None and current in parents:
+            if current in positions:
+                cycle = path[positions[current]:] + [current]
+                if len(cycle) > 2:
+                    errors.append(
+                        "parent graph: cycle detected: " + " -> ".join(cycle)
+                    )
+                break
+            if current in visited:
+                break
+            positions[current] = len(path)
+            path.append(current)
+            current = parents[current]
+        visited.update(path)
+    return errors
+
+
 def validate_metadata(path: Path) -> list[str]:
     try:
         text = path.read_text(encoding="utf-8")
@@ -224,7 +255,14 @@ def validate_metadata(path: Path) -> list[str]:
     if not isinstance(description, str) or not description.strip():
         errors.append("project.yaml: project.description must be a non-empty string")
 
-    validate_id(relations.get("parent"), "relations.parent", errors)
+    parent = relations.get("parent")
+    if parent is not None:
+        validate_id(parent, "relations.parent", errors)
+    project_id = project.get("id")
+    if isinstance(project_id, str) and (
+        parent is None or isinstance(parent, str)
+    ):
+        errors.extend(validate_parent_graph({project_id: parent}))
     for field in ("depends_on", "integrates_with", "runs_on"):
         validate_id_list(relations.get(field), f"relations.{field}", errors)
 
@@ -326,6 +364,12 @@ def validate_schema(path: Path) -> list[str]:
         errors.append("project.schema.json: project ID pattern differs from tooling")
     if project_id_list.get("uniqueItems") is not True:
         errors.append("project.schema.json: relationship lists must use uniqueItems")
+    parent_variants = relations.get("parent", {}).get("oneOf", [])
+    if {json.dumps(variant, sort_keys=True) for variant in parent_variants} != {
+        json.dumps({"$ref": "#/$defs/projectId"}, sort_keys=True),
+        json.dumps({"type": "null"}, sort_keys=True),
+    }:
+        errors.append("project.schema.json: relations.parent must allow project ID or null")
     for field in ("personal_data_in_git", "secrets_in_git"):
         if data_policy.get(field, {}).get("const") != "prohibited":
             errors.append(f"project.schema.json: data_policy.{field} must be prohibited")
