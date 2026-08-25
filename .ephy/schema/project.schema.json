@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/kirimine170/Ephy-Repository-Template/blob/main/.ephy/schema/project.schema.json",
+  "$id": "https://github.com/kirimine170/ephy-repository-template/blob/main/.ephy/schema/project.schema.json",
   "title": "Ephy project metadata",
   "description": "Metadata declared by an Ephy ecosystem repository.",
   "type": "object",
@@ -79,7 +79,14 @@
       ],
       "properties": {
         "parent": {
-          "$ref": "#/$defs/projectId"
+          "oneOf": [
+            {
+              "$ref": "#/$defs/projectId"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "depends_on": {
           "$ref": "#/$defs/projectIdList"

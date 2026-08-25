@@ -6,7 +6,7 @@
 
 ## Fields
 
-- `relations.parent` identifies the logical parent project．It does not imply Git nesting or a submodule．
+- `relations.parent` identifies the logical parent project．It does not imply Git nesting or a submodule．The ecosystem root meta project uses `null` and every other project uses a project ID．A project cannot be its own parent，and parent cycles are invalid．
 - `relations.depends_on` lists repositories whose APIs，artifacts，or behavior are direct requirements．
 - `relations.integrates_with` lists direct peers connected through an integration boundary．
 - `relations.runs_on` lists direct runtime or platform relationships．

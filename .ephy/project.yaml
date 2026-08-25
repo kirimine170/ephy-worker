@@ -1,16 +1,16 @@
 schema_version: 1
 
 project:
-  id: "ephy-repository-template"
+  id: "ephy-worker"
   family: "ephy"
-  type: "template"
-  status: "active"
-  visibility: "private"
-  description: "Base repository template for the Ephy ecosystem"
+  type: "core"
+  status: "design"
+  visibility: "public"
+  description: "Remote worker node for executing authorized Ephy jobs on independent PCs"
 
 relations:
   parent: "ephy"
-  depends_on: []
+  depends_on: ["ephy-runtime"]
   integrates_with: []
   runs_on: []
 

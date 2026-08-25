@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -10,6 +11,9 @@ import unittest
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 VALIDATE_SCRIPT = REPOSITORY_ROOT / "scripts" / "validate_repository.py"
+sys.path.insert(0, str(REPOSITORY_ROOT / "scripts"))
+
+from validate_repository import validate_parent_graph
 
 
 class ValidateRepositoryTests(unittest.TestCase):
@@ -49,7 +53,7 @@ class ValidateRepositoryTests(unittest.TestCase):
         metadata_path = self.repository / ".ephy" / "project.yaml"
         metadata = metadata_path.read_text(encoding="utf-8")
         metadata_path.write_text(
-            metadata.replace('type: "template"', 'type: "unknown"'),
+            re.sub(r'^  type: .+$', '  type: "unknown"', metadata, count=1, flags=re.MULTILINE),
             encoding="utf-8",
         )
         result = self.run_validator()
@@ -69,6 +73,34 @@ class ValidateRepositoryTests(unittest.TestCase):
         result = self.run_validator()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("personal_data_in_git must be prohibited", result.stderr)
+
+    def test_self_parent_is_detected(self) -> None:
+        metadata_path = self.repository / ".ephy" / "project.yaml"
+        metadata = metadata_path.read_text(encoding="utf-8")
+        project_id = re.search(r'^  id: "([^"]+)"$', metadata, re.MULTILINE)
+        self.assertIsNotNone(project_id)
+        metadata_path.write_text(
+            re.sub(
+                r'^  parent: .+$',
+                f'  parent: "{project_id.group(1)}"',
+                metadata,
+                count=1,
+                flags=re.MULTILINE,
+            ),
+            encoding="utf-8",
+        )
+        result = self.run_validator()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must not reference itself", result.stderr)
+
+    def test_parent_cycle_is_detected(self) -> None:
+        errors = validate_parent_graph(
+            {"ephy-a": "ephy-b", "ephy-b": "ephy-c", "ephy-c": "ephy-a"}
+        )
+        self.assertEqual(
+            errors,
+            ["parent graph: cycle detected: ephy-a -> ephy-b -> ephy-c -> ephy-a"],
+        )
 
     def test_missing_readme_section_is_detected(self) -> None:
         readme_path = self.repository / "README.md"
