@@ -1,0 +1,47 @@
+name: Feature request
+description: Propose a user-facing or implementation capability
+title: "[Feature]: "
+labels: []
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the concrete need or limitation．
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe observable behavior，not an unsupported deadline or progress estimate．
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach
+      description: Separate confirmed requirements from optional implementation ideas．
+  - type: textarea
+    id: non-goals
+    attributes:
+      label: Non-goals
+  - type: textarea
+    id: related-repositories
+    attributes:
+      label: Related repositories
+      description: Identify direct relationship or contract changes．
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: List testable completion conditions．
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Data safety
+      options:
+        - label: This request contains no secrets，personal data，raw conversations，or production data．
+          required: true

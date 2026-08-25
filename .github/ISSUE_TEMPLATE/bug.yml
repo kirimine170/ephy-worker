@@ -1,0 +1,60 @@
+name: Bug report
+description: Report reproducible behavior that differs from the current contract
+title: "[Bug]: "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: Thank you for helping improve this Ephy repository．Do not include secrets，personal data，or production records．
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Describe the observed problem and its impact．
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Provide the smallest safe，repeatable example．
+      placeholder: |
+        1. Configure ...
+        2. Run ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Provide a release version or commit identifier when available．
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include relevant operating system，runtime，and hardware details without sensitive values．
+  - type: textarea
+    id: related-repositories
+    attributes:
+      label: Related repositories
+      description: List only repositories directly related to this bug．
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Data safety
+      options:
+        - label: I removed secrets，personal data，raw conversations，and production data from this report．
+          required: true

@@ -1,0 +1,57 @@
+# Operating systems and editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+secrets/
+
+# Local，sensitive，or large data
+local-data/
+data/raw/
+datasets/
+captures/
+camera-captures/
+master-images/
+training-data/
+models/
+weights/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.gguf
+
+# Generated output
+build/
+dist/
+generated/
+coverage/
+htmlcov/
+*.log
+
+# Explicitly permit safe examples and anonymized fixtures
+!.env.example
+!tests/fixtures/
+!tests/fixtures/**

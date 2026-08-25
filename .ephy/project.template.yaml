@@ -1,0 +1,20 @@
+schema_version: 1
+
+project:
+  id: "@@PROJECT_ID@@"
+  family: "ephy"
+  type: "@@PROJECT_TYPE@@"
+  status: "@@PROJECT_STATUS@@"
+  visibility: "@@PROJECT_VISIBILITY@@"
+  description: "@@PROJECT_DESCRIPTION@@"
+
+relations:
+  parent: "@@PROJECT_PARENT@@"
+  depends_on: "@@DEPENDS_ON@@"
+  integrates_with: "@@INTEGRATES_WITH@@"
+  runs_on: "@@RUNS_ON@@"
+
+data_policy:
+  classification: "@@DATA_CLASSIFICATION@@"
+  personal_data_in_git: "prohibited"
+  secrets_in_git: "prohibited"

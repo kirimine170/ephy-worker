@@ -1,0 +1,61 @@
+name: Architecture or design proposal
+description: Propose a durable architecture，interface，data，or responsibility decision
+title: "[Design]: "
+labels: []
+body:
+  - type: textarea
+    id: background
+    attributes:
+      label: Background
+      description: Describe the implementation state and relevant context．
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: Define the problem independently of the preferred solution．
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Describe the design，interfaces，data flow，and alternatives considered．
+    validations:
+      required: true
+  - type: textarea
+    id: boundaries
+    attributes:
+      label: Responsibility boundaries
+      description: State what this repository owns and what remains elsewhere．
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security and data impact
+      description: Cover access，data classification，personal data，secrets，storage，and distribution．
+    validations:
+      required: true
+  - type: textarea
+    id: related-repositories
+    attributes:
+      label: Related repositories
+      description: List directly affected repositories and required metadata or contract changes．
+    validations:
+      required: true
+  - type: textarea
+    id: completion
+    attributes:
+      label: Completion criteria
+      description: List observable tests，documentation，and decision-record updates．
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Data safety
+      options:
+        - label: This proposal contains no secrets，personal data，raw conversations，or production data．
+          required: true
