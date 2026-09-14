@@ -15,3 +15,7 @@ Create an ADR when a change establishes a durable architecture，data，security
 5. Commit the ADR with the implementation or with the design change that makes the decision operative．
 
 Valid status labels are `Proposed`，`Accepted`，`Deprecated`，and `Superseded`．An ADR date records the decision or proposal date; it is not a delivery deadline．
+
+## Records
+
+- [ADR-0001：Phase 1の公開Web調査executor](0001-phase1-public-research.md)．

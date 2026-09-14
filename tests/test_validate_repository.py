@@ -19,7 +19,7 @@ class ValidateRepositoryTests(unittest.TestCase):
         shutil.copytree(
             REPOSITORY_ROOT,
             self.repository,
-            ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"),
+            ignore=shutil.ignore_patterns(".git", ".venv", "venv", ".ruff_cache", ".pytest_cache", "__pycache__", "*.pyc"),
         )
 
     def tearDown(self) -> None:
@@ -49,7 +49,7 @@ class ValidateRepositoryTests(unittest.TestCase):
         metadata_path = self.repository / ".ephy" / "project.yaml"
         metadata = metadata_path.read_text(encoding="utf-8")
         metadata_path.write_text(
-            metadata.replace('type: "template"', 'type: "unknown"'),
+            metadata.replace('type: "core"', 'type: "unknown"'),
             encoding="utf-8",
         )
         result = self.run_validator()

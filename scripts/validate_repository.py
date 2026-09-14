@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -241,22 +242,27 @@ def validate_metadata(path: Path) -> list[str]:
 
 def iter_text_files(root: Path) -> Iterable[tuple[str, str]]:
     """Yield small UTF-8 text files while excluding VCS and generated caches."""
-    for path in sorted(root.rglob("*")):
-        if not path.is_file():
-            continue
-        relative = path.relative_to(root)
-        if any(part in {".git", "__pycache__", ".pytest_cache"} for part in relative.parts):
-            continue
-        try:
-            content = path.read_bytes()
-        except OSError:
-            continue
-        if len(content) > 1_000_000 or b"\x00" in content:
-            continue
-        try:
-            yield relative.as_posix(), content.decode("utf-8")
-        except UnicodeDecodeError:
-            continue
+    excluded = {".git", ".venv", "venv", "__pycache__", ".pytest_cache", ".ruff_cache", "build", "dist"}
+    for directory, names, files in os.walk(root):
+        names[:] = sorted(name for name in names if name not in excluded)
+        for filename in sorted(files):
+            path = Path(directory) / filename
+            if filename in excluded or path.is_symlink():
+                continue
+            relative = path.relative_to(root)
+            try:
+                if path.stat().st_size > 1_000_000:
+                    continue
+                content = path.read_bytes()
+            except OSError:
+                continue
+            if b"\x00" in content:
+                continue
+            try:
+                yield relative.as_posix(), content.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+
 
 
 def validate_placeholders(text_files: Sequence[tuple[str, str]]) -> list[str]:

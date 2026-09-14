@@ -1,0 +1,48 @@
+# 接続URL・実model IDは利用環境で明示する．別profileへの自動切替は行わない．
+# 共有Runtime設定を書き換えず，このファイルをGit外へコピーして設定する．
+search:
+  base_url: http://127.0.0.1:8888
+  engine: duckduckgo
+  max_results: 8
+  timeout_seconds: 30
+  retries: 1
+
+model_profiles:
+  qwen-local:
+    family: qwen
+    base_url_env: EPHY_QWEN_BASE_URL
+    model_id_env: EPHY_QWEN_MODEL_ID
+    # 認証ありの場合だけ設定する．key本体をYAMLへ書かない．
+    # api_key_env: EPHY_QWEN_API_KEY
+    api: chat_completions
+    output_mode: prompted_json
+    context_tokens: 32768
+    max_output_tokens: 4096
+    schema_retries: 1
+    timeout_seconds: 120
+    # thinking／samplingは必要な場合だけ明示する．未知のmetadataはnull．
+    quantization: null
+    server: null
+    server_version: null
+    chat_template: null
+  deepseek-local:
+    family: deepseek
+    base_url_env: EPHY_DEEPSEEK_BASE_URL
+    model_id_env: EPHY_DEEPSEEK_MODEL_ID
+    # api_key_env: EPHY_DEEPSEEK_API_KEY
+    api: chat_completions
+    output_mode: prompted_json
+    context_tokens: 32768
+    max_output_tokens: 4096
+    schema_retries: 1
+    timeout_seconds: 120
+
+limits:
+  max_queries: 10
+  search_requests: 20
+  max_sources: 12
+  fetch_requests: 36
+  model_requests: 40
+  job_seconds: 900
+  request_seconds: 120
+  initial_sources: 5

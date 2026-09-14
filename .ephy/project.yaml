@@ -1,12 +1,12 @@
 schema_version: 1
 
 project:
-  id: "ephy-repository-template"
+  id: "ephy-worker"
   family: "ephy"
-  type: "template"
+  type: "core"
   status: "active"
   visibility: "private"
-  description: "Base repository template for the Ephy ecosystem"
+  description: "Authorized research job executor for Ephy"
 
 relations:
   parent: "ephy"
