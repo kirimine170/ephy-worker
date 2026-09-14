@@ -12,7 +12,7 @@ from .budget import Budget, BudgetExceeded
 from .config import ConfigurationError, WorkerConfig
 from .models import ModelError, ModelRunner
 from .schema import Extraction, StrictModel
-from .search import SearchError, SearchProvider
+from .search import SearchError, create_search_provider
 
 
 class _Probe(StrictModel):
@@ -27,7 +27,7 @@ async def doctor(
     result: dict = {"ok": True, "search": {}, "profiles": {}, "output": None}
     search = None
     try:
-        search = SearchProvider(config.search, budget)
+        search = create_search_provider(config.search, budget)
         result["search"] = await search.engine_health()
         if not result["search"]["enabled"]:
             raise ValueError("searxng_engine_disabled")
@@ -109,4 +109,6 @@ async def doctor(
             result["output"] = {"writable": False, "error": type(exc).__name__}
             result["ok"] = False
     result["metrics"] = budget.snapshot()
+    if search is not None:
+        result["metrics"]["search"] = search.metadata
     return result

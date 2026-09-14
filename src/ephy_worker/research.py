@@ -40,14 +40,14 @@ class ResearchExecutor:
     def __init__(self, config, profile_id: str, store: JobStore, *, model=None, search=None, fetcher=None):
         from .fetch import PublicFetcher
         from .models import ModelRunner
-        from .search import SearchProvider
+        from .search import create_search_provider
 
         self.config = config
         self.budget = Budget(config.limits)
         self.store = store
         self.profile_id = profile_id
         self.model = model or ModelRunner(config.model_profiles[profile_id], self.budget)
-        self.search = search or SearchProvider(config.search, self.budget)
+        self.search = search or create_search_provider(config.search, self.budget)
         self.fetcher = fetcher or PublicFetcher(self.budget)
         self.current_stage = "starting"
         self.report: Report | None = None
@@ -115,6 +115,7 @@ class ResearchExecutor:
                 results = await self.search.search(query, query_id)
                 entry["status"] = "ok"
                 entry["result_count"] = len(results)
+                entry["diagnostic"] = getattr(self.search, "last_diagnostic", {})
                 self.event("search_completed", query_id=query_id, result_count=len(results))
                 self.report.candidates.extend(results)
                 for candidate in results:
@@ -462,6 +463,7 @@ class ResearchExecutor:
                     name: version(name) for name in ("pydantic-ai-slim", "trafilatura", "pypdf", "aiohttp")
                 },
                 "search_engine": self.config.search.engine,
+                "search": getattr(self.search, "metadata", {}),
                 "source_count": len(self.report.sources),
                 "domain_count": len(
                     {urlsplit(s.final_url or s.requested_url).hostname for s in self.report.sources}

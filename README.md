@@ -2,7 +2,7 @@
 
 ## Overview
 
-認可された公開Web調査を1プロセス・1Jobで実行する，Python 3.12–3.14向けCLIです．質問を検索計画へ分け，SearXNGで探索し，HTML／テキストPDFの本文から根拠を抽出して別contextで照合します．`report.json`を正本として日本語Markdownを生成します．
+認可された公開Web調査を1プロセス・1Jobで実行する，Python 3.12–3.14向けCLIです．質問を検索計画へ分け，SearXNGまたはTavilyで探索し，HTML／テキストPDFの本文から根拠を抽出して別contextで照合します．`report.json`を正本として日本語Markdownを生成します．
 
 ## Role in the Ephy ecosystem
 
@@ -24,6 +24,8 @@ UI，stdio daemon，Runtime／Karte実接続，SQLite，resume，同時Job，分
 Phase 1実装です．実行したfixture・実モデル試験，未検証のOS／profile，検索基盤の制約は[検証記録](docs/phase1-validation.md)に記載します．`completed`は処理完了を表し，すべての主張が真実だという保証ではありません．`answerability`で回答範囲を別記します．
 
 現環境ではSearXNGのCAPTCHAにより検索発見のlive経路は未検証です．既知の公開資料を補足したQwen実行ではHTML・PDF引用を採用できましたが，数値の精度差や比較表現の過大解釈を意味照合が見逃す例があり，調査品質の合格とは扱っていません．
+
+無料枠向けのTavily検索providerを追加しました．無料プラン・従量課金無効・残量を検索前に確認し，basic検索を最大10credit／Jobに制限します．APIキー未設定のため実通信は未検証です．設定と操作手順は[Tavily検証](docs/tavily-validation.md)を参照してください．
 
 ## Architecture
 
@@ -114,7 +116,7 @@ PDFはContent-TypeとPDF magicを確認し，1始まりの**物理ページ番�
 ```bash
 uv sync --locked
 uv run python -m pytest -q
-uv run ruff check src tests/test_research.py tests/test_workflow_edges.py tests/test_cli.py tests/test_evidence.py tests/test_fetch.py tests/test_extraction.py tests/test_providers.py
+uv run ruff check src tests/test_research.py tests/test_workflow_edges.py tests/test_cli.py tests/test_evidence.py tests/test_fetch.py tests/test_extraction.py tests/test_providers.py tests/test_tavily.py
 python3 scripts/validate_repository.py --check-sensitive-patterns
 ```
 
@@ -131,6 +133,7 @@ Windowsのrepository validationは`python scripts/validate_repository.py --check
 - [Architecture](docs/architecture.md)
 - [Phase 1 ADR](docs/adr/0001-phase1-public-research.md)
 - [Phase 1 validation](docs/phase1-validation.md)
+- [Tavily free-plan validation](docs/tavily-validation.md)
 - [Repository relationships](docs/repository-relations.md)
 - [Security and data handling](docs/security-and-data.md)
 

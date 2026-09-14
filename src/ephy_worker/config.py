@@ -49,17 +49,57 @@ def _resolve(value: str | None, env: str | None, label: str) -> str:
 
 
 class SearchConfig(StrictModel):
+    provider: Literal["searxng", "tavily"] = "searxng"
     base_url: str | None = None
     base_url_env: str | None = None
+    api_key_env: str | None = None
     engine: str = Field("duckduckgo", pattern=r"^[a-zA-Z0-9 _-]{1,80}$")
     language: str = "auto"
     max_results: int = Field(8, ge=1, le=20)
     timeout_seconds: float = Field(30, gt=0, le=120)
     retries: int = Field(1, ge=0, le=1)
     response_bytes: int = Field(2 * 1024**2, ge=1024, le=8 * 1024**2)
+    max_credits_per_job: int = Field(10, ge=1, le=10)
+
+    @model_validator(mode="after")
+    def consistent(self):
+        if self.base_url and self.base_url_env:
+            raise ValueError("choose either an explicit search URL or its environment reference")
+        for name in (self.base_url_env, self.api_key_env):
+            if name is not None and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                raise ValueError("invalid environment variable reference")
+        if self.provider == "tavily":
+            if "engine" in self.model_fields_set and self.engine != "tavily":
+                raise ValueError("Tavily requires engine: tavily")
+            self.engine = "tavily"
+            if "retries" not in self.model_fields_set:
+                self.retries = 0
+            if self.retries:
+                raise ValueError("Tavily validation does not retry potentially charged searches")
+            self.api_key_env = self.api_key_env or "TAVILY_API_KEY"
+        elif self.api_key_env:
+            raise ValueError("search API keys are supported only by the Tavily provider")
+        return self
 
     def endpoint(self) -> str:
+        if self.provider == "tavily":
+            value = (
+                _resolve(self.base_url, self.base_url_env, "Tavily base URL")
+                if self.base_url or self.base_url_env
+                else "https://api.tavily.com"
+            )
+            if value.rstrip("/") != "https://api.tavily.com":
+                raise ConfigurationError("Tavily credentials may only be sent to https://api.tavily.com")
+            return "https://api.tavily.com"
         return service_url(_resolve(self.base_url, self.base_url_env, "SearXNG base URL"))
+
+    def resolve_api_key(self) -> SecretStr | None:
+        if self.provider != "tavily":
+            return None
+        key = _resolve(None, self.api_key_env, "Tavily API key")
+        if not key.isascii() or any(char.isspace() or ord(char) < 33 or ord(char) > 126 for char in key):
+            raise ConfigurationError("Tavily API key contains invalid characters")
+        return SecretStr(key)
 
 
 class ModelProfile(StrictModel):

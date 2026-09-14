@@ -1,6 +1,7 @@
 # 接続URL・実model IDは利用環境で明示する．別profileへの自動切替は行わない．
 # 共有Runtime設定を書き換えず，このファイルをGit外へコピーして設定する．
 search:
+  provider: searxng
   base_url: http://127.0.0.1:8888
   engine: duckduckgo
   max_results: 8

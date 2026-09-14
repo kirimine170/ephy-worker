@@ -58,6 +58,7 @@ async def dispatch(args) -> int:
     # Resolve before allocating a job so missing configuration is explicit and creates no phantom run．
     config.model_profiles[args.profile].resolve()
     config.search.endpoint()
+    config.search.resolve_api_key()
     try:
         store = JobStore(args.output_dir)
     except ValueError as exc:

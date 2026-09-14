@@ -1,0 +1,36 @@
+# 無料枠での検証用．Tavily dashboardでResearcher／Freeプランと従量課金無効を確認する．
+# キー本体はYAMLへ書かず，実行するterminalの環境変数へ設定する．
+search:
+  provider: tavily
+  api_key_env: TAVILY_API_KEY
+  max_results: 8
+  retries: 0
+  timeout_seconds: 30
+  max_credits_per_job: 10
+
+model_profiles:
+  qwen-local:
+    family: qwen
+    base_url_env: EPHY_QWEN_BASE_URL
+    model_id_env: EPHY_QWEN_MODEL_ID
+    output_mode: prompted_json
+    context_tokens: 32768
+    max_output_tokens: 4096
+    max_tokens_parameter: max_tokens
+  deepseek-local:
+    family: deepseek
+    base_url_env: EPHY_DEEPSEEK_BASE_URL
+    model_id_env: EPHY_DEEPSEEK_MODEL_ID
+    output_mode: prompted_json
+    context_tokens: 32768
+    max_output_tokens: 4096
+
+limits:
+  max_queries: 8
+  # /usage確認も実HTTP requestとして数える．basic検索は最大8回．
+  search_requests: 20
+  max_sources: 12
+  fetch_requests: 36
+  model_requests: 40
+  job_seconds: 900
+  initial_sources: 5

@@ -1,4 +1,4 @@
-"""Bounded SearXNG JSON calls to the explicitly configured search service．"""
+"""Explicit search provider selection and bounded SearXNG JSON calls．"""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ class SearchError(RuntimeError):
 
 _PRIVATE_PATTERNS = {
     "private_key": r"-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----",
-    "credential": r"\b(?:Bearer\s+\S+|AKIA[0-9A-Z]{16}|ghp_\w{20,}|github_pat_\w{20,}|sk-[\w-]{15,})",
+    "credential": r"\b(?:Bearer\s+\S+|AKIA[0-9A-Z]{16}|ghp_\w{20,}|github_pat_\w{20,}|sk-[\w-]{15,}|tvly-[\w-]{10,})",
     "credential_assignment": r"\b(?:password|passwd|secret|api[_-]?key|access[_-]?token)\s*[:=]\s*\S+",
     "jwt": r"\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}",
     "local_path": r"(?:(?<![A-Z0-9])[A-Z]:[\\/]\S+|\\\\[^\s\\]+\\\S+|file://|(?<![\w/])~[\\/]\S+)",
@@ -113,6 +113,14 @@ def normalize_url(value: str) -> str | None:
         return None
 
 
+def create_search_provider(config: SearchConfig, budget: Budget, *, transport=None):
+    if config.provider == "tavily":
+        from .tavily import TavilySearchProvider
+
+        return TavilySearchProvider(config, budget, transport=transport)
+    return SearchProvider(config, budget, transport=transport)
+
+
 class SearchProvider:
     def __init__(
         self, config: SearchConfig, budget: Budget, *, transport: httpx.AsyncBaseTransport | None = None
@@ -127,6 +135,10 @@ class SearchProvider:
             headers={"Accept": "application/json"},
         )
         self.last_diagnostic: dict = {}
+
+    @property
+    def metadata(self) -> dict:
+        return {"provider": "searxng", "engine": self.config.engine}
 
     async def _json(self, path: str, *, data: dict | None = None) -> dict:
         for attempt in range(self.config.retries + 1):

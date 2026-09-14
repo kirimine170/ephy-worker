@@ -477,7 +477,7 @@ async def test_doctor_checks_real_nested_workflow_schema(monkeypatch, nested_err
     )
     monkeypatch.setattr(
         diagnostics,
-        "SearchProvider",
+        "create_search_provider",
         lambda config, budget: SearchProvider(config, budget, transport=httpx.MockTransport(search_handler)),
     )
     config = WorkerConfig(
