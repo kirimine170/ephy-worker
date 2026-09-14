@@ -21,29 +21,44 @@ class _Probe(StrictModel):
 
 
 async def doctor(
-    config: WorkerConfig, profile_id: str | None = None, output_dir: str | Path | None = None
+    config: WorkerConfig,
+    profile_id: str | None = None,
+    output_dir: str | Path | None = None,
+    *,
+    usage_only: bool = False,
 ) -> dict:
+    if usage_only and config.search.provider != "tavily":
+        raise ConfigurationError("usage-only requires Tavily search provider")
     budget = Budget(config.limits)
     result: dict = {"ok": True, "search": {}, "profiles": {}, "output": None}
+    if usage_only:
+        result["mode"] = "usage_only"
     search = None
     try:
         search = create_search_provider(config.search, budget)
         result["search"] = await search.engine_health()
         if not result["search"]["enabled"]:
             raise ValueError("searxng_engine_disabled")
-        candidates = await search.search("Python documentation", "doctor-public-probe")
-        result["search"].update(
-            ok=True, json_api=True, probe_result_count=len(candidates), diagnostic=search.last_diagnostic
-        )
+        if usage_only:
+            result["search"].update(ok=True, search_probe_skipped=True, diagnostic=search.last_diagnostic)
+        else:
+            candidates = await search.search("Python documentation", "doctor-public-probe")
+            result["search"].update(
+                ok=True, json_api=True, probe_result_count=len(candidates), diagnostic=search.last_diagnostic
+            )
     except (SearchError, ConfigurationError, BudgetExceeded, ValueError) as exc:
         result["ok"] = False
         result["search"].update(ok=False, error=getattr(exc, "code", type(exc).__name__))
+        if isinstance(exc, ConfigurationError):
+            result["search"]["detail"] = str(exc)
         if search:
             result["search"]["diagnostic"] = search.last_diagnostic
     finally:
         if search:
             await search.aclose()
     selected = {profile_id: config.model_profiles.get(profile_id)} if profile_id else config.model_profiles
+    if usage_only:
+        selected = {}
     for name, profile in selected.items():
         runner = None
         try:

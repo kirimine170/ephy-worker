@@ -22,6 +22,9 @@ def parser() -> argparse.ArgumentParser:
     doctor.add_argument("--config", required=True, type=Path)
     doctor.add_argument("--profile", help="未指定なら全profileを診断")
     doctor.add_argument("--output-dir", type=Path, help="Git外の成果物rootを検査")
+    doctor.add_argument(
+        "--usage-only", action="store_true", help="Tavily使用量だけを確認し，検索・モデル呼出しを省略"
+    )
     research = sub.add_parser("research", help="新規Jobとして調査を実行")
     research.add_argument("--config", required=True, type=Path)
     research.add_argument("--profile", required=True)
@@ -42,7 +45,9 @@ async def dispatch(args) -> int:
     if args.command == "doctor":
         from .diagnostics import doctor
 
-        result = await doctor(config, profile_id=args.profile, output_dir=args.output_dir)
+        result = await doctor(
+            config, profile_id=args.profile, output_dir=args.output_dir, usage_only=args.usage_only
+        )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result["ok"] else 1
     if not args.question.strip() or len(args.question) > 8000:

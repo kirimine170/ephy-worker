@@ -25,7 +25,7 @@ Phase 1実装です．実行したfixture・実モデル試験，未検証のOS�
 
 現環境ではSearXNGのCAPTCHAにより検索発見のlive経路は未検証です．既知の公開資料を補足したQwen実行ではHTML・PDF引用を採用できましたが，数値の精度差や比較表現の過大解釈を意味照合が見逃す例があり，調査品質の合格とは扱っていません．
 
-無料枠向けのTavily検索providerを追加しました．無料プラン・従量課金無効・残量を検索前に確認し，basic検索を最大10credit／Jobに制限します．APIキー未設定のため実通信は未検証です．設定と操作手順は[Tavily検証](docs/tavily-validation.md)を参照してください．
+無料枠向けのTavily検索providerを追加しました．無料プラン・使用量・残量を検索前に確認し，basic検索を最大10credit／Jobに制限します．利用者実行のdoctorで使用量API・実検索1回・Qwen接続の成功を確認しました．`paygo_limit`のnullは未報告として保持し，無料枠の残量で制限します．設定・`doctor --usage-only`の診断手順と検証範囲は[Tavily検証](docs/tavily-validation.md)を参照してください．
 
 ## Architecture
 

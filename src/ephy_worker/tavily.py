@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 
 import httpx
 
@@ -11,6 +12,28 @@ from .budget import Budget, BudgetExceeded
 from .config import SearchConfig
 from .schema import Candidate
 from .search import SearchError, normalize_url, validate_query
+
+
+def _usage_field_diagnostic(account: dict, name: str) -> dict:
+    """Describe only expected fields，never copy arbitrary account or credential strings．"""
+    if name not in account:
+        return {"type": "missing"}
+    value = account[name]
+    if value is None:
+        return {"type": "null"}
+    if type(value) is bool:
+        return {"type": "boolean", "value": value}
+    if type(value) in {int, float}:
+        if -1_000_000_000 <= value <= 1_000_000_000:
+            return {"type": "number", "value": value}
+        return {"type": "number", "value": "out_of_diagnostic_range"}
+    if isinstance(value, str):
+        if name == "current_plan" and value.casefold() in {"researcher", "free"}:
+            return {"type": "string", "value": value.casefold()}
+        if len(value) <= 20 and re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", value):
+            return {"type": "string", "value": value}
+        return {"type": "string", "value": "redacted_unrecognized_value"}
+    return {"type": "object" if isinstance(value, dict) else "array" if isinstance(value, list) else "other"}
 
 
 class TavilySearchProvider:
@@ -73,6 +96,9 @@ class TavilySearchProvider:
                     json=body,
                     headers={"Authorization": "Bearer " + self._api_key.get_secret_value()},
                 ) as response:
+                    self.last_diagnostic.update(
+                        stage=path.lstrip("/"), endpoint=path, http_status=response.status_code
+                    )
                     if response.status_code != 200:
                         code = {
                             401: "tavily_authentication_failed",
@@ -101,30 +127,56 @@ class TavilySearchProvider:
             raise SearchError("tavily_network_error") from None
 
     async def _check_allowance(self) -> dict:
+        self.last_diagnostic = {"provider": "tavily", "stage": "usage", "endpoint": "/usage"}
         payload = await self._json("/usage")
         account = payload.get("account")
         if not isinstance(account, dict):
+            self.last_diagnostic.update(reason="account_object_missing_or_invalid")
             raise SearchError("tavily_free_allowance_unverified")
         plan = account.get("current_plan")
         fields = ("plan_usage", "plan_limit", "paygo_usage", "paygo_limit")
+        self.last_diagnostic["account_fields"] = {
+            name: _usage_field_diagnostic(account, name) for name in ("current_plan", *fields)
+        }
         values = [account.get(key) for key in fields]
-        if any(type(value) not in {int, float} or not 0 <= value < float("inf") for value in values):
+        invalid = [
+            name
+            for name, value in zip(fields, values, strict=True)
+            if not (name == "paygo_limit" and name in account and value is None)
+            and (type(value) not in {int, float} or not 0 <= value < float("inf"))
+        ]
+        if invalid:
+            self.last_diagnostic.update(
+                reason="usage_fields_not_nonnegative_numbers", unverified_fields=invalid
+            )
             raise SearchError("tavily_free_allowance_unverified")
         self._account = dict(zip(fields, values, strict=True))
         # Do not save arbitrary account strings．Only recognized free plan names are retained．
         if not isinstance(plan, str) or plan.casefold() not in {"researcher", "free"}:
             raise SearchError("tavily_free_plan_required")
         self._account["current_plan"] = plan.casefold()
-        if account["paygo_limit"] != 0 or account["paygo_usage"] != 0:
+        # /usage can return an explicit null limit on Researcher accounts．It does
+        # not prove PAYG is disabled．Preserve null，and authorize only against the
+        # independently verified free-plan balance and local reservations below．
+        if account["paygo_limit"] not in (None, 0) or account["paygo_usage"] != 0:
             raise SearchError("tavily_paygo_must_be_disabled")
         if not 0 < account["plan_limit"] <= 1000:
+            self.last_diagnostic.update(
+                reason="plan_limit_outside_free_range", unverified_fields=["plan_limit"]
+            )
             raise SearchError("tavily_free_allowance_unverified")
         remaining = max(0, account["plan_limit"] - account["plan_usage"])
         # Usage may be eventually consistent．Never restore locally reserved credits within a job．
         self._remaining = remaining if self._remaining is None else min(self._remaining, remaining)
         if self._remaining < 1:
             raise SearchError("tavily_free_credits_exhausted")
-        return {"engine": "tavily", "configured": True, "enabled": True, "free_plan_verified": True}
+        return {
+            "engine": "tavily",
+            "configured": True,
+            "enabled": True,
+            "free_plan_verified": True,
+            "paygo_limit_state": "not_reported" if account["paygo_limit"] is None else "zero",
+        }
 
     async def engine_health(self) -> dict:
         async with self._lock:

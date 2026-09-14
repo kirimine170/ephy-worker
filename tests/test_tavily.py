@@ -480,3 +480,140 @@ async def test_doctor_selects_tavily_and_reports_usage(key, monkeypatch, tmp_pat
     assert outcome["metrics"]["search"]["credits_reported"] == 1
     assert outcome["metrics"]["requests"]["search_requests"] == 3
     assert key not in json.dumps(outcome)
+
+
+@pytest.mark.parametrize(
+    "value,kind", [(None, "null"), ("0", "string"), (False, "boolean"), ({}, "object"), ([], "array")]
+)
+async def test_unverified_usage_explains_field_and_type_without_authorizing_search(key, value, kind):
+    paths = []
+
+    def handle(req):
+        paths.append(req.url.path)
+        return httpx.Response(200, json=allowance(paygo_usage=value))
+
+    p = provider(handle)
+    try:
+        with pytest.raises(SearchError, match="free_allowance_unverified"):
+            await p.engine_health()
+        diag = p.last_diagnostic
+        assert diag["endpoint"] == "/usage" and diag["http_status"] == 200
+        assert diag["account_fields"]["paygo_usage"]["type"] == kind
+        assert diag["unverified_fields"] == ["paygo_usage"]
+        assert paths == ["/usage"]
+        assert key not in json.dumps(diag)
+    finally:
+        await p.aclose()
+
+
+async def test_usage_diagnostic_distinguishes_missing_field_and_redacts_unknown_strings(key):
+    data = allowance(current_plan=key, paygo_usage="server may echo " + key)
+    del data["account"]["paygo_limit"]
+    data["account"]["api_key"] = key
+    p = provider(lambda req: httpx.Response(200, json=data))
+    try:
+        with pytest.raises(SearchError):
+            await p.engine_health()
+        diag = p.last_diagnostic
+        assert diag["account_fields"]["paygo_limit"] == {"type": "missing"}
+        assert diag["account_fields"]["current_plan"]["value"] == "redacted_unrecognized_value"
+        assert diag["account_fields"]["paygo_usage"]["value"] == "redacted_unrecognized_value"
+        assert "api_key" not in diag["account_fields"]
+        assert key not in json.dumps([diag, p.metadata])
+    finally:
+        await p.aclose()
+
+
+@pytest.mark.parametrize("valid", [True, False])
+async def test_usage_only_never_searches_or_calls_model(key, monkeypatch, valid):
+    from ephy_worker import diagnostics
+
+    paths = []
+
+    def handle(req):
+        paths.append(req.url.path)
+        data = allowance() if valid else allowance(paygo_usage=None)
+        return httpx.Response(200, json=data)
+
+    monkeypatch.setattr(
+        diagnostics,
+        "create_search_provider",
+        lambda c, b: create_search_provider(c, b, transport=httpx.MockTransport(handle)),
+    )
+    monkeypatch.setattr(diagnostics, "ModelRunner", lambda *args: pytest.fail("must not probe model"))
+    config = WorkerConfig(
+        search=SearchConfig(provider="tavily"),
+        model_profiles={
+            "test": {
+                "family": "qwen",
+                "base_url": "http://127.0.0.1:9/v1",
+                "model_id": "fixture",
+                "output_mode": "prompted_json",
+            }
+        },
+    )
+    outcome = await diagnostics.doctor(config, usage_only=True)
+    assert outcome["mode"] == "usage_only" and outcome["ok"] is valid
+    assert paths == ["/usage"]
+    assert outcome["profiles"] == {}
+    assert outcome["metrics"]["requests"] == {"search_requests": 1, "fetch_requests": 0, "model_requests": 0}
+    assert outcome["metrics"]["search"]["search_attempts"] == 0
+    assert key not in json.dumps(outcome)
+
+
+def test_cli_usage_only_missing_key_does_not_probe_any_service(monkeypatch, tmp_path):
+    from test_cli import fixture_config
+
+    from ephy_worker.cli import main
+
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    path = fixture_config(tmp_path)
+    data = yaml.safe_load(path.read_text())
+    data["search"] = {"provider": "tavily"}
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    assert main(["doctor", "--config", str(path), "--usage-only"]) == 1
+
+
+async def test_researcher_null_paygo_limit_preserves_unknown_and_uses_free_balance(key):
+    seen = []
+
+    def handle(req):
+        seen.append(req.url.path)
+        data = allowance(paygo_limit=None, plan_usage=999) if req.url.path == "/usage" else result()
+        return httpx.Response(200, json=data)
+
+    p = provider(handle)
+    try:
+        health = await p.engine_health()
+        assert health["free_plan_verified"]
+        assert health["paygo_limit_state"] == "not_reported"
+        assert p.metadata["account"]["paygo_limit"] is None
+        assert p.last_diagnostic["account_fields"]["paygo_limit"] == {"type": "null"}
+        assert len(await p.search("public documentation", "Q1")) == 1
+        assert p.metadata["remaining_credits_conservative"] == 0
+        with pytest.raises(SearchError, match="free_credits_exhausted"):
+            await p.search("another public source", "Q2")
+        assert seen.count("/search") == 1
+        assert p.metadata["credits_reserved"] == 1
+    finally:
+        await p.aclose()
+
+
+@pytest.mark.parametrize(
+    "changes,error",
+    [
+        ({"paygo_usage": 1}, "paygo_must_be_disabled"),
+        ({"paygo_usage": None}, "free_allowance_unverified"),
+        ({"plan_usage": 1000}, "free_credits_exhausted"),
+        ({"plan_usage": None}, "free_allowance_unverified"),
+        ({"current_plan": "Bootstrap"}, "free_plan_required"),
+    ],
+)
+async def test_null_paygo_limit_never_bypasses_other_free_plan_checks(key, changes, error):
+    p = provider(lambda req: httpx.Response(200, json=allowance(paygo_limit=None, **changes)))
+    try:
+        with pytest.raises(SearchError, match=error):
+            await p.search("public source", "Q1")
+        assert p.metadata["search_attempts"] == 0
+    finally:
+        await p.aclose()

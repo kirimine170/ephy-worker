@@ -4,9 +4,13 @@ All notable changes to this repository are documented in this file．
 
 ## Unreleased
 
+### Fixed
+
+- TavilyのResearcher accountで`paygo_limit=null`が返る場合の誤停止を修正．無料枠の残量検査を保持し，項目別診断と検索・モデル呼出しを行わない`doctor --usage-only`を追加．
+
 ### Added
 
-- Tavilyの無料プラン向け検索provider，事前使用量確認，basic固定・従量課金無効・最大10creditの制御，検証用設定とoffline試験．
+- Tavilyの無料プラン向け検索provider，事前使用量確認，basic固定・無料枠残量・最大10creditの制御，検証用設定とoffline試験．
 - Worker Phase 1のdoctor／research CLI，専用lockfile，公開HTML／物理ページ単位PDFの取得・抽出・照合．
 - 出典・引用実在・転載起点・矛盾を保持するJSON／Markdown成果物と，有限追加検索・Ctrl+C・timeout制御．
 - 公開fetchのDNS固定・redirect検査・容量制限と，独立parserの時間・RSS制限．
