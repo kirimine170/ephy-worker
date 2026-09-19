@@ -21,8 +21,18 @@ class InitRepositoryTests(unittest.TestCase):
         shutil.copytree(
             REPOSITORY_ROOT,
             self.repository,
-            ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"),
+            ignore=shutil.ignore_patterns(".git", ".venv", "venv", ".ruff_cache", ".pytest_cache", "__pycache__", "*.pyc"),
         )
+
+        # Exercise first initialization against a pristine template fixture，even
+        # though this repository has already been initialized as ephy-worker．
+        metadata = self.repository / ".ephy" / "project.yaml"
+        text = metadata.read_text(encoding="utf-8")
+        text = re.sub(r'  id: "[^"]+"', '  id: "ephy-repository-template"', text)
+        text = re.sub(r'  type: "[^"]+"', '  type: "template"', text)
+        metadata.write_text(text, encoding="utf-8")
+        readme = self.repository / "README.md"
+        readme.write_text("<!-- ephy-template-source -->\n" + readme.read_text(encoding="utf-8"), encoding="utf-8")
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
