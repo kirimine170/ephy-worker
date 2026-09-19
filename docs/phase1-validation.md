@@ -92,3 +92,14 @@ OCR，PDF図表画像，表の高精度構造復元，動的ページ，認証�
 uv run python -m ephy_worker doctor --config ../../local-data/worker-research/worker.yaml --profile qwen-local --output-dir ../../local-data/worker-research/reports
 uv run python -m ephy_worker research --config ../../local-data/worker-research/worker.yaml --profile qwen-local --output-dir ../../local-data/worker-research/reports --question "2025年4月公開のQwen3-30B-A3Bについて，総パラメータ数と活性化パラメータ数，thinkingとnon-thinkingの切替方法，ベンチマークの推論条件と制約を公式資料と技術レポートから整理してください．2025年7月版とは区別してください．"
 ```
+
+## Phase 1後の強化（claim・引用の決定的整合性）
+
+上記監査のc001（精度の違う値の混合）とc004（比較表現の強化）を受け，`evidence.py`の`apply_review`に決定的整合性チェックを追加した．reviewがsupportsとして条件一致と判定した各evidenceについて，claim本文と引用を次の2点で検査する．
+
+1. 数値の精度：隣接する単位（B，M，％，億，万，倍など）を持つ数値だけを対象に，同一の単位のあいだだけ桁列を比較し，片方向のprefix関係になる場合（例：`30B`対`30.5B`，`3.3B`対`3B`）にその引用をsupportとして数えない．claim側の数値の値と単位が引用にそのまま現れる場合は，他の数値が混ざっていても指摘しない．単位のない数値（日付，version，裸の整数），model名やhyphenated複合語内の数値（Qwen3-30B-A3B，GPT-4），ASCII単位の直後にASCII文字が続く表記（`3beta`，`3months`）は対象外である．
+2. 比較表現の強さ：同等・同等以上・優位の3段階の固定語彙で，claimの表現が引用より強い場合（例：引用がhighly competitiveでclaimが同等または優れる）にその引用をsupportとして数えない．同等または優れる・同等または優れているのような複合表現は完全形として登録し，全markerを収集したうえで最長一致で重なりを解決するため，内包される語で過大に評価しない．否定は選択された完全な表現にのみ適用するため，否定された複合表現（同等または優れるわけではない）は肯定markerを残さずlevel 0となる．否定は比較述語に直接付着した明示的な形の有限パターン集合だけ数える（英語は述語の直前にdoes not，did not，cannot，can not，never，not，no，without，n'tが続く形，日本語は直後の〜ない・〜ません・わけではないなど，および直前の非）．汎用の英語解析ではないため，no doubt ... outperformsやnot only outperformsは否定と扱わない．単独の無・不も否定と扱わないため，無条件で上回るや不具合修正後は上回るは誤検出しない．
+
+検査が問題を検出してもclaimは書き換えない．該当evidenceのrelationはその場で`context_only`へ変更されて背景として保存され，詳細は`check_reason`へ追記されて`uncertainty`へも記録し，claimの`reason`へ検査の追記を行う．claimは残りの有効な根拠がその状態を満たさなくなった場合にのみ降格される．支持がすべて除外された場合は`insufficient`となり，複数のsupportsの一部だけが問題のある場合は残りの支持でclaimを維持できる（例：30.5Bと30Bが混在して30.5B側だけが除外されても，30B側の支持でsupported_primaryを維持）．検査は1つのclaimのすべてのsupportsへ個別に適用するため，資料ごとに精度の異なる値が混ざって支持がすべて除外されたc001型のclaimは降格する．
+
+このチェックは上記Qwen実行の監査で観測された失敗形状のみを対象とする狭い範囲であり，汎用の数値・比較セマンティクスではない．異なる値の検出（95対90），条件・benchmark範囲の省略，言い換えによる強化は依然として同一モデルの別context照合と人の再確認に依存する．決定の範囲と代替案は[ADR-0002](adr/0002-claim-citation-consistency.md)に記載する．offline test suite（`tests/test_evidence.py`）に，検出される失敗形状と，忠実な数値・比較表現を誤検出しないための偽陽性保護テストを追加した．live経路の再実行は未実施であり，本強化の適用後も上記Qwen実行の調査品質評価は変更していない．

@@ -19,3 +19,4 @@ Valid status labels are `Proposed`，`Accepted`，`Deprecated`，and `Superseded
 ## Records
 
 - [ADR-0001：Phase 1の公開Web調査executor](0001-phase1-public-research.md)．
+- [ADR-0002：claimと引用の決定的整合性チェック](0002-claim-citation-consistency.md)．

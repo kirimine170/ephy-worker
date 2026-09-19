@@ -87,9 +87,23 @@ def render_markdown(report: Report) -> str:
     def claim_evidence(claim: Claim) -> list[Evidence]:
         return [evidence[key] for key in claim.evidence_ids if key in evidence]
 
+    def qualifying(claim: Claim) -> list[Evidence]:
+        """Checked，conditions-matching evidence with the relation the status
+        rests on；empty for every other status．"""
+        items = [e for e in claim_evidence(claim) if e.checked and e.conditions_match]
+        if claim.status in {"supported_primary", "corroborated"}:
+            return [e for e in items if e.relation == "supports"]
+        if claim.status == "refuted":
+            return [e for e in items if e.relation == "contradicts"]
+        return []
+
     def citations(claim: Claim) -> str:
+        # Unlabelled citations beside a confirmed conclusion show only the
+        # qualifying evidence．Rejected context stays visibly labelled in the
+        # detailed evidence list，not next to the conclusion．
+        items = qualifying(claim) if confirmed(claim) else claim_evidence(claim)
         entries = []
-        for item in claim_evidence(claim):
+        for item in items:
             source = sources[item.source_id]
             label = f"{source.source_id} / {item.passage_id}"
             if item.page is not None:
@@ -98,14 +112,7 @@ def render_markdown(report: Report) -> str:
         return "，".join(dict.fromkeys(entries))
 
     def confirmed(claim: Claim) -> bool:
-        if not claim.checked or claim_counts[claim.claim_id] != 1:
-            return False
-        usable = [e for e in claim_evidence(claim) if e.checked and e.conditions_match]
-        if claim.status in {"supported_primary", "corroborated"}:
-            return any(e.relation == "supports" for e in usable)
-        if claim.status == "refuted":
-            return any(e.relation == "contradicts" for e in usable)
-        return False
+        return claim.checked and claim_counts[claim.claim_id] == 1 and bool(qualifying(claim))
 
     lines = [
         "# 調査レポート",

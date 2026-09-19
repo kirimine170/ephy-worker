@@ -2,6 +2,12 @@
 
 An exact quotation check establishes existence only．Semantic support is supplied
 by the separate review stage，and independent origins require separate evidence．
+A supporting quote is also checked deterministically against the claim text
+(see ``_support_conflicts``)．A quote that drops or adds the decimal precision
+of a same-unit quantity the claim states，or that is weaker than the comparison
+the claim asserts，is persisted as ``context_only`` with the deterministic
+rejection details and is not counted as support．The claim is downgraded only
+when the remaining valid evidence no longer satisfies its status．
 """
 
 from __future__ import annotations
@@ -290,6 +296,197 @@ def group_origins(sources: list[Source]) -> list[OriginGroup]:
     return output
 
 
+# Deterministic claim/quote consistency checks (semantic hardening)．
+# They cover only the failure shapes observed in the Phase 1 Qwen validation，
+# not general numeric or comparative semantics．
+_NUMBER_TOKEN = re.compile(r"\d+(?:\.\d+)?")
+_QUANTITY_UNIT = re.compile(r"億万|百万|倍|%|[KMGTP]?B|ms|km|kg|[KMGTP]|兆|億|万|千|[smx]", re.IGNORECASE)
+_HYPHENS = frozenset({"-", "‑", "–", "―"})
+
+# Comparison expressions ordered by asserted strength: 2 = equality，
+# 3 = equal-or-better，4 = superiority．
+_COMPARISON_LEVELS: dict[int, tuple[str, ...]] = {
+    2: ("同等", "匹敵", "equal", "equivalent", "on par", "comparable"),
+    3: (
+        "同等以上",
+        "同等または優れる",
+        "同等または優れている",
+        "同等かそれ以上",
+        "equal to or better",
+        "equal or better",
+        "matches or exceeds",
+    ),
+    4: (
+        "優れる",
+        "優位",
+        "上回る",
+        "勝る",
+        "凌ぐ",
+        "outperform",
+        "surpass",
+        "better than",
+        "higher than",
+        "state-of-the-art",
+        "state of the art",
+    ),
+}
+# Finite explicit English negation patterns attached directly to the comparison
+# predicate．This is not general English parsing：doubt or emphasis phrases
+# such as "no doubt it outperforms" or "not only outperforms" stay positive．
+_NEGATION_EN = re.compile(r"\b(?:does\s+not|did\s+not|can\s+not|cannot|without|never|not|no)\s+$|n't\s+$")
+_NEGATION_EN_WINDOW = 12
+# Explicit Japanese negation forms attached to the marker itself．Standalone 無
+# or 不 are never negation: 無条件 (unconditionally) and 不具合 (defect) keep
+# the comparison positive．
+_NEGATION_JA = (
+    "わけではない",
+    "わけでもない",
+    "わけがない",
+    "ではない",
+    "でない",
+    "にすぎない",
+    "しない",
+    "ない",
+    "ません",
+    "なく",
+    "ず",
+)
+
+
+def _quantities(text: str) -> list[tuple[str, str]]:
+    """Return (normalized decimal core, unit) pairs for quantity numbers in ``text``．
+
+    A quantity number is a digit run with an adjacent unit (B，M，%，億，万，倍，…)．
+    The unit is retained so that exact value-and-unit matches can protect a claim
+    quantity and precision is compared only between the same unit (no unit
+    conversion)．Digits embedded in identifiers (Qwen3，A3B，v2) or in hyphenated
+    compounds (Qwen3-30B-A3B，GPT-4) are not quantity numbers，so model names，
+    versions，and dates never take part in the check．An ASCII unit must end at a
+    boundary: ``3beta`` and ``3months`` are identifiers，while ``3ms``，``300M``，
+    ``95%``，and ``3倍`` remain quantities．
+    """
+    normalized = unicodedata.normalize("NFKC", text)
+    quantities: list[tuple[str, str]] = []
+    for match in _NUMBER_TOKEN.finditer(normalized):
+        start, end = match.span()
+        before = normalized[start - 1] if start > 0 else ""
+        if (before.isascii() and before.isalnum()) or before in _HYPHENS:
+            continue
+        unit = _QUANTITY_UNIT.match(normalized, end)
+        if unit is None:
+            continue
+        after = normalized[unit.end() : unit.end() + 1]
+        if after in _HYPHENS:
+            continue
+        # A digit or letter right after an ASCII unit means the unit is part of a
+        # longer identifier (3beta，3months)．Japanese units carry no such boundary．
+        if unit.group().isascii() and after.isascii() and after.isalnum():
+            continue
+        core = match.group()
+        if "." in core:
+            core = core.rstrip("0").rstrip(".")
+        quantities.append((core, unit.group()))
+    return quantities
+
+
+def _precision_conflict(claim_core: str, quote_core: str) -> bool:
+    """True when one core is the other with decimal digits added or dropped．
+
+    ``30`` vs ``30.5`` (the claim rounds 30.5B to 30B) and ``3.3`` vs ``3``
+    (the claim adds precision the quote does not state) both conflict．
+    Unrelated values such as ``30`` vs ``3.3`` or ``95`` vs ``90`` are outside
+    this narrow check and are left to the semantic review stage．
+    """
+    if claim_core == quote_core:
+        return False
+    return quote_core.startswith(claim_core + ".") or claim_core.startswith(quote_core + ".")
+
+
+def _marker_spans(text: str, marker: str) -> list[tuple[int, int]]:
+    # ASCII markers also match common inflections (outperforms，surpassed，…)
+    # without reaching unrelated words such as "equality"．
+    pattern = rf"\b{re.escape(marker)}(?:s|es|ed|ing|d)?\b" if marker.isascii() else re.escape(marker)
+    return [match.span() for match in re.finditer(pattern, text)]
+
+
+def _negated(text: str, span: tuple[int, int]) -> bool:
+    """True when a narrow explicit negation attaches to the marker span．
+
+    English: a finite pattern set directly before the predicate (does not，
+    did not，cannot，can not，never，not，no，without，n't)．This is not
+    general English parsing，so "no doubt it outperforms" stays positive．
+    Japanese: an explicit form attached within two characters after the
+    marker (上回らない，匹敵しない，同等ではない，上回るわけではない)，or the
+    prefix 非 directly before it (非同等)．Unrelated 無 or 不 never count．
+    """
+    start, end = span
+    before = text[max(0, start - _NEGATION_EN_WINDOW) : start]
+    if _NEGATION_EN.search(before):
+        return True
+    if start > 0 and text[start - 1] == "非":
+        return True
+    tail = text[end : end + 6]
+    return any(tail[offset:].startswith(_NEGATION_JA) for offset in range(3))
+
+
+def _comparison_level(text: str) -> int:
+    """Return the strongest tracked comparison expression level in ``text``．
+
+    0 means no tracked expression．All marker spans are collected first and
+    overlaps are resolved by preferring the longest span，so the complete
+    composites 同等または優れる／同等または優れている and "matches or exceeds"
+    keep level 3 instead of being raised by a nested marker．Negation is then
+    applied only to the selected complete span，so a negated composite removes
+    its nested 同等／優れる markers as well．
+    """
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    spans: list[tuple[int, int, int]] = []
+    for level, markers in _COMPARISON_LEVELS.items():
+        for marker in markers:
+            for span in _marker_spans(normalized, marker):
+                spans.append((span[0], span[1], level))
+    spans.sort(key=lambda item: (item[0] - item[1], item[0]))
+    chosen: list[tuple[int, int, int]] = []
+    for item in spans:
+        if all(item[1] <= start or item[0] >= end for start, end, _ in chosen):
+            chosen.append(item)
+    kept = [level for start, end, level in chosen if not _negated(normalized, (start, end))]
+    return max(kept, default=0)
+
+
+def _support_conflicts(claim_text: str, quote_text: str) -> list[str]:
+    """Deterministic consistency problems between a claim and its support quote．
+
+    Returns human-readable details．An empty result does not assert that the
+    quote fully supports the claim．
+    """
+    details: list[str] = []
+    claim_quantities = _quantities(claim_text)
+    quote_quantities = _quantities(quote_text)
+    if claim_quantities and quote_quantities:
+        quote_exact = {(core, unit.casefold()) for core, unit in quote_quantities}
+        for core, unit in claim_quantities:
+            # An exact value-and-unit match in the quote protects this claim
+            # quantity from unrelated quote quantities．
+            if (core, unit.casefold()) in quote_exact:
+                continue
+            for quote_core, quote_unit in quote_quantities:
+                if quote_unit.casefold() != unit.casefold():
+                    continue
+                if _precision_conflict(core, quote_core):
+                    details.append(
+                        f"数値の精度が一致しません（claim「{core}{unit}」に対し引用は「{quote_core}{quote_unit}」）．"
+                        "引用の数値を丸めたり精度を加えたりしたclaimはsupportとして扱いません．"
+                    )
+    claim_level = _comparison_level(claim_text)
+    if claim_level and claim_level > _comparison_level(quote_text):
+        details.append(
+            "claimが引用より強い比較表現（同等・優位など）を使用しています．"
+            "引用が同じ以上の強さの比較を示さないため，supportとして扱いません．"
+        )
+    return list(dict.fromkeys(details))
+
+
 def apply_review(
     claims: list[Claim], evidence: list[Evidence], review: Review, groups: list[OriginGroup]
 ) -> list[Claim]:
@@ -350,6 +547,7 @@ def apply_review(
         claim.uncertainty = _unique([*claim.uncertainty, *check.uncertainty])
         supporting: list[Evidence] = []
         contradicting: list[Evidence] = []
+        support_conflicts: list[str] = []
         for item_check in check.evidence_checks:
             item = evidence_map[item_check.evidence_id]
             item.relation = item_check.relation
@@ -362,9 +560,24 @@ def apply_review(
                     f"{item.evidence_id}: 条件・日時・version等が不一致．{item_check.reason}"
                 )
             elif item_check.relation == "supports":
-                supporting.append(item)
+                details = _support_conflicts(claim.text, item.quote)
+                if details:
+                    # The deterministic guard overrides the review relation so the
+                    # item is persisted and rendered as context，not support．
+                    item.relation = "context_only"
+                    item.check_reason = f"{item_check.reason}{''.join(details)}"
+                    for detail in details:
+                        claim.uncertainty.append(f"{item.evidence_id}: {detail}")
+                    support_conflicts.extend(details)
+                else:
+                    supporting.append(item)
             elif item_check.relation == "contradicts":
                 contradicting.append(item)
+        if support_conflicts:
+            claim.reason += (
+                " 決定的整合性チェックでclaimと引用の間に数値の精度差または比較表現の強さの差を検出したため，"
+                "該当のevidenceをsupportとして計りません．"
+            )
         primary = any(item.is_primary for item in supporting)
         confirmed = set()
         for item in supporting:

@@ -4,7 +4,7 @@ CLIは設定と公開質問を受け取り，Job別directoryを作ります．re
 
 `schema.py`はschema version0.1の正本です．unknown fieldを拒否するPydantic型を利用します．`models.py`は明示したChat Completions endpointにPydantic AIを接続し，schema出力と有限retryを扱います．`search.py`は設定済みSearXNGのみ，`fetch.py`は公開HTTP(S)のみを取得します．両者の接続経路は共有しません．
 
-`extraction.py`は取得済みbytesを子processへ渡し，HTMLと物理ページ単位PDFを解析します．time／RSS上限と取消で対象parserだけを停止します．`evidence.py`は全抽出passageの語彙検索，origin統合，引用実在と照合IDの検査を行います．意味の支持を形式検証の合格と混同しません．
+`extraction.py`は取得済みbytesを子processへ渡し，HTMLと物理ページ単位PDFを解析します．time／RSS上限と取消で対象parserだけを停止します．`evidence.py`は全抽出passageの語彙検索，origin統合，引用実在と照合IDの検査を行います．意味の支持を形式検証の合格と混同しません．reviewがsupportsとしたevidenceについて，claim本文と引用の決定的整合性（数値の精度，比較表現の強さ）を検査し，検査に落ちた引用は`context_only`として保存されsupportへ数えず，claimは残りの有効な根拠がその状態を満たさなくなった場合にのみ降格します（[ADR-0002](adr/0002-claim-citation-consistency.md)）．
 
 `report.py`は検査済みのclaim IDからMarkdownを生成します．最終生成用LLMは呼びません．`store.py`はGit外Job directoryへJSON正本，レポート，events，metrics，hashをUTF-8で保存します．取消や上限でも検査済み部分を返します．プロセス強制kill後の自動復旧はPhase 1の範囲外です．
 

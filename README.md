@@ -23,7 +23,7 @@ UI，stdio daemon，Runtime／Karte実接続，SQLite，resume，同時Job，分
 
 Phase 1実装です．実行したfixture・実モデル試験，未検証のOS／profile，検索基盤の制約は[検証記録](docs/phase1-validation.md)に記載します．`completed`は処理完了を表し，すべての主張が真実だという保証ではありません．`answerability`で回答範囲を別記します．
 
-現環境ではSearXNGのCAPTCHAにより検索発見のlive経路は未検証です．既知の公開資料を補足したQwen実行ではHTML・PDF引用を採用できましたが，数値の精度差や比較表現の過大解釈を意味照合が見逃す例があり，調査品質の合格とは扱っていません．
+現環境ではSearXNGのCAPTCHAにより検索発見のlive経路は未検証です．既知の公開資料を補足したQwen実行ではHTML・PDF引用を採用できましたが，数値の精度差や比較表現の過大解釈を意味照合が見逃す例があり，調査品質の合格とは扱っていません．これを受けて`evidence.py`の`apply_review`にclaimと引用の決定的整合性チェック（数値の精度，比較表現の強さ）を追加しました．検査に落ちた引用はsupportとして数えず`context_only`として保存し，claimは残りの有効な根拠がその状態を満たさなくなった場合にのみ降格します．チェックは観測された失敗形状のみの狭い範囲をoffline testでカバーしており，live経路の再実行はまだ行っていません．その他の過大解釈の検出は同一モデルの別context照合と人の再確認に任せます．
 
 無料枠向けのTavily検索providerを追加しました．無料プラン・使用量・残量を検索前に確認し，basic検索を最大10credit／Jobに制限します．利用者実行のdoctorで使用量API・実検索1回・Qwen接続の成功を確認しました．`paygo_limit`のnullは未報告として保持し，無料枠の残量で制限します．設定・`doctor --usage-only`の診断手順と検証範囲は[Tavily検証](docs/tavily-validation.md)を参照してください．
 
