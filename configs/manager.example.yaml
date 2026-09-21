@@ -1,0 +1,13 @@
+# Git外へコピーして使う．credential本体は環境変数にだけ設定する．
+manager:
+  host: 127.0.0.1
+  port: 8321
+  database_path: /absolute/private/ephy-manager/manager.db
+  artifact_dir: /absolute/private/ephy-manager/artifacts
+  requester_credential_env: EPHY_MANAGER_REQUESTER_CREDENTIAL
+  worker_credentials_env:
+    collector-01: EPHY_COLLECTOR_01_CREDENTIAL
+  lease_ttl_seconds: 45
+  worker_offline_seconds: 90
+  max_artifact_bytes: 20971520
+  max_artifacts_per_job: 32

@@ -157,6 +157,9 @@ def worker(tmp_path, **kwargs):
     config = SimpleNamespace(limits=Limits(), search=SimpleNamespace(engine="fixture"))
     store = JobStore(tmp_path)
     model = kwargs.pop("model", FakeModel())
+    if "collector" in kwargs:
+        # collector モードでは local search/fetcher は構築しない（None のまま）．
+        return ResearchExecutor(config, "fixture", store, model=model, collector=kwargs.pop("collector"))
     return ResearchExecutor(
         config,
         "fixture",
@@ -165,6 +168,138 @@ def worker(tmp_path, **kwargs):
         search=kwargs.pop("search", FakeSearch()),
         fetcher=kwargs.pop("fetcher", FakeFetcher()),
     )
+
+
+class FakeCollector:
+    """collector の二阶段インターフェースを worker 側採番（s1..）で模した fake．"""
+
+    mode = "remote"
+
+    def __init__(self, *, fail_search=False):
+        from ephy_worker.collector import ExtractStageResult, SearchStageResult
+
+        self.stage_results = (SearchStageResult, ExtractStageResult)
+        self.search_calls = []
+        self.extract_calls = []
+        self.fail_search = fail_search
+        self.closed = False
+
+    @property
+    def metadata(self):
+        return {"mode": self.mode, "contract": "0.4", "endpoint": "fixture"}
+
+    async def search(self, items, *, round_index=0, topic=""):
+        from ephy_worker.remote_collector import RemoteCollectorError
+
+        if self.fail_search:
+            raise RemoteCollectorError("search_timeout")
+        self.search_calls.append({"round_index": round_index, "items": list(items)})
+        queries = []
+        candidates = []
+        for query_id, query in items:
+            queries.append(
+                {
+                    "query_id": query_id, "text": query.text, "role": query.role, "reason": query.reason,
+                    "status": "ok", "result_count": 5, "diagnostic": {},
+                }
+            )
+            candidates.extend(
+                Candidate(
+                    url=f"https://example.org/{query_id}/{i}",
+                    title="Version 2 spec",
+                    query_id=query_id,
+                    engine="fixture",
+                    rank=i,
+                )
+                for i in range(5)
+            )
+        return self.stage_results[0](
+            queries=queries,
+            candidates=candidates,
+            usage={"search_requests": len(items), "search_credits": 0, "model_requests": 0},
+        )
+
+    async def extract(self, items, *, round_index=0, topic=""):
+        self.extract_calls.append({"round_index": round_index, "items": list(items)})
+        sources = []
+        for index, (_preassigned_id, candidate) in enumerate(items, start=1):
+            # worker は job 内で s1.. を採番し，先渡しの S 連番は無視する．
+            source_id = f"s{index}"
+            body = "Version 2 は10件まで対応します．"
+            sources.append(
+                Source(
+                    source_id=source_id,
+                    requested_url=candidate.url,
+                    final_url=candidate.url,
+                    title="Version 2 spec",
+                    kind="html",
+                    status="ok",
+                    http_status=200,
+                    passages=[
+                        Passage(
+                            source_id=source_id,
+                            passage_id=f"{source_id}-html-0",
+                            text=body,
+                            start=0,
+                            end=len(body),
+                        )
+                    ],
+                )
+            )
+        return self.stage_results[1](
+            sources=sources,
+            usage={"fetch_requests": len(items), "document_bytes": 0, "model_requests": 0},
+        )
+
+    async def aclose(self):
+        self.closed = True
+
+
+async def test_collector_mode_two_stage_flow(tmp_path):
+    collector = FakeCollector()
+    w = worker(tmp_path, collector=collector)
+    report = await w.run("Version 2 の上限を確認してください")
+    assert report.state == "completed"
+    # local provider は構築されず，collector だけが収集に使う．
+    assert w.search is None and w.fetcher is None and collector.closed is True
+    # search job 1 回（plan の 3 query），extract job 1 回（選択した 5 候補）．
+    assert [c["round_index"] for c in collector.search_calls] == [0]
+    assert [c["round_index"] for c in collector.extract_calls] == [0]
+    assert [q[0] for q in collector.search_calls[0]["items"]] == ["Q1", "Q2", "Q3"]
+    assert [s[0] for s in collector.extract_calls[0]["items"]] == [f"S{i}" for i in range(1, 6)]
+    # report の queries には Q 連番，sources には worker の s 連番が S 連番へ付け直される．
+    assert [q["query_id"] for q in report.queries] == ["Q1", "Q2", "Q3"]
+    assert [s.source_id for s in report.sources] == [f"S{i}" for i in range(1, 6)]
+    for source in report.sources:
+        for passage in source.passages:
+            assert passage.source_id == source.source_id
+    assert report.metrics["collection"]["mode"] == "remote"
+
+
+async def test_collector_mode_followup_round_passage_ids_unique(tmp_path):
+    collector = FakeCollector()
+    report = await worker(tmp_path, model=FakeModel(additional=True), collector=collector).run(
+        "Version 2 の上限を確認してください"
+    )
+    assert report.state == "completed"
+    assert report.stop_reason == "additional_round_limit"
+    assert [c["round_index"] for c in collector.search_calls] == [0, 1]
+    assert [c["round_index"] for c in collector.extract_calls] == [0, 1]
+    # round 1 でも worker は s1.. を採番するため，付け直し後は report 全体で passage_id が一意．
+    passage_ids = [p.passage_id for s in report.sources for p in s.passages]
+    assert len(passage_ids) == len(set(passage_ids))
+    # フォローアップ round は追加 3 件まで（select_candidates の target）．
+    assert [s.source_id for s in report.sources] == [f"S{i}" for i in range(1, 9)]
+    assert [s[0] for s in collector.extract_calls[1]["items"]] == ["S6", "S7", "S8"]
+
+
+async def test_collector_failure_marks_job_failed(tmp_path):
+    collector = FakeCollector(fail_search=True)
+    report = await worker(tmp_path, collector=collector).run("Version 2 の上限を確認してください")
+    assert report.state == "failed"
+    assert report.stop_reason == "stage_failed"
+    assert {"stage": "search", "code": "search_timeout"} in report.failures
+    assert collector.closed is True
 
 
 async def test_complete_report_provenance_and_fresh_job(tmp_path):

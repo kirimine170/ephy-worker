@@ -2,7 +2,7 @@
 
 ## Overview
 
-認可された公開Web調査を1プロセス・1Jobで実行する，Python 3.12–3.14向けCLIです．質問を検索計画へ分け，SearXNGまたはTavilyで探索し，HTML／テキストPDFの本文から根拠を抽出して別contextで照合します．`report.json`を正本として日本語Markdownを生成します．
+認可された公開Web調査を実行する，Python 3.12–3.14向けCLIです．質問を検索計画へ分け，SearXNGまたはTavilyで探索し，HTML／テキストPDFの本文から根拠を抽出して別contextで照合します．`report.json`を正本として日本語Markdownを生成します．検索・取得・本文抽出は，同processまたはLLMを持たない別PCの収集Workerで実行できます．
 
 ## Role in the Ephy ecosystem
 
@@ -17,11 +17,11 @@ Workerは調査Job内の実行・予算・出典を所有します．目的・�
 
 ## Non-goals
 
-UI，stdio daemon，Runtime／Karte実接続，SQLite，resume，同時Job，分散処理，OCR，JSブラウザ，認証回避，両モデル比較，汎用評価runnerはPhase 1に含めません．
+UI，stdio daemon，Runtime／Karte実接続，自動再割当，中間resume，複数調査の並列化，OCR，JSブラウザ，認証回避，両モデル比較，汎用評価runnerは対象外です．
 
 ## Current status
 
-Phase 1実装です．実行したfixture・実モデル試験，未検証のOS／profile，検索基盤の制約は[検証記録](docs/phase1-validation.md)に記載します．`completed`は処理完了を表し，すべての主張が真実だという保証ではありません．`answerability`で回答範囲を別記します．
+Phase 1の調査処理に加え，Phase 2の分散収集経路を実装しています．実行したfixture・実モデル試験，未検証のOS／profile，検索基盤の制約は[Phase 1検証](docs/phase1-validation.md)と[Phase 2検証](docs/phase2-validation.md)に記載します．`completed`は処理完了を表し，すべての主張が真実だという保証ではありません．`answerability`で回答範囲を別記します．
 
 現環境ではSearXNGのCAPTCHAにより検索発見のlive経路は未検証です．既知の公開資料を補足したQwen実行ではHTML・PDF引用を採用できましたが，数値の精度差や比較表現の過大解釈を意味照合が見逃す例があり，調査品質の合格とは扱っていません．これを受けて`evidence.py`の`apply_review`にclaimと引用の決定的整合性チェック（数値の精度，比較表現の強さ）を追加しました．検査に落ちた引用はsupportとして数えず`context_only`として保存し，claimは残りの有効な根拠がその状態を満たさなくなった場合にのみ降格します．チェックは観測された失敗形状のみの狭い範囲をoffline testでカバーしており，live経路の再実行はまだ行っていません．その他の過大解釈の検出は同一モデルの別context照合と人の再確認に任せます．
 
@@ -29,7 +29,7 @@ Phase 1実装です．実行したfixture・実モデル試験，未検証のOS�
 
 ## Architecture
 
-`config`／`models`／`search`／`fetch`／`extraction`／`evidence`／`research`／`report`／`store`をCLIから分離しています．[設計判断](docs/adr/0001-phase1-public-research.md)と[処理境界](docs/architecture.md)を参照してください．Workerはモデルにshell・ファイル・credential・URL取得のtoolを渡しません．
+`config`／`models`／`search`／`fetch`／`extraction`／`evidence`／`research`／`report`／`store`をCLIから分離しています．Phase 2では`collector`／`manager`／`worker_service`を追加し，調査判断と資料収集を契約0.4で分けます．[Phase 1設計](docs/adr/0001-phase1-public-research.md)，[Phase 2設計](docs/adr/0003-phase2-distributed-collection.md)，[処理境界](docs/architecture.md)を参照してください．Workerはモデルにshell・ファイル・credential・URL取得のtoolを渡しません．
 
 ## Repository relationships
 
@@ -80,6 +80,37 @@ uv run python -m ephy_worker doctor --config /absolute/private/worker.yaml --pro
 uv run python -m ephy_worker research --config /absolute/private/worker.yaml --profile qwen-local --question "公開の技術比較質問" --output-dir /absolute/private/research-output
 ```
 
+### Phase 2の分散収集
+
+Manager，収集Worker，調査processは役割別の設定を使います．例をGit外へコピーし，絶対pathと環境変数を利用環境へ合わせます．credentialは十分長い乱数を各端末の環境変数に設定し，YAMLやshell historyへ値を直接書かないでください．Managerはloopbackにだけbindします．別PCからはSSH port forwarding等の暗号化tunnelで各端末の`127.0.0.1:8321`へ接続するか，検証済みのHTTPS reverse proxyを用意します．平文HTTPのLAN公開は既定で拒否します．
+
+```text
+cp configs/manager.example.yaml /absolute/private/manager.yaml
+cp configs/collector-worker.example.yaml /absolute/private/collector.yaml
+cp configs/research-remote.example.yaml /absolute/private/research-remote.yaml
+uv run python -m ephy_worker manager run --config /absolute/private/manager.yaml
+uv run python -m ephy_worker worker run --config /absolute/private/collector.yaml
+uv run python -m ephy_worker manager workers --config /absolute/private/manager.yaml
+uv run python -m ephy_worker research --config /absolute/private/research-remote.yaml --profile qwen-local --mode remote --question "公開の技術比較質問" --output-dir /absolute/private/research-output
+```
+
+調査processは検索語生成，候補選択，引用照合，追加round，レポート生成を担当します．収集Workerは`web.collect`の`search`と`extract`だけを実行し，LLMへ接続しません．指定した`target_worker_id`が未登録，offline，能力不一致の場合は待機理由を返し，localへ自動切替しません．
+
+手動Job操作は次のとおりです．`submit`用JSONは[例](configs/job-search.example.json)をGit外へコピーし，`submit_key`を再送単位で固定します．同じkeyと同じ入力の再送は同じJobを返し，異なる入力は拒否されます．
+
+```text
+uv run python -m ephy_worker job submit --config /absolute/private/manager.yaml --file /absolute/private/job-search.json
+uv run python -m ephy_worker job status --config /absolute/private/manager.yaml --job-id JOB_ID
+uv run python -m ephy_worker job cancel --config /absolute/private/manager.yaml --job-id JOB_ID
+uv run python -m ephy_worker job result --config /absolute/private/manager.yaml --job-id JOB_ID
+uv run python -m ephy_worker job retry --config /absolute/private/manager.yaml --job-id JOB_ID
+uv run python -m ephy_worker job delete --config /absolute/private/manager.yaml --job-id JOB_ID
+```
+
+各processは`Ctrl+C`で停止します．Manager停止前に調査processと収集Workerを止めます．Workerとの通信が切れた通常実行Jobはlease失効後に`lost`となり，遅延結果は拒否されます．取消要求中に通信が切れたJobは，停止確認がないため`cancel_requested`のまま残ります．状態と原因を確認してから明示retryしてください．自動再割当や中間resumeはありません．
+
+ManagerのSQLiteとartifact directoryは同じPCのローカルdiskへ置き，ネットワーク共有しません．terminal Jobの成果物が不要になったら`job delete`でDB参照と管理対象ファイルを削除します．Managerのartifact directory内を個別に削除すると参照が壊れます．2台用の接続情報はManager側のtunnel到達先，両credential環境変数，収集側の検索provider URLまたはTavily key，調査側のLLM endpoint／model IDです．
+
 Windowsでは絶対pathを例として`"C:\Users\you\ephy-worker-private\worker.yaml"`のように渡します．空白・日本語を含むpathは引用符で囲んでください．DeepSeek利用時は同じcommandのprofileだけを`deepseek-local`へ変更します．既知の公開PDFを補足する場合は`--source-url "https://example.org/paper.pdf"`を付けます．検索発見と実行者指定は区別して記録します．
 
 `doctor`はSearXNGのJSON／設定engine／障害，model IDの存在，選択した型付き出力mode，出力先を検査します．CAPTCHA・403・429・timeoutを検索0件として扱いません．model discoveryもmodel request数に含みます．検索語は外部検索サービスへ送信されるため，完全オフラインではありません．公開質問だけを渡してください．
@@ -116,7 +147,8 @@ PDFはContent-TypeとPDF magicを確認し，1始まりの**物理ページ番�
 ```bash
 uv sync --locked
 uv run python -m pytest -q
-uv run ruff check src tests/test_research.py tests/test_workflow_edges.py tests/test_cli.py tests/test_evidence.py tests/test_fetch.py tests/test_extraction.py tests/test_providers.py tests/test_tavily.py
+uv run ruff check src tests/test_research.py tests/test_workflow_edges.py tests/test_cli.py tests/test_evidence.py tests/test_fetch.py tests/test_extraction.py tests/test_providers.py tests/test_tavily.py tests/test_manager.py tests/test_manager_http.py tests/test_worker_service.py
+PYTHONPATH=src .venv/bin/python scripts/validate_phase2_processes.py
 python3 scripts/validate_repository.py --check-sensitive-patterns
 ```
 
@@ -133,6 +165,8 @@ Windowsのrepository validationは`python scripts/validate_repository.py --check
 - [Architecture](docs/architecture.md)
 - [Phase 1 ADR](docs/adr/0001-phase1-public-research.md)
 - [Phase 1 validation](docs/phase1-validation.md)
+- [Phase 2 distributed collection ADR](docs/adr/0003-phase2-distributed-collection.md)
+- [Phase 2 validation](docs/phase2-validation.md)
 - [Tavily free-plan validation](docs/tavily-validation.md)
 - [Repository relationships](docs/repository-relations.md)
 - [Security and data handling](docs/security-and-data.md)
