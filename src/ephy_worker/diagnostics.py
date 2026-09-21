@@ -9,7 +9,7 @@ from typing import Literal
 from pydantic import Field
 
 from .budget import Budget, BudgetExceeded
-from .config import ConfigurationError, WorkerConfig
+from .config import ConfigurationError, WorkerConfig, _resolve
 from .models import ModelError, ModelRunner
 from .schema import Extraction, StrictModel
 from .search import SearchError, create_search_provider
@@ -27,7 +27,7 @@ async def doctor(
     *,
     usage_only: bool = False,
 ) -> dict:
-    if usage_only and config.search.provider != "tavily":
+    if usage_only and (config.search is None or config.search.provider != "tavily"):
         raise ConfigurationError("usage-only requires Tavily search provider")
     budget = Budget(config.limits)
     result: dict = {"ok": True, "search": {}, "profiles": {}, "output": None}
@@ -35,6 +35,8 @@ async def doctor(
         result["mode"] = "usage_only"
     search = None
     try:
+        if config.search is None:
+            raise ConfigurationError("search is not configured")
         search = create_search_provider(config.search, budget)
         result["search"] = await search.engine_health()
         if not result["search"]["enabled"]:
@@ -123,6 +125,26 @@ async def doctor(
         except (OSError, ValueError) as exc:
             result["output"] = {"writable": False, "error": type(exc).__name__}
             result["ok"] = False
+    # remote/worker/manager セクションは設定レベルのみ確認する（稼働サービスへの接続はしない）．
+    sections = (
+        ("remote", config.remote, lambda s: bool(s.resolve_credential())),
+        ("worker", config.worker_service, lambda s: bool(s.resolve_credential())),
+        (
+            "manager",
+            config.manager,
+            lambda s: len(s.resolved_worker_credentials()) >= 1
+            and bool(_resolve(None, s.requester_credential_env, "manager requester credential")),
+        ),
+    )
+    for name, section, check in sections:
+        if section is None:
+            continue
+        try:
+            ok = bool(check(section))
+        except Exception:  # noqa: BLE001 — credential 解決失敗は doctor 結果として記録するだけ
+            ok = False
+        result[name] = {"configured": True, "ok": ok}
+        result["ok"] = result["ok"] and ok
     result["metrics"] = budget.snapshot()
     if search is not None:
         result["metrics"]["search"] = search.metadata

@@ -1,0 +1,14 @@
+# LLM profileは不要．管理サービスはloopback tunnel経由またはHTTPSを使う．
+worker_service:
+  manager_url: http://127.0.0.1:8321
+  worker_id: collector-01
+  credential_env: EPHY_COLLECTOR_01_CREDENTIAL
+  heartbeat_interval_seconds: 20
+  poll_interval_seconds: 2
+  search:
+    provider: searxng
+    base_url_env: EPHY_SEARXNG_BASE_URL
+    engine: duckduckgo
+    max_results: 8
+    timeout_seconds: 30
+    retries: 1

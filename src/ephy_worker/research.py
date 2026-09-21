@@ -37,7 +37,9 @@ def prompt(task: str, data: dict) -> str:
 
 
 class ResearchExecutor:
-    def __init__(self, config, profile_id: str, store: JobStore, *, model=None, search=None, fetcher=None):
+    def __init__(
+        self, config, profile_id: str, store: JobStore, *, model=None, search=None, fetcher=None, collector=None
+    ):
         from .fetch import PublicFetcher
         from .models import ModelRunner
         from .search import create_search_provider
@@ -47,8 +49,14 @@ class ResearchExecutor:
         self.store = store
         self.profile_id = profile_id
         self.model = model or ModelRunner(config.model_profiles[profile_id], self.budget)
-        self.search = search or create_search_provider(config.search, self.budget)
-        self.fetcher = fetcher or PublicFetcher(self.budget)
+        self.collector = collector
+        # collector mode は research 側で search/fetch を直接実行しない．
+        # provider を作らないことで，local credential を解決しない（remote のみ）設定でも動く．
+        self.search = search
+        self.fetcher = fetcher
+        if collector is None:
+            self.search = self.search or create_search_provider(config.search, self.budget)
+            self.fetcher = self.fetcher or PublicFetcher(self.budget)
         self.current_stage = "starting"
         self.report: Report | None = None
         self.candidates: dict[str, Candidate] = {}
@@ -138,14 +146,15 @@ class ResearchExecutor:
                 self.budget.stage_seconds["search"] += round(time.monotonic() - started, 3)
         return fresh
 
-    async def acquire(self, fresh: list[Candidate], *, first: bool) -> int:
+    async def select_candidates(self, fresh: list[Candidate], *, first: bool) -> list[Candidate]:
+        """fresh 候補から fetch 対象を選択する（Selection model + 決定的 fallback）．"""
         available = [c for c in fresh if normalize_url(c.url) not in self.budget.source_keys]
         if not available:
-            return 0
+            return []
         remaining = self.config.limits.max_sources - len(self.budget.source_keys)
         target = min(self.config.limits.initial_sources if first else 3, remaining, len(available))
         if not target:
-            return 0
+            return []
         # Prioritize explicit supplemental references and preserve their provenance．
         selected = [c for c in available if c.supplied][:target]
         others = [c for c in available if c not in selected]
@@ -169,6 +178,10 @@ class ResearchExecutor:
                     self.failure("select", "unknown_candidate_url")
             # LLM may select too few．Bounded rank-order exploration supplies the remaining slots．
             selected.extend(c for c in others if c not in selected and len(selected) < target)
+        return selected
+
+    async def acquire(self, fresh: list[Candidate], *, first: bool) -> int:
+        selected = await self.select_candidates(fresh, first=first)
         count = 0
         for candidate in selected:
             self.budget.check()
@@ -351,6 +364,9 @@ class ResearchExecutor:
         return review
 
     async def _execute(self, supplemental_urls: list[str]) -> None:
+        if self.collector is not None:
+            await self._execute_via_collector(supplemental_urls)
+            return
         plan = await self.call(
             Plan,
             "問いを確認項目へ分けて，異なる役割の検索語を3〜5本作成します．overview（全体像），primary（一次資料），"
@@ -405,6 +421,175 @@ class ResearchExecutor:
         elif not any(s.passages for s in self.report.sources):
             self.report.stop_reason = "no_readable_sources"
 
+    async def _execute_via_collector(self, supplemental_urls: list[str]) -> None:
+        """collector 経由の収集（契約 0.4）：plan/search/select/extract/review は research 側で実行し，
+        worker は search / extract の job だけを行う．"""
+        plan = await self.call(
+            Plan,
+            "問いを確認項目へ分けて，異なる役割の検索語を3〜5本作成します．overview（全体像），primary（一次資料），"
+            "limitations（制約・失敗・訂正）の各役割を最低1本含めます．同じ語の反復で本数を増やしません．",
+            {"question": self.report.question, "as_of": self.report.created_at},
+            "plan",
+        )
+        roles = {q.role for q in plan.queries}
+        if not {"overview", "primary", "limitations"} <= roles:
+            raise ValueError("plan_missing_query_roles")
+        if len({" ".join(q.text.casefold().split()) for q in plan.queries}) < 3:
+            raise ValueError("plan_duplicate_queries")
+        self.report.subquestions = plan.subquestions
+        self.event("plan_ready", subquestions=plan.subquestions, query_count=len(plan.queries))
+        # 1) search job：worker が plan queries を検索し，候補のみ返す．
+        self.current_stage = "search"
+        search_result = await self.collector.search(
+            [(f"Q{index + 1}", query) for index, query in enumerate(plan.queries)],
+            round_index=0,
+            topic=self.report.question,
+        )
+        fresh = self._absorb_search(search_result)
+        for url in supplemental_urls:
+            key = normalize_url(url)
+            candidate = Candidate(url=url, title="利用者／実行者が指定した追加公開資料", supplied=True)
+            if key not in self.candidates:
+                fresh.insert(0, candidate)
+                self.candidates[key] = candidate
+            else:
+                self.candidates[key].supplied = True
+        # 2) 選択（research 側の model）→ 3) extract job：選択済み候補だけを取得する．
+        selected = await self.select_candidates(fresh, first=True)
+        self.current_stage = "fetch"
+        extract_result = await self.collector.extract(
+            self._extract_items(selected),
+            round_index=0,
+            topic=self.report.question,
+        )
+        acquired = self._absorb_extract(extract_result)
+        review = await self.examine(0)
+        self.report.rounds.append(
+            {
+                "round": 0,
+                "new_readable_sources": acquired,
+                "checked_claims": sum(c.checked for c in self.report.claims),
+            }
+        )
+        self.event("round_completed", **self.report.rounds[-1])
+        self.report.stop_reason = "no_actionable_gaps"
+        if review and review.additional_queries:
+            if self.config.limits.model_requests - self.budget.counts["model_requests"] < 3:
+                raise BudgetExceeded("model_requests_reserved_for_review")
+            followup = [q for q in review.additional_queries if q.reason.strip() and q.role == "gap"]
+            if followup:
+                self.current_stage = "search"
+                search_result = await self.collector.search(
+                    [(f"Q{len(self.report.queries) + index + 1}", query) for index, query in enumerate(followup)],
+                    round_index=1,
+                    topic=self.report.question,
+                )
+                fresh = self._absorb_search(search_result)
+                selected = await self.select_candidates(fresh, first=False)
+                if selected:
+                    self.current_stage = "fetch"
+                    extract_result = await self.collector.extract(
+                        self._extract_items(selected),
+                        round_index=1,
+                        topic=self.report.question,
+                    )
+                    acquired = self._absorb_extract(extract_result)
+                else:
+                    acquired = 0
+                if acquired:
+                    await self.examine(1)
+                self.report.rounds.append(
+                    {
+                        "round": 1,
+                        "new_readable_sources": acquired,
+                        "checked_claims": sum(c.checked for c in self.report.claims),
+                    }
+                )
+                self.event("round_completed", **self.report.rounds[-1])
+                self.report.stop_reason = "additional_round_limit" if acquired else "no_new_evidence"
+        elif not any(s.passages for s in self.report.sources):
+            self.report.stop_reason = "no_readable_sources"
+
+    def _extract_items(self, selected: list[Candidate]) -> list[tuple[str, Candidate]]:
+        """extract job への (source_id, candidate) 列（report の連番を先渡しする）．"""
+        return [
+            (f"S{len(self.report.sources) + index + 1}", candidate)
+            for index, candidate in enumerate(selected)
+        ]
+
+    def _absorb_search(self, result) -> list[Candidate]:
+        """search job の結果を report へ取り込み，新規候補を返す．
+
+        query_id は research 側が report の連番（Q1..）で先渡しするため，再マッピングは不要．
+        """
+        fresh: list[Candidate] = []
+        self.budget.take("search_requests", int(result.usage.get("search_requests", 0)))
+        self.budget.take("max_queries", len(result.queries))
+        self.budget.stage_seconds["search"] += result.elapsed_seconds
+        for entry in result.queries:
+            # worker は local な gather と同じ run_search_stage を使うため，query 項目の形状は一致する．
+            self.report.queries.append(dict(entry))
+            self.budget.query_keys.add(" ".join(str(entry.get("text", "")).casefold().split()))
+            self.event("search_completed", query_id=entry.get("query_id"), result_count=entry.get("result_count", 0))
+        for candidate in result.candidates:
+            key = normalize_url(candidate.url)
+            if key and key not in self.candidates:
+                self.candidates[key] = candidate
+                self.report.candidates.append(candidate)
+                fresh.append(candidate)
+        self.report.failures.extend(result.failures)
+        return fresh
+
+    def _absorb_extract(self, result) -> int:
+        """extract job の結果を report へ取り込み，新規 readable source 数を返す．
+
+        report の source/passages は S 連番の単一 namespace であり，passage_id は report 全体で
+        一意である必要がある（evidence 検証の前提）．LocalCollector は先渡しの ID をそのまま使うが，
+        RemoteCollector の worker は job 内で s1.. を採番するため，位置付きで report の
+        namespace へ付け直す（round をまたいでも衝突しない）．
+        """
+        acquired = 0
+        base = len(self.report.sources)
+        self.budget.take("fetch_requests", int(result.usage.get("fetch_requests", 0)))
+        self.budget.take("max_sources", len(result.sources))
+        self.budget.stage_seconds["fetch"] += result.elapsed_seconds
+        for index, source in enumerate(result.sources):
+            new_id = f"S{base + index + 1}"
+            old_id = source.source_id
+            if new_id != old_id:
+                prefix = f"{old_id}-"
+                passages = [
+                    passage.model_copy(
+                        update={
+                            "source_id": new_id,
+                            "passage_id": (
+                                f"{new_id}-{passage.passage_id[len(prefix):]}"
+                                if passage.passage_id.startswith(prefix)
+                                else passage.passage_id
+                            ),
+                        }
+                    )
+                    for passage in source.passages
+                ]
+                source = source.model_copy(update={"source_id": new_id, "passages": passages})
+            self.report.sources.append(source)
+            key = normalize_url(source.final_url or source.requested_url)
+            if key:
+                self.budget.source_keys.add(key)
+            if source.passages:
+                acquired += 1
+            if source.status != "ok":
+                self.failure("fetch", f"{source.source_id}:{source.status}")
+            self.event(
+                "source_fetched",
+                source_id=source.source_id,
+                status=source.status,
+                passage_count=len(source.passages),
+                source_kind=source.kind,
+            )
+        self.report.failures.extend(result.failures)
+        return acquired
+
     async def run(self, question: str, supplemental_urls: list[str] | None = None) -> Report:
         from .search import validate_public_text
 
@@ -435,7 +620,9 @@ class ResearchExecutor:
             self.failure(self.current_stage, getattr(exc, "code", type(exc).__name__))
         finally:
             # Closing a client cancels this request only．Never stop shared servers．
-            for client in (self.fetcher, self.search, self.model):
+            for client in (self.collector, self.fetcher, self.search, self.model):
+                if client is None:
+                    continue
                 try:
                     async with asyncio.timeout(1.0):
                         await client.aclose()
@@ -462,8 +649,9 @@ class ResearchExecutor:
                 "dependencies": {
                     name: version(name) for name in ("pydantic-ai-slim", "trafilatura", "pypdf", "aiohttp")
                 },
-                "search_engine": self.config.search.engine,
-                "search": getattr(self.search, "metadata", {}),
+                "search_engine": self.config.search.engine if self.config.search is not None else None,
+                "search": getattr(self.search, "metadata", {}) if self.search is not None else {},
+                "collection": self.collector.metadata if self.collector is not None else {},
                 "source_count": len(self.report.sources),
                 "domain_count": len(
                     {urlsplit(s.final_url or s.requested_url).hostname for s in self.report.sources}

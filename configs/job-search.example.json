@@ -1,0 +1,41 @@
+{
+  "contract": "0.4",
+  "submit_key": "replace-with-a-unique-key",
+  "parent_job_id": null,
+  "kind": "web.collect",
+  "input": {
+    "mode": "search",
+    "topic": "公開仕様の確認",
+    "round_index": 0,
+    "queries": [
+      {
+        "query_id": "Q1",
+        "text": "public specification example",
+        "role": "primary",
+        "reason": "一次資料を探す"
+      }
+    ]
+  },
+  "target_worker_id": "collector-01",
+  "budget": {
+    "max_queries": 1,
+    "search_requests": 2,
+    "max_sources": 1,
+    "fetch_requests": 1,
+    "model_requests": 1,
+    "job_seconds": 300,
+    "request_seconds": 120,
+    "parser_seconds": 20,
+    "parser_memory_mb": 512,
+    "html_bytes": 5242880,
+    "pdf_bytes": 20971520,
+    "text_chars": 200000,
+    "pdf_pages": 100,
+    "cache_bytes": 134217728,
+    "initial_sources": 4,
+    "passage_chars": 1600,
+    "selected_passages": 24,
+    "max_redirects": 5
+  },
+  "deadline_seconds": 300
+}

@@ -41,6 +41,27 @@ def service_url(value: str) -> str:
     return value.rstrip("/")
 
 
+def manager_service_url(value: str, *, allow_remote_api: bool, allow_insecure_http: bool) -> str:
+    url = service_url(value)
+    parsed = urlsplit(url)
+    hostname = parsed.hostname or ""
+    try:
+        address = ipaddress.ip_address(hostname)
+        loopback = address.is_loopback
+        private = address.is_private
+    except ValueError:
+        loopback = hostname == "localhost"
+        private = loopback or "." not in hostname or hostname.endswith((".local", ".lan", ".internal"))
+    if not private and not allow_remote_api:
+        raise ConfigurationError("public manager endpoint requires explicit allow_remote_api: true")
+    if parsed.scheme == "http" and not loopback and not allow_insecure_http:
+        raise ConfigurationError(
+            "non-loopback manager endpoint requires HTTPS，a loopback tunnel，"
+            "or explicit allow_insecure_http: true"
+        )
+    return url
+
+
 def _resolve(value: str | None, env: str | None, label: str) -> str:
     resolved = os.environ.get(env, "") if env else (value or "")
     if not resolved.strip():
@@ -195,10 +216,91 @@ class ResolvedProfile(StrictModel):
         return result
 
 
-class WorkerConfig(StrictModel):
-    model_profiles: dict[str, ModelProfile] = Field(min_length=1)
+class RemoteConfig(StrictModel):
+    """remote 収集モードの research 側設定．credential は env のみから解決する．"""
+
+    manager_url: str
+    requester_credential_env: str = Field("EPHY_MANAGER_REQUESTER_CREDENTIAL", pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
+    target_worker_id: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{2,79}$")
+    poll_interval_seconds: float = Field(2.0, gt=0, le=60)
+    max_wait_seconds: float = Field(1800, gt=0, le=7200)
+    deadline_seconds: float = Field(1200, gt=0, le=3600)
+    allow_remote_api: bool = False
+    allow_insecure_http: bool = False
+
+    def endpoint(self) -> str:
+        return manager_service_url(
+            self.manager_url,
+            allow_remote_api=self.allow_remote_api,
+            allow_insecure_http=self.allow_insecure_http,
+        )
+
+    def resolve_credential(self) -> SecretStr:
+        value = _resolve(None, self.requester_credential_env, "manager requester credential")
+        return SecretStr(value)
+
+
+class WorkerServiceConfig(StrictModel):
+    """collector Worker 側設定（別の PC で起動する）．model は使わない．"""
+
+    manager_url: str
+    worker_id: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{2,79}$")
+    credential_env: str = Field("EPHY_WORKER_CREDENTIAL", pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
     search: SearchConfig
+    heartbeat_interval_seconds: float = Field(20, gt=0, le=300)
+    poll_interval_seconds: float = Field(2, gt=0, le=60)
+    allow_remote_api: bool = False
+    allow_insecure_http: bool = False
+
+    def endpoint(self) -> str:
+        return manager_service_url(
+            self.manager_url,
+            allow_remote_api=self.allow_remote_api,
+            allow_insecure_http=self.allow_insecure_http,
+        )
+
+    def resolve_credential(self) -> SecretStr:
+        value = _resolve(None, self.credential_env, "worker credential")
+        return SecretStr(value)
+
+
+class ManagerSettings(StrictModel):
+    """manager サービス本体の設定．worker credential は env 参照のみ．"""
+
+    host: Literal["127.0.0.1", "::1", "localhost"] = "127.0.0.1"
+    port: int = Field(8321, ge=1, le=65535)
+    database_path: Path
+    artifact_dir: Path
+    requester_credential_env: str = Field("EPHY_MANAGER_REQUESTER_CREDENTIAL", pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
+    worker_credentials_env: dict[str, str] = Field(default_factory=dict)
+    lease_ttl_seconds: float = Field(45, gt=0, le=600)
+    worker_offline_seconds: float = Field(90, gt=0, le=3600)
+    max_artifact_bytes: int = Field(20 * 1024**2, ge=4096, le=64 * 1024**2)
+    max_artifacts_per_job: int = Field(32, ge=1, le=128)
+
+    @model_validator(mode="after")
+    def consistent(self):
+        for worker_id, env in self.worker_credentials_env.items():
+            if not re.fullmatch(r"^[a-z0-9][a-z0-9._-]{2,79}$", worker_id):
+                raise ValueError(f"invalid worker_id: {worker_id}")
+            if not re.fullmatch(r"^[A-Za-z_][A-Za-z0-9_]*$", env):
+                raise ValueError(f"invalid environment variable name for worker {worker_id}")
+        return self
+
+    def resolved_worker_credentials(self) -> dict[str, str]:
+        return {
+            worker_id: _resolve(None, env, f"worker credential for {worker_id}")
+            for worker_id, env in self.worker_credentials_env.items()
+        }
+
+
+class WorkerConfig(StrictModel):
+    model_profiles: dict[str, ModelProfile] = Field(default_factory=dict)
+    search: SearchConfig | None = None
     limits: Limits = Field(default_factory=Limits)
+    remote: RemoteConfig | None = None
+    worker_service: WorkerServiceConfig | None = None
+    manager: ManagerSettings | None = None
 
 
 def load_config(path: str | Path) -> WorkerConfig:

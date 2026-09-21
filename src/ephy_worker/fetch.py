@@ -9,7 +9,7 @@ import socket
 import zlib
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
-from typing import Protocol
+from typing import Any, Protocol
 from urllib.parse import urldefrag, urljoin, urlsplit
 
 import aiohttp
@@ -232,13 +232,30 @@ def identify_document(media_type: str, prefix: bytes) -> tuple[str, str | None]:
 
 class PublicFetcher:
     def __init__(
-        self, budget: Budget, *, transport: FetchTransport | None = None, resolver: Resolver | None = None
+        self,
+        budget: Budget,
+        *,
+        transport: FetchTransport | None = None,
+        resolver: Resolver | None = None,
+        document_hook: Callable[[Source, bytes, str], Any] | None = None,
     ):
         self.budget = budget
         self.transport = transport or AioHTTPTransport()
         self.resolver = resolver or resolve_public
+        self.document_hook = document_hook
+        self.hook_errors: list[str] = []
         self._all = asyncio.Semaphore(3)
         self._hosts: dict[str, asyncio.Semaphore] = {}
+
+    async def _call_document_hook(self, source: Source, body: bytes, kind: str) -> None:
+        if self.document_hook is None:
+            return
+        try:
+            result = self.document_hook(source, body, kind)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as exc:  # noqa: BLE001 - artifact 取得失敗で fetch 自体は失敗にしない
+            self.hook_errors.append(f"{source.source_id}:{getattr(exc, 'code', type(exc).__name__)}")
 
     async def aclose(self) -> None:
         await self.transport.aclose()
@@ -320,6 +337,7 @@ class PublicFetcher:
                         source.kind = kind
                         if note:
                             source.limitations.append(note)
+                        await self._call_document_hook(source, bytes(body), kind)
             parsed = await extract_document(
                 bytes(body),
                 url=url,
