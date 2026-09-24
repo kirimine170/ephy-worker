@@ -1,0 +1,17 @@
+{
+  "job_id": "coding-example-001",
+  "task_id": "example-single-file-fix",
+  "goal": "Change calculator.add so it returns the sum of its two arguments.",
+  "repository_path": "/absolute/path/to/a/git/repository",
+  "base_revision": "HEAD",
+  "validation_command": ["python", "-m", "unittest", "discover", "-s", "tests", "-q"],
+  "timeout_seconds": 300,
+  "network_policy": "offline",
+  "model_profile": "mock",
+  "mock_changes": [
+    {
+      "path": "calculator.py",
+      "content": "def add(left, right):\n    return left + right\n"
+    }
+  ]
+}

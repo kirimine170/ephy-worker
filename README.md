@@ -2,7 +2,7 @@
 
 ## Overview
 
-認可された公開Web調査を実行する，Python 3.12–3.14向けCLIです．質問を検索計画へ分け，SearXNGまたはTavilyで探索し，HTML／テキストPDFの本文から根拠を抽出して別contextで照合します．`report.json`を正本として日本語Markdownを生成します．検索・取得・本文抽出は，同processまたはLLMを持たない別PCの収集Workerで実行できます．
+認可された公開Web調査と隔離されたcoding Jobを実行する，Python 3.12–3.14向けCLIです．調査では質問を検索計画へ分け，SearXNGまたはTavilyで探索し，HTML／テキストPDFの本文から根拠を抽出して別contextで照合します．codingではtemporary Git worktree，Pi RPC adapter，独立validation，machine-readable artifactを用います．
 
 ## Role in the Ephy ecosystem
 
@@ -14,14 +14,17 @@ Workerは調査Job内の実行・予算・出典を所有します．目的・�
 - source／passage／claim IDと引用の実在をコードで検査し，意味・条件・版・日時を別段階で照合する．
 - 追加調査は理由付きで最大1roundに制限し，矛盾・未確認点・取得不能を保存する．
 - 取消・timeout・上限時も検査済みの部分結果を保存する．
+- coding modelをprofileで交換し，同じsynthetic taskを隔離worktreeと独立validationで評価する．
 
 ## Non-goals
 
-UI，stdio daemon，Runtime／Karte実接続，自動再割当，中間resume，複数調査の並列化，OCR，JSブラウザ，認証回避，両モデル比較，汎用評価runnerは対象外です．
+UI，stdio daemon，Runtime／Karte実接続，自動再割当，中間resume，複数調査の並列化，OCR，JSブラウザ，認証回避は対象外です．coding機能の自動model weight取得，自動ranking，merge／push／deploy，自己更新も対象外です．
 
 ## Current status
 
 Phase 1の調査処理に加え，Phase 2の分散収集経路を実装しています．実行したfixture・実モデル試験，未検証のOS／profile，検索基盤の制約は[Phase 1検証](docs/phase1-validation.md)と[Phase 2検証](docs/phase2-validation.md)に記載します．`completed`は処理完了を表し，すべての主張が真実だという保証ではありません．`answerability`で回答範囲を別記します．
+
+Coding Evaluation MVPは，Pi RPC adapter，detached worktree，deterministic mock，独立validation，6カテゴリのoffline smoke suiteを実装しています．mac向けcodingの既定Pi backendはRuntimeのcode経路と同じllama.cppです．共有llama.cpp routerで複数GGUFを切り替えるprofileも用意しています．現在の未コミット内容も明示したfileだけ一時snapshotに含め，ephy-worker自身からcandidate patchを作れます．実行境界は[Coding executorとevaluation harness](docs/coding-evaluation.md)を参照してください．
 
 現環境ではSearXNGのCAPTCHAにより検索発見のlive経路は未検証です．既知の公開資料を補足したQwen実行ではHTML・PDF引用を採用できましたが，数値の精度差や比較表現の過大解釈を意味照合が見逃す例があり，調査品質の合格とは扱っていません．これを受けて`evidence.py`の`apply_review`にclaimと引用の決定的整合性チェック（数値の精度，比較表現の強さ）を追加しました．検査に落ちた引用はsupportとして数えず`context_only`として保存し，claimは残りの有効な根拠がその状態を満たさなくなった場合にのみ降格します．チェックは観測された失敗形状のみの狭い範囲をoffline testでカバーしており，live経路の再実行はまだ行っていません．その他の過大解釈の検出は同一モデルの別context照合と人の再確認に任せます．
 
@@ -30,6 +33,8 @@ Phase 1の調査処理に加え，Phase 2の分散収集経路を実装してい
 ## Architecture
 
 `config`／`models`／`search`／`fetch`／`extraction`／`evidence`／`research`／`report`／`store`をCLIから分離しています．Phase 2では`collector`／`manager`／`worker_service`を追加し，調査判断と資料収集を契約0.4で分けます．[Phase 1設計](docs/adr/0001-phase1-public-research.md)，[Phase 2設計](docs/adr/0003-phase2-distributed-collection.md)，[処理境界](docs/architecture.md)を参照してください．Workerはモデルにshell・ファイル・credential・URL取得のtoolを渡しません．
+
+Coding経路は`coding_schema`／`coding_profiles`／`coding_executor`／`evaluation`を調査経路から分離します．Pi固有処理はRPC adapter内だけに置き，`CodingJob → worktree → Pi/mock → patch → validation → CodingResult`を構成します．
 
 ## Repository relationships
 
@@ -79,6 +84,17 @@ model_profiles:
 uv run python -m ephy_worker doctor --config /absolute/private/worker.yaml --profile qwen-local --output-dir /absolute/private/research-output
 uv run python -m ephy_worker research --config /absolute/private/worker.yaml --profile qwen-local --question "公開の技術比較質問" --output-dir /absolute/private/research-output
 ```
+
+### Coding evaluation
+
+実modelもPiも不要なmock smoke suiteです．artifact既定先はGit外の`~/.local/state/ephy-worker/eval/runs`です．
+
+```text
+uv run python -m ephy_worker eval run --suite smoke --model mock
+uv run python -m ephy_worker coding run /absolute/private/coding-job.json --dry-run
+```
+
+Job example，custom profile，実Pi接続，failure code，artifact schemaは[Coding executorとevaluation harness](docs/coding-evaluation.md)を参照してください．
 
 ### Phase 2の分散収集
 
@@ -147,7 +163,9 @@ PDFはContent-TypeとPDF magicを確認し，1始まりの**物理ページ番�
 ```bash
 uv sync --locked
 uv run python -m pytest -q
-uv run ruff check src tests/test_research.py tests/test_workflow_edges.py tests/test_cli.py tests/test_evidence.py tests/test_fetch.py tests/test_extraction.py tests/test_providers.py tests/test_tavily.py tests/test_manager.py tests/test_manager_http.py tests/test_worker_service.py
+uv run python -m pytest -q tests/test_coding_executor.py tests/test_coding_evaluation.py
+uv run python -m ephy_worker eval run --suite smoke --model mock --output-dir /absolute/git-external/eval-runs
+uv run ruff check src tests/test_research.py tests/test_workflow_edges.py tests/test_cli.py tests/test_evidence.py tests/test_fetch.py tests/test_extraction.py tests/test_providers.py tests/test_tavily.py tests/test_manager.py tests/test_manager_http.py tests/test_worker_service.py tests/test_coding_executor.py tests/test_coding_evaluation.py
 PYTHONPATH=src .venv/bin/python scripts/validate_phase2_processes.py
 python3 scripts/validate_repository.py --check-sensitive-patterns
 ```
@@ -168,6 +186,8 @@ Windowsのrepository validationは`python scripts/validate_repository.py --check
 - [Phase 2 distributed collection ADR](docs/adr/0003-phase2-distributed-collection.md)
 - [Phase 2 validation](docs/phase2-validation.md)
 - [Tavily free-plan validation](docs/tavily-validation.md)
+- [Coding executor and evaluation](docs/coding-evaluation.md)
+- [Local coding model validation](docs/coding-model-validation.md)
 - [Repository relationships](docs/repository-relations.md)
 - [Security and data handling](docs/security-and-data.md)
 

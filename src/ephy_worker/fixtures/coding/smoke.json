@@ -1,0 +1,105 @@
+{
+  "suite_id": "smoke",
+  "tasks": [
+    {
+      "task_id": "single-file-bug-fix",
+      "category": "single_file_bug_fix",
+      "description": "Fix calculator.add so it returns the arithmetic sum. Change only what is needed.",
+      "fixture_repository": "generated:single-file-bug-fix",
+      "base_revision": "HEAD",
+      "validation_command": ["{python}", "-m", "unittest", "discover", "-s", "tests", "-q"],
+      "timeout_seconds": 60,
+      "files": {
+        ".gitignore": "__pycache__/\n",
+        "calculator.py": "def add(left, right):\n    return left - right\n",
+        "tests/test_calculator.py": "import unittest\n\nfrom calculator import add\n\n\nclass CalculatorTest(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(add(7, 5), 12)\n\n\nif __name__ == '__main__':\n    unittest.main()\n"
+      },
+      "mock_changes": [
+        {"path": "calculator.py", "content": "def add(left, right):\n    return left + right\n"}
+      ]
+    },
+    {
+      "task_id": "multi-file-feature",
+      "category": "multi_file_feature",
+      "description": "Add a new formatting.py module with format_name(name), then update greeting.render to use it and produce 'Hello, Ada!'.",
+      "fixture_repository": "generated:multi-file-feature",
+      "validation_command": ["{python}", "-m", "unittest", "discover", "-s", "tests", "-q"],
+      "timeout_seconds": 60,
+      "files": {
+        ".gitignore": "__pycache__/\n",
+        "greeting.py": "def render(name):\n    return name\n",
+        "tests/test_greeting.py": "import unittest\n\nfrom formatting import format_name\nfrom greeting import render\n\n\nclass GreetingTest(unittest.TestCase):\n    def test_format_name(self):\n        self.assertEqual(format_name('  ada  '), 'Ada')\n\n    def test_render(self):\n        self.assertEqual(render('  ada  '), 'Hello, Ada!')\n\n\nif __name__ == '__main__':\n    unittest.main()\n"
+      },
+      "mock_changes": [
+        {"path": "formatting.py", "content": "def format_name(name):\n    return name.strip().title()\n"},
+        {"path": "greeting.py", "content": "from formatting import format_name\n\n\ndef render(name):\n    return f'Hello, {format_name(name)}!'\n"}
+      ]
+    },
+    {
+      "task_id": "failing-test-repair",
+      "category": "failing_test_repair",
+      "description": "Repair slugify so repeated whitespace produces one separator and surrounding whitespace is ignored.",
+      "fixture_repository": "generated:failing-test-repair",
+      "validation_command": ["{python}", "-m", "unittest", "discover", "-s", "tests", "-q"],
+      "timeout_seconds": 60,
+      "files": {
+        ".gitignore": "__pycache__/\n",
+        "slug.py": "def slugify(value):\n    return value.lower().replace(' ', '-')\n",
+        "tests/test_slug.py": "import unittest\n\nfrom slug import slugify\n\n\nclass SlugTest(unittest.TestCase):\n    def test_whitespace(self):\n        self.assertEqual(slugify('  Hello   World  '), 'hello-world')\n\n\nif __name__ == '__main__':\n    unittest.main()\n"
+      },
+      "mock_changes": [
+        {"path": "slug.py", "content": "def slugify(value):\n    return '-'.join(value.lower().split())\n"}
+      ]
+    },
+    {
+      "task_id": "behavior-preserving-refactor",
+      "category": "behavior_preserving_refactor",
+      "description": "Extract the duplicated discount logic into a _discount_rate(total) helper while preserving price behavior.",
+      "fixture_repository": "generated:behavior-preserving-refactor",
+      "validation_command": ["{python}", "-m", "unittest", "discover", "-s", "tests", "-q"],
+      "timeout_seconds": 60,
+      "files": {
+        ".gitignore": "__pycache__/\n",
+        "pricing.py": "def retail(total):\n    rate = 0.1 if total >= 100 else 0\n    return total * (1 - rate)\n\ndef wholesale(total):\n    rate = 0.1 if total >= 100 else 0\n    return total * (1 - rate)\n",
+        "tests/test_pricing.py": "import unittest\n\nimport pricing\n\n\nclass PricingTest(unittest.TestCase):\n    def test_behavior_and_refactor(self):\n        self.assertEqual(pricing.retail(50), 50)\n        self.assertEqual(pricing.wholesale(200), 180)\n        self.assertTrue(hasattr(pricing, '_discount_rate'))\n\n\nif __name__ == '__main__':\n    unittest.main()\n"
+      },
+      "mock_changes": [
+        {"path": "pricing.py", "content": "def _discount_rate(total):\n    return 0.1 if total >= 100 else 0\n\n\ndef retail(total):\n    return total * (1 - _discount_rate(total))\n\n\ndef wholesale(total):\n    return total * (1 - _discount_rate(total))\n"}
+      ]
+    },
+    {
+      "task_id": "repository-navigation",
+      "category": "repository_navigation",
+      "description": "Find the nested timeout setting used by the application and change it to 30 seconds.",
+      "fixture_repository": "generated:repository-navigation",
+      "validation_command": ["{python}", "-m", "unittest", "discover", "-s", "tests", "-q"],
+      "timeout_seconds": 60,
+      "files": {
+        ".gitignore": "__pycache__/\n",
+        "src/__init__.py": "",
+        "src/app/__init__.py": "",
+        "src/app/config.py": "REQUEST_TIMEOUT_SECONDS = 0\n",
+        "tests/test_config.py": "import unittest\n\nfrom src.app.config import REQUEST_TIMEOUT_SECONDS\n\n\nclass ConfigTest(unittest.TestCase):\n    def test_timeout(self):\n        self.assertEqual(REQUEST_TIMEOUT_SECONDS, 30)\n\n\nif __name__ == '__main__':\n    unittest.main()\n"
+      },
+      "mock_changes": [
+        {"path": "src/app/config.py", "content": "REQUEST_TIMEOUT_SECONDS = 30\n"}
+      ]
+    },
+    {
+      "task_id": "test-failure-driven-fix",
+      "category": "test_failure_driven_fix",
+      "description": "Use the failing test to make parse_optional_int return None for blank input without changing numeric parsing.",
+      "fixture_repository": "generated:test-failure-driven-fix",
+      "validation_command": ["{python}", "-m", "unittest", "discover", "-s", "tests", "-q"],
+      "timeout_seconds": 60,
+      "files": {
+        ".gitignore": "__pycache__/\n",
+        "parser.py": "def parse_optional_int(value):\n    return int(value)\n",
+        "tests/test_parser.py": "import unittest\n\nfrom parser import parse_optional_int\n\n\nclass ParserTest(unittest.TestCase):\n    def test_blank_and_number(self):\n        self.assertIsNone(parse_optional_int(''))\n        self.assertEqual(parse_optional_int('42'), 42)\n\n\nif __name__ == '__main__':\n    unittest.main()\n"
+      },
+      "mock_changes": [
+        {"path": "parser.py", "content": "def parse_optional_int(value):\n    if value == '':\n        return None\n    return int(value)\n"}
+      ]
+    }
+  ]
+}

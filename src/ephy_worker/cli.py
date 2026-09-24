@@ -17,7 +17,7 @@ class CLIError(ValueError):
 
 
 def parser() -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(prog="ephy-worker", description="公開資料の本文を取得・照合するWorker")
+    root = argparse.ArgumentParser(prog="ephy-worker", description="調査・収集・coding Jobを実行するWorker")
     sub = root.add_subparsers(dest="command", required=True)
     doctor = sub.add_parser("doctor", help="設定・接続・型付き出力を確認")
     doctor.add_argument("--config", required=True, type=Path)
@@ -61,6 +61,24 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument("--job-id", required=True)
         if name == "retry":
             command.add_argument("--submit-key")
+    coding = sub.add_parser("coding", help="隔離worktreeでcoding Jobを実行")
+    coding_sub = coding.add_subparsers(dest="coding_command", required=True)
+    coding_run = coding_sub.add_parser("run", help="JSON coding Jobを実行")
+    coding_run.add_argument("job_file", type=Path)
+    coding_run.add_argument("--profiles", type=Path, help="coding model profile YAML")
+    coding_run.add_argument("--output-dir", type=Path, help="Git外のevaluation artifact root")
+    coding_run.add_argument("--dry-run", action="store_true", help="解決・実行計画だけを検証")
+    coding_verify = coding_sub.add_parser("verify-source", help="候補patchのsource snapshotと現在のcheckoutを照合")
+    coding_verify.add_argument("artifact_dir", type=Path)
+    coding_verify.add_argument("--repository", required=True, type=Path)
+    evaluation = sub.add_parser("eval", help="coding model evaluationを実行")
+    evaluation_sub = evaluation.add_subparsers(dest="eval_command", required=True)
+    evaluation_run = evaluation_sub.add_parser("run", help="synthetic suiteを実行")
+    evaluation_run.add_argument("--suite", default="smoke")
+    evaluation_run.add_argument("--model", required=True)
+    evaluation_run.add_argument("--repeat", type=int, default=1)
+    evaluation_run.add_argument("--profiles", type=Path, help="coding model profile YAML")
+    evaluation_run.add_argument("--output-dir", type=Path, help="Git外のevaluation artifact root")
     return root
 
 
@@ -216,6 +234,16 @@ async def _run_job_command(config, args) -> int:
 
 
 async def dispatch(args) -> int:
+    if args.command == "coding":
+        from .coding_cli import run_coding_command, run_coding_verify_command
+
+        if args.coding_command == "verify-source":
+            return run_coding_verify_command(args)
+        return await run_coding_command(args)
+    if args.command == "eval":
+        from .coding_cli import run_evaluation_command
+
+        return await run_evaluation_command(args)
     from .config import load_config
 
     config = load_config(args.config)
