@@ -45,4 +45,8 @@ The Ruff gate checks declared allowed Python files that exist in the candidate�
 
 ## Audit output
 
-The gpt-oss lead reports：the hypothesis，baseline/candidate comparison，each evaluation axis，executed checks，unexecuted checks with reasons，Git status，diff summary，decision，and remaining risks．Passing gates make a proposal eligible for review; they do not authorize automatic application．
+After independent verification，freeze the final patch，candidate snapshot，changed-files manifest，verification results，workflow events，model provenance，and required contracts into an audit bundle．Every result must bind to the exact final `patch_sha256` and candidate snapshot SHA-256．Do not reuse a result from an earlier candidate state．
+
+A fresh gpt-oss process audits that bundle under [the independent audit contract](audit-contract.md) with read-only tools．Its output must be one JSON object that satisfies [the audit result schema](audit-result.schema.json)．The runner separately attests the actual auditor model，tool trace，schema validation，bound hashes，and unchanged candidate before and after audit．
+
+Passing hard gates do not by themselves make a proposal review-ready．`review_ready` additionally requires valid workflow evidence，`ACCEPT_PROPOSAL` from the final-patch audit，a passing external execution attestation，and unchanged candidate state．It never authorizes automatic application．
