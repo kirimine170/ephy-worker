@@ -17,3 +17,11 @@ Runtimeが実行許可とJob全体の管理，WorkerがJob内の調査loop，Kar
 Managerはloopback HTTP，単一SQLite connection，Git外artifact directoryを所有する．事前登録credentialに一致するWorkerだけが登録とpull claimを行える．RequesterとWorkerの操作権限は分ける．claimはSQLite transactionで直列化し，attemptとleaseを発行する．結果確定とartifact uploadはworker ID，attempt，lease，hash，size，job scopeを検査する．Manager再起動後はSQLiteからJob，attempt，結果参照を復元する．
 
 Workerは`web.collect`能力だけを宣言し，検索providerとparserを持つがmodel profileを持たない．1 processあたり1 Jobを実行し，lease更新で取消と実行権喪失を観測する．Managerへの接続と公開page fetchは別clientであり，分散化しても公開fetchのprivate address拒否やredirect検査は変えない．詳細は[ADR-0003](adr/0003-phase2-distributed-collection.md)を参照する．
+
+## Coding evaluation境界
+
+Coding Jobは既存の調査model profileや`web.collect`契約を拡張せず，local coding専用contractとして扱う．`coding_executor.py`がtarget Git repositoryとbase revisionを検査し，worker所有のdetached worktreeを作る．`FakePiRunner`と`PiRpcRunner`は同じinterfaceを実装し，PiのCLI／JSONL RPC詳細をJob schemaから分離する．
+
+agent実行後のGit diffをcandidate patchとして固定してから，workerがvalidation commandを別processで実行する．agent messageはsuccess判定に使用しない．結果とlogはGit外artifact directoryへ保存し，worktreeを回収する．Runtime連携，remote scheduling，自動commit／merge／pushはこの境界へ含めない．詳細は[coding evaluation設計](coding-evaluation.md)を参照する．
+
+自己改善の初期経路では，現在のephy-worker作業ツリーのtracked fileと明示した未追跡fileを，Git外の一時repositoryへsnapshotする．Piはそのbaselineから作ったdetached worktreeで動き，候補patchとsource file hashをartifactとして残す．mac向けPiの既定model endpointはRuntime code経路と同じllama.cpp `127.0.0.1:8083/v1`である．

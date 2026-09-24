@@ -1,0 +1,17 @@
+{
+  "defaultProvider": "llama-local",
+  "defaultModel": "Qwen3.8-27B-UD-Q4_K_M",
+  "defaultThinkingLevel": "off",
+  "thinkingBudgets": {
+    "minimal": 1024,
+    "low": 2048,
+    "medium": 4096,
+    "high": 8192
+  },
+  "enableInstallTelemetry": false,
+  "compaction": {
+    "enabled": true,
+    "reserveTokens": 16384,
+    "keepRecentTokens": 12000
+  }
+}

@@ -47,6 +47,7 @@ weights/
 build/
 dist/
 generated/
+.ephy-worker/
 coverage/
 htmlcov/
 *.log

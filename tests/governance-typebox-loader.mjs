@@ -3,6 +3,9 @@ export const Type = {
   Literal(value) {
     return { const: value };
   },
+  Optional(schema) {
+    return { ...schema, optional: true };
+  },
   Object(properties, options = {}) {
     return {
       type: "object",
@@ -13,6 +16,9 @@ export const Type = {
   },
   String(options = {}) {
     return { type: "string", ...options };
+  },
+  Union(items, options = {}) {
+    return { anyOf: items, ...options };
   },
 };
 `;

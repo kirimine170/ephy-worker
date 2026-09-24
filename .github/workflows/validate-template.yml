@@ -39,5 +39,11 @@ jobs:
           --experimental-loader ./tests/governance-typebox-loader.mjs
           ./tests/governance-gate-smoke.mjs
 
+      - name: Execute local Pi model router smoke test
+        run: >-
+          node --experimental-strip-types
+          --experimental-loader ./tests/governance-typebox-loader.mjs
+          ./tests/pi-model-router-smoke.mjs
+
       - name: Validate repository and scan template text
         run: python scripts/validate_repository.py --check-sensitive-patterns

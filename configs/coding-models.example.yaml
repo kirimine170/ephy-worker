@@ -1,0 +1,42 @@
+profiles:
+  - profile_id: mock
+    provider: mock
+    model_id: deterministic-file-writer
+    server_type: mock
+    context_window: 32768
+    reasoning_level: none
+    quantization: null
+    notes: Offline deterministic fixture runner．No model or endpoint is used．
+
+  - profile_id: qwen3-coder-30b-a3b
+    provider: llama_cpp
+    model_id: qwen3-coder-30b-a3b
+    server_type: llama.cpp
+    context_window: 32768
+    reasoning_level: none
+    quantization: UD-Q4_K_XL
+    endpoint: http://127.0.0.1:8083/v1
+    pi_args: [--offline]
+    notes: Local llama.cpp code server shared with Ephy Runtime．
+
+  - profile_id: qwen3-coder-30b-a3b-router
+    provider: llama_router
+    model_id: qwen3-coder-30b-a3b
+    server_type: llama.cpp
+    context_window: 32768
+    reasoning_level: none
+    quantization: UD-Q4_K_XL
+    endpoint: http://127.0.0.1:8084/v1
+    pi_args: [--offline]
+    notes: Shared llama.cpp router．Loads on demand and leaves Runtime's 8083 untouched．
+
+  - profile_id: qwen3-8b-q6-k-router
+    provider: llama_router
+    model_id: qwen3-8b-q6-k
+    server_type: llama.cpp
+    context_window: 32768
+    reasoning_level: none
+    quantization: Q6_K
+    endpoint: http://127.0.0.1:8084/v1
+    pi_args: [--offline]
+    notes: Smaller local model for the shared llama.cpp router．
