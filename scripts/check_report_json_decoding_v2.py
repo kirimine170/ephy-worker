@@ -66,8 +66,12 @@ def _validate_strict_text_options(call: ast.Call, *, decode: bool) -> None:
         raise EvaluationError("errors must be omitted or literal strict")
 
 
-def _marker() -> ast.Call:
-    return ast.Call(func=ast.Name(id=MARKER_NAME, ctx=ast.Load()), args=[], keywords=[])
+def _marker(receiver: ast.expr) -> ast.Call:
+    return ast.Call(
+        func=ast.Name(id=MARKER_NAME, ctx=ast.Load()),
+        args=[copy.deepcopy(receiver)],
+        keywords=[],
+    )
 
 
 def _is_marker(node: ast.AST) -> bool:
@@ -87,7 +91,7 @@ class ReportReadNormalizer(ast.NodeTransformer):
             if self.candidate:
                 _validate_strict_text_options(node, decode=False)
             self.count += 1
-            return ast.copy_location(_marker(), node)
+            return ast.copy_location(_marker(node.func.value), node)
         if node.func.attr != "decode" or not isinstance(node.func.value, ast.Call):
             return node
         byte_call = node.func.value
@@ -100,21 +104,22 @@ class ReportReadNormalizer(ast.NodeTransformer):
         if self.candidate:
             _validate_strict_text_options(node, decode=True)
         self.count += 1
-        return ast.copy_location(_marker(), node)
+        return ast.copy_location(_marker(byte_call.func.value), node)
 
 
 class ReplaceName(ast.NodeTransformer):
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, replacement: ast.Call) -> None:
         self.name = name
+        self.replacement = replacement
 
     def visit_Name(self, node: ast.Name) -> ast.AST:
         if node.id == self.name and isinstance(node.ctx, ast.Load):
-            return ast.copy_location(_marker(), node)
+            return ast.copy_location(copy.deepcopy(self.replacement), node)
         return node
 
 
 def _inline_single_use_alias(function: ast.AsyncFunctionDef) -> None:
-    aliases: list[tuple[int, str]] = []
+    aliases: list[tuple[int, str, ast.Call]] = []
     for index, statement in enumerate(function.body):
         if (
             isinstance(statement, ast.Assign)
@@ -122,8 +127,8 @@ def _inline_single_use_alias(function: ast.AsyncFunctionDef) -> None:
             and isinstance(statement.targets[0], ast.Name)
             and _is_marker(statement.value)
         ):
-            aliases.append((index, statement.targets[0].id))
-    for index, name in reversed(aliases):
+            aliases.append((index, statement.targets[0].id, statement.value))
+    for index, name, replacement in reversed(aliases):
         loads = [
             node
             for statement in function.body
@@ -133,7 +138,7 @@ def _inline_single_use_alias(function: ast.AsyncFunctionDef) -> None:
         if len(loads) != 1:
             raise EvaluationError("report JSON alias must be a simple single-use value")
         del function.body[index]
-        function = ReplaceName(name).visit(function)
+        function = ReplaceName(name, replacement).visit(function)
 
 
 def _target(module: ast.Module, name: str, path: Path) -> ast.AsyncFunctionDef:

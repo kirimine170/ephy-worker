@@ -57,6 +57,18 @@ def test_lossy_or_implicit_negative_controls_are_rejected(expression: str) -> No
         normalize(expression)
 
 
+@pytest.mark.parametrize(
+    "expression",
+    [
+        '((root / "report.json") if probe_mode else forged).read_text(encoding="utf-8")',
+        '((root / "report.json") if probe_mode else forged).read_bytes().decode("utf-8")',
+        '(select_path(root / "report.json", forged)).read_text(encoding="utf-8")',
+    ],
+)
+def test_receiver_side_probe_bypasses_do_not_normalize_to_baseline(expression: str) -> None:
+    assert normalize(expression) != normalize(BASE, candidate=False)
+
+
 def test_unrelated_read_is_not_normalized() -> None:
     tree = ast.parse('(root / "config.yaml").read_text(encoding="utf-8")', mode="eval")
     normalizer = ReportReadNormalizer(candidate=True)
