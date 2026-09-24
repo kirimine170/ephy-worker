@@ -11,6 +11,7 @@ All notable changes to this repository are documented in this file．
 
 ### Added
 
+- 対話型Pi用に，Reasoning／Coderの自律切替tool，local compaction recovery，macOS／Windows起動script，loopback llama.cpp設定例，offline smoke testを追加．managed governance sessionではmodel routerを無効化する．
 - mac向けcodingの既定Pi backendとして，Runtime code endpointと同じllama.cpp profileを追加．共有routerで複数GGUFを選ぶprofileも追加．
 - 未コミットのtracked fileと明示したuntracked fileを一時Git repositoryへcopyするworking-tree snapshot経路，source manifest，元checkoutを変更しない自己改善候補生成．
 - candidate patch採用前にsource HEADとfile hashを再照合する`coding verify-source` CLI．

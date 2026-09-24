@@ -26,6 +26,8 @@ Phase 1の調査処理に加え，Phase 2の分散収集経路を実装してい
 
 Coding Evaluation MVPは，Pi RPC adapter，detached worktree，deterministic mock，独立validation，6カテゴリのoffline smoke suiteを実装しています．mac向けcodingの既定Pi backendはRuntimeのcode経路と同じllama.cppです．共有llama.cpp routerで複数GGUFを切り替えるprofileも用意しています．現在の未コミット内容も明示したfileだけ一時snapshotに含め，ephy-worker自身からcandidate patchを作れます．実行境界は[Coding executorとevaluation harness](docs/coding-evaluation.md)を参照してください．
 
+対話型のlocal Piでは，Qwen3.8 ReasoningとQwen3 Coderを作業phaseに応じて自律切替するopt-in tool，token上限時のcompaction recovery，macOS／Windows共通の起動引数例を共有しています．managed self-improvement sessionではrouterを無効化し，既存のmodel identityとrole分離を維持します．構成，検証範囲，未検証範囲は[Pi自律model切替](docs/pi-autonomous-model-routing.md)を参照してください．
+
 現環境ではSearXNGのCAPTCHAにより検索発見のlive経路は未検証です．既知の公開資料を補足したQwen実行ではHTML・PDF引用を採用できましたが，数値の精度差や比較表現の過大解釈を意味照合が見逃す例があり，調査品質の合格とは扱っていません．これを受けて`evidence.py`の`apply_review`にclaimと引用の決定的整合性チェック（数値の精度，比較表現の強さ）を追加しました．検査に落ちた引用はsupportとして数えず`context_only`として保存し，claimは残りの有効な根拠がその状態を満たさなくなった場合にのみ降格します．チェックは観測された失敗形状のみの狭い範囲をoffline testでカバーしており，live経路の再実行はまだ行っていません．その他の過大解釈の検出は同一モデルの別context照合と人の再確認に任せます．
 
 無料枠向けのTavily検索providerを追加しました．無料プラン・使用量・残量を検索前に確認し，basic検索を最大10credit／Jobに制限します．利用者実行のdoctorで使用量API・実検索1回・Qwen接続の成功を確認しました．`paygo_limit`のnullは未報告として保持し，無料枠の残量で制限します．設定・`doctor --usage-only`の診断手順と検証範囲は[Tavily検証](docs/tavily-validation.md)を参照してください．
@@ -188,6 +190,7 @@ Windowsのrepository validationは`python scripts/validate_repository.py --check
 - [Tavily free-plan validation](docs/tavily-validation.md)
 - [Coding executor and evaluation](docs/coding-evaluation.md)
 - [Local coding model validation](docs/coding-model-validation.md)
+- [Pi autonomous model routing](docs/pi-autonomous-model-routing.md)
 - [Repository relationships](docs/repository-relations.md)
 - [Security and data handling](docs/security-and-data.md)
 

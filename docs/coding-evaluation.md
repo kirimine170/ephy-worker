@@ -101,7 +101,7 @@ failure codeは`pi_executable_unavailable`，`model_unavailable`，`model_endpoi
 このhostのRuntime checkout内binaryは旧配置先を`LC_RPATH`に保持するため，専用スクリプトが`DYLD_LIBRARY_PATH`を設定して起動する．詳細は[macOS初期検証](macos-self-improvement-validation.md)に記録した．
 
 ```bash
-cd /Users/kirimine170/Desktop/Ephy_Project/ephy-workspace/ephy-runtime
+cd /absolute/path/to/ephy-runtime
 ./scripts/start_llama_router.sh
 ```
 
