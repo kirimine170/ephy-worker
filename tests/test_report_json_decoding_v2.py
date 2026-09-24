@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from runpy import run_path
 
 import pytest
 
-from scripts.check_report_json_decoding_v2 import EvaluationError, ReportReadNormalizer
+CHECKER = run_path(
+    str(Path(__file__).resolve().parents[1] / "scripts" / "check_report_json_decoding_v2.py")
+)
+EvaluationError = CHECKER["EvaluationError"]
+ReportReadNormalizer = CHECKER["ReportReadNormalizer"]
 
 BASE = '(root / "report.json").read_text()'
 
