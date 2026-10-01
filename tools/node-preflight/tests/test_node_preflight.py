@@ -344,12 +344,55 @@ class ProbeTests(unittest.TestCase):
 
     def assert_runtime_static_boundaries(self, source):
         tree = ast.parse(source)
+        # This is the closed syntax/operation contract of this one reviewed CLI,
+        # not an analyzer that accepts arbitrary Python and proves it harmless.
+        allowed_nodes = set("""
+            Add And Assign Attribute AugAssign BinOp BitAnd BitOr BoolOp Break
+            Call ClassDef Compare Constant Dict DictComp Div Eq ExceptHandler Expr
+            For FormattedValue FunctionDef GeneratorExp Gt GtE If IfExp Import
+            ImportFrom In Is IsNot JoinedStr Lambda List ListComp Load Lt LtE
+            Module Mult Name Not NotEq NotIn Or Pass Pow Raise Return Set SetComp
+            Slice Store Sub Subscript Try Tuple USub UnaryOp While With alias arg
+            arguments comprehension keyword withitem
+        """.split())
+        allowed_functions = set("""
+            _read_fd _read_source_at _read_windows_regular build_report check
+            collect_observations error gib gib_argument load_sample main memory_for_os
+            memory_linux memory_macos memory_windows normalize_architecture observation
+            observed package_probe padded_version parser positive_measurement profile_result
+            python_version_probe read_bounded_regular reject_constant source_reference_probe
+            summary unique_object unknown valid_value validate_observations value workspace_probe
+        """.split())
+        expected_counter = ast.dump(ast.parse("count += len(data)").body[0], include_attributes=False)
+        for node in ast.walk(tree):
+            self.assertIn(type(node).__name__, allowed_nodes)
+            if isinstance(node, ast.FunctionDef):
+                self.assertIn(node.name, allowed_functions)
+            if isinstance(node, ast.AugAssign):
+                self.assertEqual(ast.dump(node, include_attributes=False), expected_counter)
         imports = set()
         aliases = {}
         allowed_imports = {
             "__future__", "argparse", "ctypes", "hashlib", "importlib.metadata",
             "json", "os", "platform", "re", "shutil", "stat", "sys",
             "decimal", "pathlib", "typing",
+        }
+        allowed_module_attributes = set("""
+            argparse.ArgumentParser argparse.ArgumentTypeError ctypes.CDLL ctypes.POINTER
+            ctypes.Structure ctypes.WinDLL ctypes.byref ctypes.c_char_p ctypes.c_int
+            ctypes.c_size_t ctypes.c_uint32 ctypes.c_uint64 ctypes.c_void_p ctypes.c_wchar_p
+            ctypes.create_string_buffer ctypes.get_last_error ctypes.sizeof hashlib.sha256
+            importlib.metadata importlib.metadata.PackageNotFoundError importlib.metadata.version
+            json.JSONDecodeError json.dumps json.loads os.O_DIRECTORY os.O_NOFOLLOW
+            os.O_NONBLOCK os.O_RDONLY os.W_OK os.X_OK os.access os.close os.cpu_count os.dup
+            os.fstat os.name os.open os.read os.sched_getaffinity os.supports_dir_fd
+            platform.machine platform.system re.compile re.fullmatch shutil.disk_usage
+            shutil.which stat.S_ISDIR stat.S_ISREG sys.exit sys.stderr sys.stdout
+            sys.version_info sys.version_info.releaselevel
+        """.split())
+        allowed_from_members = allowed_module_attributes | {
+            "__future__.annotations", "decimal.Decimal", "decimal.InvalidOperation",
+            "pathlib.Path", "typing.Any",
         }
         for item in ast.walk(tree):
             if isinstance(item, ast.Import):
@@ -363,6 +406,7 @@ class ProbeTests(unittest.TestCase):
                 imports.add(item.module)
                 for alias in item.names:
                     self.assertNotEqual(alias.name, "*")
+                    self.assertIn(item.module + "." + alias.name, allowed_from_members)
                     aliases[alias.asname or alias.name] = item.module + "." + alias.name
             elif isinstance(item, ast.ImportFrom):
                 self.fail("relative imports require separate review")
@@ -374,6 +418,13 @@ class ProbeTests(unittest.TestCase):
             if isinstance(node, ast.Attribute):
                 return qualified(node.value) + "." + node.attr
             return ""
+
+        imported_roots = {name.split('.')[0] for name in aliases.values()}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and qualified(node).split('.')[0] in imported_roots:
+                self.assertIn(qualified(node), allowed_module_attributes)
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name):
+                self.assertNotIn(qualified(node.value), allowed_imports)
 
         # Freeze the reviewed call surface as well as imports. New aliases or
         # APIs require an explicit checker/review change instead of passing by
@@ -410,8 +461,17 @@ class ProbeTests(unittest.TestCase):
             "info_call": {"library.GetFileInformationByHandleEx"},
             "read": {"library.ReadFile"},
         }
+        native_libraries = {
+            "kernel": {"ctypes.WinDLL"},
+            "library": {"ctypes.WinDLL", "ctypes.CDLL"},
+        }
+        module_definitions = {
+            node.name for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        }
         assignments = {}
         reviewed_stores = set()
+        plain_assignment_targets = set()
         expected_probe = ast.dump(ast.parse(
             '{"Linux": memory_linux, "Windows": memory_windows, "Darwin": memory_macos}.get(system)',
             mode="eval",
@@ -420,16 +480,33 @@ class ProbeTests(unittest.TestCase):
             if isinstance(item, ast.Assign):
                 for target in item.targets:
                     if isinstance(target, ast.Name):
+                        plain_assignment_targets.add(id(target))
                         assignments.setdefault(target.id, []).append(item.value)
                         if target.id in native_bindings:
                             self.assertIn(qualified(item.value), native_bindings[target.id])
+                            reviewed_stores.add(id(target))
+                        elif target.id in native_libraries:
+                            self.assertIsInstance(item.value, ast.Call)
+                            self.assertIn(qualified(item.value.func), native_libraries[target.id])
                             reviewed_stores.add(id(target))
                         elif target.id == "probe":
                             self.assertEqual(ast.dump(item.value, include_attributes=False), expected_probe)
                             reviewed_stores.add(id(target))
 
+        unstable_flag_names = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                if id(node) not in plain_assignment_targets:
+                    unstable_flag_names.add(node.id)
+            elif isinstance(node, ast.arg):
+                unstable_flag_names.add(node.arg)
+            elif isinstance(node, (ast.MatchAs, ast.MatchStar, ast.ExceptHandler)) and node.name:
+                unstable_flag_names.add(node.name)
+            elif isinstance(node, ast.MatchMapping) and node.rest:
+                unstable_flag_names.add(node.rest)
+
         builtin_calls = {
-            "all", "any", "dict", "hasattr", "int", "isinstance", "len", "list",
+            "all", "any", "bool", "dict", "hasattr", "int", "isinstance", "len", "list",
             "map", "min", "open", "print", "set", "sorted", "str", "tuple", "type",
         }
         for item in ast.walk(tree):
@@ -453,7 +530,7 @@ class ProbeTests(unittest.TestCase):
                 node.func.id for node in nodes
                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
             }
-            protected = builtin_calls | set(aliases) | called_names
+            protected = builtin_calls | set(aliases) | called_names | module_definitions | set(native_libraries)
             defined = set()
             for node in nodes:
                 if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
@@ -462,7 +539,7 @@ class ProbeTests(unittest.TestCase):
                 elif isinstance(node, ast.arg) and node.arg in protected:
                     self.assertEqual((getattr(scope, "name", None), node.arg), ("check", "predicate"))
                 elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                    self.assertNotIn(node.name, builtin_calls | set(aliases) | set(native_bindings) | defined)
+                    self.assertNotIn(node.name, builtin_calls | set(aliases) | set(native_bindings) | set(native_libraries) | defined)
                     defined.add(node.name)
                 elif isinstance(node, ast.ExceptHandler) and node.name is not None:
                     self.assertNotIn(node.name, protected)
@@ -486,7 +563,7 @@ class ProbeTests(unittest.TestCase):
             if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
                 return read_only_flags(node.left, seen) and read_only_flags(node.right, seen)
             if isinstance(node, ast.Name):
-                if node.id in seen:
+                if node.id in seen or node.id in unstable_flag_names:
                     return False
                 values = assignments.get(node.id, [])
                 return bool(values) and all(
@@ -504,6 +581,18 @@ class ProbeTests(unittest.TestCase):
             "link", "symlink", "mkfifo", "mknod", "putenv", "unsetenv",
         }
         for item in ast.walk(tree):
+            self.assertNotIsInstance(item, (ast.Global, ast.Nonlocal))
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                self.assertFalse(item.decorator_list)
+                self.assertFalse(item.name.startswith("__"))
+            if isinstance(item, ast.ClassDef):
+                bases = {
+                    "InputError": "ValueError", "MemoryStatus": "ctypes.Structure",
+                    "RedactingParser": "argparse.ArgumentParser",
+                }
+                self.assertIn(item.name, bases)
+                self.assertEqual([qualified(base) for base in item.bases], [bases[item.name]])
+                self.assertFalse(item.keywords)
             if isinstance(item, ast.Name):
                 self.assertNotIn(item.id, {"__builtins__", "__loader__", "__spec__"})
             if isinstance(item, ast.Attribute):
@@ -538,6 +627,10 @@ class ProbeTests(unittest.TestCase):
                         isinstance(item.args[2], ast.Lambda)
                         or isinstance(item.args[2], ast.Name) and item.args[2].id == "bool"
                     )
+                if name == "map":
+                    self.assertTrue(item.args)
+                    self.assertIsInstance(item.args[0], ast.Name)
+                    self.assertEqual(item.args[0].id, "str")
                 if member in {"open", "fdopen"}:
                     self.assertFalse(any(isinstance(arg, ast.Starred) for arg in item.args))
                     self.assertFalse(any(keyword.arg is None for keyword in item.keywords))
@@ -633,6 +726,7 @@ class ProbeTests(unittest.TestCase):
             "import os as operating\noperating.remove('output')",
             "from os import remove as delete\ndelete('output')",
             "writer = open\nwriter('output', 'w')",
+            "list(map(open, ['output'], ['w']))",
             "import os\ndelete = os.remove\ndelete('output')",
             "import os\ngetattr(os, 'remove')('output')",
             "import ctypes\nlibrary = ctypes.WinDLL('kernel32')\nread = library.DeleteFileW\nread('output')",
@@ -659,10 +753,11 @@ class ProbeTests(unittest.TestCase):
         for source in (
             "import os\nopen = os.remove\nopen('output')",
             "open = len\nopen('output')",
+            "bool = len\ncheck({}, 'x', bool, 'failure', 'requirement')",
             "open: object = len\nopen('output')",
             "(open := len)('output')",
             "for open in (): open('output')",
-            "def shadow(open): return open('output')",
+            "def unknown(open): return open('output')",
             "def open(path): return 1\nopen('output')",
             "from pathlib import Path\nPath = str\nPath('output')",
             "import platform\nimport os\nplatform.system = os.cpu_count\nplatform.system()",
@@ -671,6 +766,47 @@ class ProbeTests(unittest.TestCase):
             "__builtins__['open'] = len\nopen('output')",
             "try:\n pass\nexcept Exception as open:\n open('output')",
             "match len:\n case open: open('output')",
+            "def unknown(): return None\nunknown = len\ndef observed(): return unknown('x')",
+            "def unknown(): return None\ndef observed():\n global unknown\n unknown = len",
+            "library = object()\nread = library.ReadFile\nread('output')",
+        ):
+            with self.subTest(source=source), self.assertRaises(AssertionError):
+                self.assert_runtime_static_boundaries(source)
+
+    def test_static_control_rejects_mutated_or_shadowed_open_flags(self):
+        for source in (
+            "import os\nflags = os.O_RDONLY\nflags |= os.O_WRONLY | os.O_CREAT\nos.open('output', flags)",
+            "import os\nflags = os.O_RDONLY\nflags: int = os.O_WRONLY\nos.open('output', flags)",
+            "import os\nflags = os.O_RDONLY\n(flags,) = (os.O_WRONLY,)\nos.open('output', flags)",
+            "import os\nflags = os.O_RDONLY\nfor flags in (os.O_WRONLY,): os.open('output', flags)",
+            "import os\nflags = os.O_RDONLY\ndef unknown(flags): return os.open('output', flags)",
+        ):
+            with self.subTest(source=source), self.assertRaises(AssertionError):
+                self.assert_runtime_static_boundaries(source)
+
+    def test_static_control_rejects_implicit_decorator_calls(self):
+        controls = (
+            "from os import remove\n@remove\nclass Payload: pass",
+            "from os import remove\nclass Meta(type):\n def __fspath__(cls): return 'output'\n@remove\nclass Payload(metaclass=Meta): pass",
+            "@open\ndef unknown(): pass",
+            "class InputError(ValueError, metaclass=type): pass",
+        )
+        for source in controls:
+            with self.subTest(source=source), self.assertRaises(AssertionError):
+                self.assert_runtime_static_boundaries(source)
+
+    def test_static_control_rejects_unreviewed_syntax_and_operations(self):
+        for source in (
+            "async def unknown(): return 1",
+            "def unknown(): yield 1",
+            "count = 1\ncount -= 1",
+            "del value",
+            "class Unreviewed: pass",
+            "def unreviewed(): return 1",
+            "match value:\n case 1: pass",
+            "import os\nenvironment = os.environ\nenvironment['KEY'] = 'value'",
+            "from os import environ\nenviron['KEY'] = 'value'",
+            "import os\nnamespace = os\nnamespace.environ['KEY'] = 'value'",
         ):
             with self.subTest(source=source), self.assertRaises(AssertionError):
                 self.assert_runtime_static_boundaries(source)
