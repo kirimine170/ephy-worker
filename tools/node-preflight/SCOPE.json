@@ -1,0 +1,19 @@
+{
+  "deliverable": "standalone read-only ephy-node-preflight companion",
+  "reference_commit": "0f6c3cb7a272bc67e2a0a0dc828e579df6823d98",
+  "scope": ["node_preflight.py", "tests", "samples", "README.md", "SCOPE.json", "VERIFICATION.md", "MANIFEST.sha256"],
+  "acceptance": [
+    "No network, subprocess, configuration mutation, package installation, credential reads, or worker registration",
+    "Only bounded system facts, fixed package metadata, PATH tool existence, explicit workspace metadata, and three explicitly selected source files",
+    "No source imports or executions; absent data is not readiness",
+    "Contract reference is web.collect 0.4, search/extract, concurrency 1; test/render are local profiles only",
+    "Offline samples use strict bounded JSON and never probe the host",
+    "Deterministic unittest suite covers malformed inputs, failure states, profiles, privacy, source drift and OS probes",
+    "CLI JSON, summary and Japanese help/documentation; sanitized samples and source ZIP",
+    "Repository integration, full ephy-worker tests, real Windows/macOS and two-PC verification remain explicitly unverified"
+  ],
+  "environment": {"executor": "assistant cloud workspace", "python_observed": "3.12.14", "dependencies": "stdlib only", "network": "none at tool runtime"},
+  "publication": "none",
+  "formal_ephy_job": false,
+  "note": "Independent companion artifact, not an integrated ephy-worker candidate or formal managed-Pi proposal"
+}
