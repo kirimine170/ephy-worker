@@ -344,6 +344,7 @@ class ProbeTests(unittest.TestCase):
 
     def assert_runtime_static_boundaries(self, source):
         tree = ast.parse(source)
+        parents = {id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
         # This is the closed syntax/operation contract of this one reviewed CLI,
         # not an analyzer that accepts arbitrary Python and proves it harmless.
         allowed_nodes = set("""
@@ -372,6 +373,7 @@ class ProbeTests(unittest.TestCase):
                 self.assertEqual(ast.dump(node, include_attributes=False), expected_counter)
         imports = set()
         aliases = {}
+        module_bindings = set()
         allowed_imports = {
             "__future__", "argparse", "ctypes", "hashlib", "importlib.metadata",
             "json", "os", "platform", "re", "shutil", "stat", "sys",
@@ -398,6 +400,7 @@ class ProbeTests(unittest.TestCase):
             if isinstance(item, ast.Import):
                 imports.update(alias.name for alias in item.names)
                 for alias in item.names:
+                    module_bindings.add(alias.asname or alias.name.split('.')[0])
                     aliases[alias.asname or alias.name.split('.')[0]] = (
                         alias.name if alias.asname else alias.name.split('.')[0]
                     )
@@ -425,6 +428,14 @@ class ProbeTests(unittest.TestCase):
                 self.assertIn(qualified(node), allowed_module_attributes)
             if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name):
                 self.assertNotIn(qualified(node.value), allowed_imports)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in module_bindings:
+                parent = parents[id(node)]
+                attribute_base = isinstance(parent, ast.Attribute) and parent.value is node
+                availability_probe = (
+                    isinstance(parent, ast.Call) and qualified(parent.func) == "hasattr"
+                    and parent.args and parent.args[0] is node
+                )
+                self.assertTrue(attribute_base or availability_probe)
 
         # Freeze the reviewed call surface as well as imports. New aliases or
         # APIs require an explicit checker/review change instead of passing by
@@ -454,6 +465,39 @@ class ProbeTests(unittest.TestCase):
             validate_observations value value.is_finite value.lower value.startswith
             values.get version.split workspace.stat workspace_probe
         """.split())
+        arities = {name: {1} for name in allowed_calls}
+        for name in """
+            .hexdigest .splitlines MemoryStatus OBSERVATION_TYPES.items REFERENCE_HASHES.items
+            RedactingParser ctypes.c_uint32 ctypes.c_uint64 ctypes.get_last_error main
+            os.cpu_count parser platform.machine platform.system probe python_version_probe
+            required.items root.add_mutually_exclusive_group stream.reconfigure
+            value.is_finite value.lower workspace.stat
+        """.split():
+            arities[name] = {0}
+        for name in """
+            _read_fd _read_source_at _read_windows_regular collect_observations data.replace
+            hasattr isinstance map min os.access os.open os.read re.fullmatch
+            read_bounded_regular self.exit valid_value
+        """.split():
+            arities[name] = {2}
+        arities.update({
+            "": {0}, ".get": {1, 2}, ".open": {0, 1}, "open": {1, 2},
+            "observation": {1, 3}, "observed": {1, 2}, "unknown": {0, 1},
+            "call": {1, 5}, "build_report": {5}, "check": {5}, "read": {5},
+            "info_call": {4}, "profile_result": {4}, "create": {7},
+        })
+        keyword_contract = {
+            "RedactingParser": {"description", "epilog"},
+            "ctypes.WinDLL": {"use_last_error"},
+            "inputs.add_argument": {"help", "type"},
+            "root.add_argument": {"action", "choices", "default", "help", "type"},
+            "root.add_mutually_exclusive_group": {"required"},
+            "json.dumps": {"allow_nan", "ensure_ascii", "indent", "sort_keys"},
+            "json.loads": {"object_pairs_hook", "parse_constant"},
+            "observation": {"reason"}, "os.open": {"dir_fd"},
+            "open": {"mode"}, ".open": {"mode"}, "print": {"file"},
+            "stream.reconfigure": {"encoding", "errors"},
+        }
         native_bindings = {
             "call": {"kernel.GlobalMemoryStatusEx", "library.sysctlbyname"},
             "create": {"library.CreateFileW"}, "close": {"library.CloseHandle"},
@@ -595,8 +639,30 @@ class ProbeTests(unittest.TestCase):
                 self.assertFalse(item.keywords)
             if isinstance(item, ast.Name):
                 self.assertNotIn(item.id, {"__builtins__", "__loader__", "__spec__"})
+                self.assertNotIn(item.id, {
+                    "eval", "exec", "compile", "__import__", "getattr", "setattr",
+                    "delattr", "globals", "locals", "vars", "breakpoint", "input",
+                })
+                if isinstance(item.ctx, ast.Load) and item.id in native_libraries:
+                    parent = parents[id(item)]
+                    self.assertIsInstance(parent, ast.Attribute)
+                    self.assertTrue(any(qualified(parent) in targets for targets in native_bindings.values()))
+                if isinstance(item.ctx, ast.Load) and item.id in native_bindings:
+                    parent = parents[id(item)]
+                    direct_call = isinstance(parent, ast.Call) and parent.func is item
+                    prototype = isinstance(parent, ast.Attribute) and parent.value is item and parent.attr in {"argtypes", "restype"}
+                    self.assertTrue(direct_call or prototype)
             if isinstance(item, ast.Attribute):
                 self.assertFalse(item.attr.startswith("__"))
+                if qualified(item) == "data.replace":
+                    parent = parents[id(item)]
+                    self.assertIsInstance(parent, ast.Call)
+                    self.assertIs(parent.func, item)
+                for binding, targets in native_bindings.items():
+                    if qualified(item) in targets:
+                        parent = parents[id(item)]
+                        self.assertIsInstance(parent, ast.Assign)
+                        self.assertTrue(all(isinstance(target, ast.Name) and target.id == binding for target in parent.targets))
                 if item.attr in forbidden:
                     self.assertIn(qualified(item), {"platform.system", "data.replace"})
             if isinstance(item, ast.Call):
@@ -611,6 +677,40 @@ class ProbeTests(unittest.TestCase):
                     self.assertEqual(item.func.right.value, 2)
                 else:
                     self.assertIn(name, allowed_calls)
+                self.assertIn(len(item.args), arities[name])
+                self.assertFalse({keyword.arg for keyword in item.keywords} - keyword_contract.get(name, set()))
+                if name == "json.loads":
+                    callbacks = {"object_pairs_hook": "unique_object", "parse_constant": "reject_constant"}
+                    for keyword in item.keywords:
+                        self.assertIsInstance(keyword.value, ast.Name)
+                        self.assertEqual(keyword.value.id, callbacks[keyword.arg])
+                if name in {"inputs.add_argument", "root.add_argument"}:
+                    for keyword in item.keywords:
+                        if keyword.arg == "type":
+                            self.assertIn(qualified(keyword.value), {"pathlib.Path", "gib_argument"})
+                        elif keyword.arg == "action":
+                            self.assertIsInstance(keyword.value, ast.Constant)
+                            self.assertEqual(keyword.value.value, "append")
+                if name == "print":
+                    for keyword in item.keywords:
+                        receivers = (keyword.value.body, keyword.value.orelse) if isinstance(keyword.value, ast.IfExp) else (keyword.value,)
+                        self.assertTrue(all(qualified(receiver) in {"sys.stdout", "sys.stderr"} for receiver in receivers))
+                if name == ".open":
+                    self.assertIsInstance(item.func.value, ast.Call)
+                    self.assertEqual(qualified(item.func.value.func), "pathlib.Path")
+                if name == "data.replace":
+                    self.assertEqual([arg.value if isinstance(arg, ast.Constant) else None for arg in item.args], [b"\r\n", b"\n"])
+                    scope = parents[id(item)]
+                    while not isinstance(scope, (ast.FunctionDef, ast.Module)):
+                        scope = parents[id(scope)]
+                    self.assertIsInstance(scope, ast.FunctionDef)
+                    self.assertEqual(scope.name, "source_reference_probe")
+                    stores = [node for node in local_nodes(scope) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id == "data"]
+                    self.assertEqual(len(stores), 1)
+                    assignment = parents[id(stores[0])]
+                    self.assertIsInstance(assignment, ast.Assign)
+                    expected = ast.parse("_read_source_at(root_fd, relative)", mode="eval").body
+                    self.assertEqual(ast.dump(assignment.value, include_attributes=False), ast.dump(expected, include_attributes=False))
                 if name in {"ctypes.WinDLL", "ctypes.CDLL"}:
                     self.assertTrue(item.args)
                     self.assertIsInstance(item.args[0], ast.Constant)
@@ -807,6 +907,31 @@ class ProbeTests(unittest.TestCase):
             "import os\nenvironment = os.environ\nenvironment['KEY'] = 'value'",
             "from os import environ\nenviron['KEY'] = 'value'",
             "import os\nnamespace = os\nnamespace.environ['KEY'] = 'value'",
+        ):
+            with self.subTest(source=source), self.assertRaises(AssertionError):
+                self.assert_runtime_static_boundaries(source)
+
+    def test_static_control_rejects_unreviewed_callback_arguments(self):
+        for source in (
+            "sorted([\"open('output','w')\"], key=exec)",
+            "min('one', 'two', key=eval)",
+            "import ctypes\nimport json\njson.loads('{}', object_pairs_hook=ctypes.CDLL)",
+            "import ctypes\nimport json\njson.dumps('value', default=ctypes.CDLL)",
+            "import ctypes\nroot.add_argument('--value', type=ctypes.CDLL)",
+            "open('input', 'r', opener=exec)",
+            "print('value', file=handle)",
+        ):
+            with self.subTest(source=source), self.assertRaises(AssertionError):
+                self.assert_runtime_static_boundaries(source)
+
+    def test_static_control_rejects_ambiguous_replace_receivers(self):
+        for source in (
+            "from pathlib import Path\ndata = Path('source')\ndata.replace('output')",
+            "from pathlib import Path\ndef source_reference_probe(root):\n data = Path('source')\n data.replace(b'\\r\\n', b'\\n')",
+            "import os\ndef _read_source_at(root_fd, relative): return os",
+            "from pathlib import Path\ndata = Path('source')\nreplacement = data.replace",
+            "import argparse\nfrom pathlib import Path\ndata = Path('source')\nclass RedactingParser(argparse.ArgumentParser):\n error = data.replace",
+            "import ctypes\nlibrary = ctypes.WinDLL('kernel32')\ncreate = library.CreateFileW\nreplacement = create",
         ):
             with self.subTest(source=source), self.assertRaises(AssertionError):
                 self.assert_runtime_static_boundaries(source)
