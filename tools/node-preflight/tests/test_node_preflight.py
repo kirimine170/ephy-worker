@@ -731,6 +731,18 @@ class ProbeTests(unittest.TestCase):
                     self.assertTrue(item.args)
                     self.assertIsInstance(item.args[0], ast.Name)
                     self.assertEqual(item.args[0].id, "str")
+                if name == "call":
+                    scope = parents[id(item)]
+                    while not isinstance(scope, (ast.FunctionDef, ast.Module)):
+                        scope = parents[id(scope)]
+                    self.assertIsInstance(scope, ast.FunctionDef)
+                    readonly_native_calls = {
+                        "memory_windows": "call(ctypes.byref(status))",
+                        "memory_macos": "call(b'hw.memsize', ctypes.byref(value), ctypes.byref(size), None, 0)",
+                    }
+                    self.assertIn(scope.name, readonly_native_calls)
+                    expected = ast.parse(readonly_native_calls[scope.name], mode="eval").body
+                    self.assertEqual(ast.dump(item, include_attributes=False), ast.dump(expected, include_attributes=False))
                 if member in {"open", "fdopen"}:
                     self.assertFalse(any(isinstance(arg, ast.Starred) for arg in item.args))
                     self.assertFalse(any(keyword.arg is None for keyword in item.keywords))
@@ -907,6 +919,7 @@ class ProbeTests(unittest.TestCase):
             "import os\nenvironment = os.environ\nenvironment['KEY'] = 'value'",
             "from os import environ\nenviron['KEY'] = 'value'",
             "import os\nnamespace = os\nnamespace.environ['KEY'] = 'value'",
+            "import ctypes\ndef memory_macos():\n library = ctypes.CDLL('/usr/lib/libSystem.B.dylib')\n call = library.sysctlbyname\n call(b'kern.hostname', None, None, ctypes.create_string_buffer(b'changed'), 7)",
         ):
             with self.subTest(source=source), self.assertRaises(AssertionError):
                 self.assert_runtime_static_boundaries(source)
