@@ -343,12 +343,20 @@ def package_probe(name: str) -> dict:
         return unknown()
 
 
+def python_version_probe() -> dict:
+    # Numeric components alone mislabel 3.12.0rc1 as supported final 3.12.0.
+    # Keep the report schema stable while failing closed for prerelease runtimes.
+    if sys.version_info.releaselevel != "final":
+        return unknown("non_release_version")
+    return observed(list(sys.version_info[:3]))
+
+
 def collect_observations(workspace: Path, worker_source: Path | None = None) -> dict:
     system = platform.system()
     obs = {
         "os": observed(system if system in {"Linux", "Windows", "Darwin"} else "Other"),
         "architecture": observed(normalize_architecture(platform.machine())),
-        "python_version": observed(list(sys.version_info[:3])),
+        "python_version": python_version_probe(),
         "cpu_logical": positive_measurement(os.cpu_count()),
         "cpu_affinity": unknown("unsupported_platform"),
     }

@@ -110,6 +110,7 @@ reportにはhostname，ユーザー名，workspace／実行ファイルの絶対
 - `os.access` は書込試験ではありません．ACL，race，read-only mount，Git外出力先というrepo要件は別に確認してください
 - PATH存在はtool versionや正常実行を証明しません．distribution metadataもimport成功，binary ABI，lockfile一致，extras／推移的依存の解決を証明しません
 - prerelease／dev／local versionなど単純な数値releaseでないmetadataは，比較を推測せず `unknown` にします
+- Python実行環境自体がalpha／beta／release candidateの場合も，数値だけでfinal releaseと扱わず `unknown / non_release_version` とします．ほかの必須条件が揃っていても `incomplete` になります
 - sourceの固定3ファイル一致は，checkout全体のcommitや，実際にimportされるworker sourceを証明しません
 - GPUの有無，driver，VRAM，LLM model容量を測定せず，GPU名から実行能力を推定しません
 - 2台の実通信，OS別停止処理，実検索，引用品質，coding隔離，formal governance gateは未検証です

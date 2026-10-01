@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 import unittest
+from collections import namedtuple
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, mock_open, patch
@@ -368,6 +369,29 @@ class ProbeTests(unittest.TestCase):
                 self.assertEqual(n.package_probe("pydantic")["status"], "unknown")
         with patch.object(n.importlib.metadata, "version", side_effect=KeyError("Version")):
             self.assertEqual(n.package_probe("pydantic")["status"], "unknown")
+
+    def test_prerelease_python_cannot_pass_any_profile(self):
+        version_info = namedtuple("VersionInfo", "major minor micro releaselevel serial")
+        for minor in (12, 13, 14):
+            for release in ("alpha", "beta", "candidate"):
+                with self.subTest(minor=minor, release=release), patch.object(
+                    n.sys, "version_info", version_info(3, minor, 0, release, 1)
+                ):
+                    item = n.python_version_probe()
+                    self.assertEqual(item, n.unknown("non_release_version"))
+                    obs = good_observations()
+                    obs["python_version"] = item
+                    report = n.build_report(obs, ["collect", "test", "render"], "live")
+                    self.assertEqual(report["overall"], "incomplete")
+                    self.assertTrue(all(p["status"] == "incomplete" for p in report["profiles"]))
+
+    def test_final_python_preserves_numeric_version(self):
+        version_info = namedtuple("VersionInfo", "major minor micro releaselevel serial")
+        for minor in (12, 13, 14):
+            with self.subTest(minor=minor), patch.object(
+                n.sys, "version_info", version_info(3, minor, 0, "final", 0)
+            ):
+                self.assertEqual(n.python_version_probe(), n.observed([3, minor, 0]))
 
     def test_windows_source_fails_closed_without_reading(self):
         path = Path("unused")
