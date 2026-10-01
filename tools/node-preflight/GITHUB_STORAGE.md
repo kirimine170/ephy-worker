@@ -2,7 +2,9 @@
 
 このdirectoryは，既に作成した独立版 `ephy-node-preflight` 0.1.0のsourceをGitHubへ一元保管するためのものです．[PR #11](https://github.com/kirimine170/ephy-worker/pull/11)は，当初**未検証・採用不可のDraft PR**として公開し，その後，利用者が指定したCodex Review／P0・P1修正／CIの経路を経てsquash mergeされました．独立した補助CLIであり，Workerの登録能力や正式なself-improvement workflowの採用を意味しません．
 
-今回に限り，正式な検証・監査が未完了でも保管／レビュー用Draft PRへ置くこと，その後に上記経路でmergeすることについて，利用者の明示的な承認を得ています．この案件固有の例外はgovernance本文や既存のquality gateを変更せず，`review_ready`，`external_pr_review_ready`，formal audit完了を成立させません．Worker API，config，依存関係，CIの定義もこの補助CLIの保管では変更していません．release／deployは実施していません．
+利用者が保管／レビュー用Draft PRの公開と，Codex Review／P0・P1修正／CI後のmerge操作を明示的に承認したことは，実施された操作の事実として記録します．一方，[governance正本](../../docs/system-development-governance.md)の `merge_ready` は，明示的な人間の承認に加えて `review_ready` または `external_pr_review_ready` の成立を必要とします．ユーザー承認やCodex Review／CIの成功だけでは，`pre_audit_workflow_gate` を含む技術的・手続的readinessを満たしません．
+
+PR #11と来歴文書修正[PR #12](https://github.com/kirimine170/ephy-worker/pull/12)のmerge時には，正式Pi workflow／`pre_audit_workflow_gate`／formal auditを完了しておらず，`review_ready`／`external_pr_review_ready` も成立していませんでした．したがって，これらのmergeはrepositoryの `merge_ready` 条件と採用契約を満たさない **governance deviation（手順逸脱）** として記録します．ユーザー承認によってquality gateやpermission boundaryに例外が成立した，または過去のmergeがgovernanceへ適合したとは主張しません．policy本文と既存gateは変更していません．Worker API，config，依存関係，CIの定義もこの補助CLIの保管では変更していません．release／deployは実施していません．
 
 ## 保存した内容
 
