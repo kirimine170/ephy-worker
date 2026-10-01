@@ -6,7 +6,7 @@
 
 ## 保存した内容
 
-- 最初の保管commitでは配布済み独立版をbyte単位で保存しました．その後，Codex ReviewのP1に対応し，Python prereleaseの判定，static controlのfrom-import判定，回帰test，関連説明を限定修正しています．合成sampleと期待JSONは変更していません．
+- 最初の保管commitでは配布済み独立版をbyte単位で保存しました．その後，Codex ReviewのP1に対応し，Python prereleaseの判定，static controlのimport／call allowlistと読取専用open判定，回帰test，関連説明を限定修正しています．合成sampleと期待JSONは変更していません．
 - `MANIFEST.sha256` は，元配布版と同じ11ファイルについて，現在の修正後bytesを照合するhashです．この追加説明はmanifestの対象ではありません．元配布版のidentityは以下のSHA-256と最初の保管commitで保持します．
 - `SCOPE.json` のpublicationと `VERIFICATION.md` は，GitHub移送前の独立版を作成・検証した時点の記録です．現在の保管場所と確認対象headは，このDraft PRとGitHubのcommitを参照してください．
 - ZIP，Python cache，実行バイナリ，実端末のreport，credential，個人情報，会話記録は追加していません．sampleは合成データです．
@@ -34,11 +34,11 @@ repository rootでは既存の検査を実行します．
 python3 -B scripts/validate_repository.py --check-sensitive-patterns
 ```
 
-rootの既存pytest設定は `tests/` を対象とするため，この独立CLIの56 unit testは上記commandで別に実行する必要があります．既存CIは変更していません．
+rootの既存pytest設定は `tests/` を対象とするため，この独立CLIの59 unit testは上記commandで別に実行する必要があります．既存CIは変更していません．
 
 ## 検証と未確認の境界
 
-- Linux cloud／Python 3.12.14で，この独立CLIの56 unit testと，合成sample 3件のJSON・exit codeを再確認しています．alpha／beta／candidateの数値切り捨てによる誤通過を回帰testで拒否し，final releaseの既存挙動を保持します．from-importのsource moduleも検査し，禁止importと禁止callの不正controlを実行せずASTだけで拒否します．
+- Linux cloud／Python 3.12.14で，この独立CLIの59 unit testと，合成sample 3件のJSON・exit codeを再確認しています．alpha／beta／candidateの誤通過を拒否し，final releaseの挙動を保持します．固定import／call allowlist，from-import source，alias，open mode／flagsを検査し，HTTP通信，process起動，書込／削除／touch等の不正controlを実行せずASTで拒否します．
 - GitHub移送先のbaseと追加後のsnapshotに対し，既存repository validatorとsecret-pattern scanを実行しています．
 - Windows／macOSはAPI mockによるunit testのみで，実機確認ではありません．Windowsのsource attestationは意図的に `unknown` です．
 - full Worker regression，実Worker登録／Job，2台間通信，formal Pi workflow gate，正式な独立監査は，独立CLIのtest結果で代替しません．

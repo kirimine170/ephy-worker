@@ -345,15 +345,149 @@ class ProbeTests(unittest.TestCase):
     def assert_runtime_static_boundaries(self, source):
         tree = ast.parse(source)
         imports = set()
+        aliases = {}
+        allowed_imports = {
+            "__future__", "argparse", "ctypes", "hashlib", "importlib.metadata",
+            "json", "os", "platform", "re", "shutil", "stat", "sys",
+            "decimal", "pathlib", "typing",
+        }
         for item in ast.walk(tree):
             if isinstance(item, ast.Import):
-                imports.update(alias.name.split('.')[0] for alias in item.names)
+                imports.update(alias.name for alias in item.names)
+                for alias in item.names:
+                    aliases[alias.asname or alias.name.split('.')[0]] = (
+                        alias.name if alias.asname else alias.name.split('.')[0]
+                    )
             elif isinstance(item, ast.ImportFrom) and item.module is not None:
-                imports.add(item.module.split('.')[0])
-        self.assertFalse(imports & {"subprocess", "socket", "requests", "httpx", "urllib"})
-        forbidden = {"eval", "exec", "system", "popen", "write_text", "write_bytes", "mkdir", "makedirs", "unlink", "rmtree", "rename", "replace"}
+                self.assertEqual(item.level, 0)
+                imports.add(item.module)
+                for alias in item.names:
+                    self.assertNotEqual(alias.name, "*")
+                    aliases[alias.asname or alias.name] = item.module + "." + alias.name
+            elif isinstance(item, ast.ImportFrom):
+                self.fail("relative imports require separate review")
+        self.assertFalse(imports - allowed_imports)
+
+        def qualified(node):
+            if isinstance(node, ast.Name):
+                return aliases.get(node.id, node.id)
+            if isinstance(node, ast.Attribute):
+                return qualified(node.value) + "." + node.attr
+            return ""
+
+        # Freeze the reviewed call surface as well as imports. New aliases or
+        # APIs require an explicit checker/review change instead of passing by
+        # omission from a blacklist.
+        allowed_calls = set("""
+            .decode .get .hexdigest .join .splitlines .open
+            InputError MemoryStatus OBSERVATION_TYPES.items REFERENCE_HASHES.items
+            RedactingParser VERSION_RE.fullmatch _read_fd _read_source_at
+            _read_windows_regular all any argparse.ArgumentTypeError build_report
+            call check checks.append chunks.append cli.error cli.parse_args close
+            collect_observations create ctypes.CDLL ctypes.POINTER ctypes.WinDLL
+            ctypes.byref ctypes.c_size_t ctypes.c_uint32 ctypes.c_uint64
+            ctypes.c_void_p ctypes.create_string_buffer ctypes.get_last_error
+            ctypes.sizeof data.decode data.replace decimal.Decimal dict dict.fromkeys
+            get_type gib handle.read hasattr hashlib.sha256 importlib.metadata.version
+            info_call inputs.add_argument int isinstance json.dumps json.loads
+            kind.endswith len lines.append lines.extend list load_sample main map
+            memory_for_os min normalize_architecture obs.update observation observed
+            open os.access os.close os.cpu_count os.dup os.fstat os.open os.read
+            os.sched_getaffinity package_probe padded_version parser pathlib.Path
+            platform.machine platform.system positive_measurement predicate print
+            probe profile_result python_version_probe re.compile re.fullmatch read
+            read_bounded_regular required.items required.update root.add_argument
+            root.add_mutually_exclusive_group self.exit set shutil.disk_usage
+            shutil.which sorted source_reference_probe stat.S_ISDIR stat.S_ISREG
+            str stream.reconfigure summary sys.exit tuple type unknown valid_value
+            validate_observations value value.is_finite value.lower value.startswith
+            values.get version.split workspace.stat workspace_probe
+        """.split())
+        native_bindings = {
+            "call": {"kernel.GlobalMemoryStatusEx", "library.sysctlbyname"},
+            "create": {"library.CreateFileW"}, "close": {"library.CloseHandle"},
+            "get_type": {"library.GetFileType"},
+            "info_call": {"library.GetFileInformationByHandleEx"},
+            "read": {"library.ReadFile"},
+        }
+        assignments = {}
+        for item in ast.walk(tree):
+            if isinstance(item, ast.Assign):
+                for target in item.targets:
+                    if isinstance(target, ast.Name):
+                        assignments.setdefault(target.id, []).append(item.value)
+                        if target.id in native_bindings:
+                            self.assertIn(qualified(item.value), native_bindings[target.id])
+
+        def read_only_flags(node, seen=frozenset()):
+            if qualified(node) in {
+                "os.O_RDONLY", "os.O_DIRECTORY", "os.O_NOFOLLOW", "os.O_NONBLOCK", "os.O_BINARY",
+            }:
+                return True
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+                return read_only_flags(node.left, seen) and read_only_flags(node.right, seen)
+            if isinstance(node, ast.Name):
+                if node.id in seen:
+                    return False
+                values = assignments.get(node.id, [])
+                return bool(values) and all(
+                    read_only_flags(value, seen | {node.id}) for value in values
+                )
+            return False
+
+        forbidden = {
+            "eval", "exec", "__import__", "system", "popen", "fork", "forkpty",
+            "posix_spawn", "posix_spawnp", "startfile", "write", "writelines",
+            "write_text", "write_bytes", "touch", "remove", "removedirs", "rmdir",
+            "mkdir", "makedirs", "unlink", "rmtree", "rename", "renames", "replace",
+            "copy", "copy2", "copyfile", "copytree", "move", "chmod", "fchmod",
+            "chown", "fchown", "lchown", "utime", "truncate", "ftruncate",
+            "link", "symlink", "mkfifo", "mknod", "putenv", "unsetenv",
+        }
         for item in ast.walk(tree):
             if isinstance(item, ast.Call):
+                name = qualified(item.func)
+                member = name.rsplit(".", 1)[-1]
+                if not name:
+                    # The sole reviewed computed callable builds FILE_ATTRIBUTE_TAG_INFO.
+                    self.assertIsInstance(item.func, ast.BinOp)
+                    self.assertIsInstance(item.func.op, ast.Mult)
+                    self.assertEqual(qualified(item.func.left), "ctypes.c_uint32")
+                    self.assertIsInstance(item.func.right, ast.Constant)
+                    self.assertEqual(item.func.right.value, 2)
+                else:
+                    self.assertIn(name, allowed_calls)
+                if name in {"ctypes.WinDLL", "ctypes.CDLL"}:
+                    self.assertTrue(item.args)
+                    self.assertIsInstance(item.args[0], ast.Constant)
+                    self.assertEqual(item.args[0].value, "kernel32" if name.endswith("WinDLL") else "/usr/lib/libSystem.B.dylib")
+                if name == "create":
+                    self.assertEqual(len(item.args), 7)
+                    self.assertFalse(item.keywords)
+                    for argument, expected in zip(item.args[1:], (0x80000000, 1, None, 3, 0x00200000, None)):
+                        self.assertIsInstance(argument, ast.Constant)
+                        self.assertEqual(argument.value, expected)
+                if member in {"open", "fdopen"}:
+                    self.assertFalse(any(isinstance(arg, ast.Starred) for arg in item.args))
+                    self.assertFalse(any(keyword.arg is None for keyword in item.keywords))
+                if name == "os.open":
+                    flags = next((k.value for k in item.keywords if k.arg == "flags"), None)
+                    flags = flags if flags is not None else item.args[1] if len(item.args) > 1 else None
+                    self.assertIsNotNone(flags)
+                    self.assertTrue(read_only_flags(flags))
+                elif member in {"open", "fdopen"}:
+                    offset = 1 if name in {"open", "os.fdopen"} else 0
+                    mode = next((k.value for k in item.keywords if k.arg == "mode"), None)
+                    mode = mode if mode is not None else item.args[offset] if len(item.args) > offset else ast.Constant("r")
+                    self.assertIsInstance(mode, ast.Constant)
+                    self.assertIn(mode.value, {"r", "rb", "rt"})
+                if member == "system":
+                    self.assertEqual(name, "platform.system")
+                elif member == "replace":
+                    self.assertEqual(name, "data.replace")
+                else:
+                    self.assertNotIn(member, forbidden)
+                    self.assertFalse(member.startswith(("execv", "execl", "spawn")))
                 if isinstance(item.func, ast.Name):
                     self.assertNotIn(item.func.id, forbidden)
                 if isinstance(item.func, ast.Attribute):
@@ -400,6 +534,55 @@ class ProbeTests(unittest.TestCase):
         self.assert_runtime_static_boundaries(
             "from pathlib import Path\nfrom decimal import Decimal\nimport platform\nplatform.system()"
         )
+
+    def test_static_control_rejects_other_network_imports(self):
+        for source in (
+            "from http.client import HTTPSConnection",
+            "import http.client as client",
+            "from ftplib import FTP",
+            "import smtplib",
+            "import asyncio",
+            "from os import *",
+        ):
+            with self.subTest(source=source), self.assertRaises(AssertionError):
+                self.assert_runtime_static_boundaries(source)
+
+    def test_static_control_rejects_file_mutation_apis_and_modes(self):
+        controls = (
+            "open('output', 'w').write('x')",
+            "open('output', mode='a')",
+            "open('output', 'r+')",
+            "open('output', 'xb')",
+            "mode = input()\nopen('output', mode)",
+            "options = {'mode': 'w'}\nopen('output', **options)",
+            "args = ('output', 'w')\nopen(*args)",
+            "from pathlib import Path\nPath('output').open('w')",
+            "from pathlib import Path\nPath('output').touch()",
+            "import os\nos.remove('output')",
+            "import os as operating\noperating.remove('output')",
+            "from os import remove as delete\ndelete('output')",
+            "writer = open\nwriter('output', 'w')",
+            "import os\ndelete = os.remove\ndelete('output')",
+            "import os\ngetattr(os, 'remove')('output')",
+            "import ctypes\nlibrary = ctypes.WinDLL('kernel32')\nread = library.DeleteFileW\nread('output')",
+            "import os\nos.open('output', os.O_WRONLY | os.O_CREAT)",
+            "import os\nflags = os.O_RDWR\nos.open('output', flags)",
+            "import os\nos.fdopen(3, 'w')",
+            "import shutil\nshutil.copyfile('source', 'output')",
+        )
+        for source in controls:
+            with self.subTest(source=source), self.assertRaises(AssertionError):
+                self.assert_runtime_static_boundaries(source)
+
+    def test_static_control_accepts_explicit_read_only_opens(self):
+        for source in (
+            "open('input', 'rb')",
+            "open('input', mode='r')",
+            "from pathlib import Path\nPath('input').open('rb')",
+            "import os\nos.open('input', os.O_RDONLY | os.O_NOFOLLOW)",
+        ):
+            with self.subTest(source=source):
+                self.assert_runtime_static_boundaries(source)
 
 
     def test_metadata_missing_version_is_unknown(self):
