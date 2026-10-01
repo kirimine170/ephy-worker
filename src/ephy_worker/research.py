@@ -590,10 +590,28 @@ class ResearchExecutor:
         self.report.failures.extend(result.failures)
         return acquired
 
-    async def run(self, question: str, supplemental_urls: list[str] | None = None) -> Report:
+    async def run(
+        self,
+        question: str,
+        supplemental_urls: list[str] | None = None,
+        *,
+        existing_report: Report | None = None,
+    ) -> Report:
         from .search import validate_public_text
 
         validate_public_text(question)
+        if existing_report is None and getattr(self.store, "opened_existing", False):
+            raise ValueError("existing_store_requires_checkpoint")
+        if existing_report is not None:
+            if existing_report.job_id != self.store.job_id:
+                raise ValueError("existing_report job_id does not match store")
+            if existing_report.question != question:
+                raise ValueError("existing_report question does not match request")
+            if existing_report.profile_id != self.profile_id:
+                raise ValueError("existing_report profile_id does not match request")
+            # Report 0.1 has no stage checkpoint, restored budget, or execution
+            # lineage. Starting _execute again would be a retry, not a resume.
+            raise ValueError("resume_checkpoint_unsupported")
         self.report = Report(job_id=self.store.job_id, question=question, profile_id=self.profile_id)
         self.store.status(self.report)
         self.event("started", profile_id=self.profile_id)

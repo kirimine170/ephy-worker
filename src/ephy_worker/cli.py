@@ -40,6 +40,11 @@ def parser() -> argparse.ArgumentParser:
     research.add_argument(
         "--source-url", action="append", default=[], help="明示的な追加公開資料URL（複数可）"
     )
+    research.add_argument(
+        "--resume-job-id",
+        default=None,
+        help="既存Jobの再開は検証可能なcheckpointがないため現在利用不可",
+    )
     worker = sub.add_parser("worker", help="Workerサービス（遠隔hostでcollect jobを実行）")
     worker_sub = worker.add_subparsers(dest="worker_command", required=True)
     worker_run = worker_sub.add_parser("run", help="workerを起動し，job claim・実行を繰り返す")
@@ -274,6 +279,20 @@ async def dispatch(args) -> int:
     from .search import validate_public_text
 
     validate_public_text(args.question)
+    resume_job_id = getattr(args, "resume_job_id", None)
+    if resume_job_id is not None:
+        from .store import JobStore
+
+        try:
+            store = JobStore.open_existing(args.output_dir, resume_job_id)
+            saved_report = store.load_report()
+            if saved_report.question != args.question or saved_report.profile_id != args.profile:
+                raise ValueError("resume request does not match the saved report")
+        except FileNotFoundError as exc:
+            raise CLIError("resume_job_not_found") from exc
+        except ValueError as exc:
+            raise CLIError("resume_job_invalid") from exc
+        raise CLIError("resume_checkpoint_unsupported")
     config.model_profiles[args.profile].resolve()
     if args.mode == "remote":
         collector = _build_remote_collector(config)
