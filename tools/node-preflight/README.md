@@ -133,7 +133,7 @@ sample modeはhost probeを呼びません．未知キー，欠損キー，重�
 
 unit testは一時directoryとfixtureを作ります．この点は，読み取り専用の診断CLI自体と異なります．POSIX descriptor探索だけのtestは，Windows上では明示skipされる設計です．今回のLinux testではskipはありませんでした．
 
-static controlは，レビュー済みのimport／call allowlistと，読取専用open mode／flagsを確認します．HTTP client，process，書込み，削除，touch，alias等の不正controlはASTとして検査し，実行しません．これは固定されたsourceに対する回帰検査であり，任意のPython programを安全に実行するsandboxや，正式な監査の代替ではありません．新しいAPIにはcheckerとsourceのレビューが必要です．
+static controlは，レビュー済みのimport／call allowlist，許可callableの再束縛拒否，読取専用open mode／flagsを確認します．HTTP client，process，書込み，削除，touch，alias等の不正controlはASTとして検査し，実行しません．これは固定されたsourceに対する回帰検査であり，任意のPython programを安全に実行するsandboxや，正式な監査の代替ではありません．新しいAPIにはcheckerとsourceのレビューが必要です．
 
 ## 次の統合作業
 

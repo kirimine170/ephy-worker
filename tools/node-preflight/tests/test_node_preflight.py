@@ -411,6 +411,11 @@ class ProbeTests(unittest.TestCase):
             "read": {"library.ReadFile"},
         }
         assignments = {}
+        reviewed_stores = set()
+        expected_probe = ast.dump(ast.parse(
+            '{"Linux": memory_linux, "Windows": memory_windows, "Darwin": memory_macos}.get(system)',
+            mode="eval",
+        ).body, include_attributes=False)
         for item in ast.walk(tree):
             if isinstance(item, ast.Assign):
                 for target in item.targets:
@@ -418,6 +423,60 @@ class ProbeTests(unittest.TestCase):
                         assignments.setdefault(target.id, []).append(item.value)
                         if target.id in native_bindings:
                             self.assertIn(qualified(item.value), native_bindings[target.id])
+                            reviewed_stores.add(id(target))
+                        elif target.id == "probe":
+                            self.assertEqual(ast.dump(item.value, include_attributes=False), expected_probe)
+                            reviewed_stores.add(id(target))
+
+        builtin_calls = {
+            "all", "any", "dict", "hasattr", "int", "isinstance", "len", "list",
+            "map", "min", "open", "print", "set", "sorted", "str", "tuple", "type",
+        }
+        for item in ast.walk(tree):
+            if isinstance(item, (ast.Import, ast.ImportFrom)):
+                for alias in item.names:
+                    self.assertNotIn(alias.asname or alias.name.split('.')[0], builtin_calls)
+
+        scope_types = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+
+        def local_nodes(scope):
+            for child in ast.iter_child_nodes(scope):
+                yield child
+                if not isinstance(child, scope_types):
+                    yield from local_nodes(child)
+
+        # Names are resolved before any call is accepted. Rebinding a builtin,
+        # imported namespace, or local call target must not inherit its allowlist.
+        for scope in [tree, *(node for node in ast.walk(tree) if isinstance(node, scope_types))]:
+            nodes = list(local_nodes(scope))
+            called_names = {
+                node.func.id for node in nodes
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            }
+            protected = builtin_calls | set(aliases) | called_names
+            defined = set()
+            for node in nodes:
+                if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                    if node.id in protected:
+                        self.assertIn(id(node), reviewed_stores)
+                elif isinstance(node, ast.arg) and node.arg in protected:
+                    self.assertEqual((getattr(scope, "name", None), node.arg), ("check", "predicate"))
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    self.assertNotIn(node.name, builtin_calls | set(aliases) | set(native_bindings) | defined)
+                    defined.add(node.name)
+                elif isinstance(node, ast.ExceptHandler) and node.name is not None:
+                    self.assertNotIn(node.name, protected)
+                elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name is not None:
+                    self.assertNotIn(node.name, protected)
+                elif isinstance(node, ast.MatchMapping) and node.rest is not None:
+                    self.assertNotIn(node.rest, protected)
+                elif isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                    name = qualified(node)
+                    self.assertNotIn(name, allowed_calls)
+                    self.assertFalse(name.split('.')[0] in builtin_calls | set(aliases))
+                    self.assertFalse(any(name in names for names in native_bindings.values()))
+                elif isinstance(node, ast.Subscript) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                    self.assertNotIn(qualified(node.value).split('.')[0], protected)
 
         def read_only_flags(node, seen=frozenset()):
             if qualified(node) in {
@@ -445,6 +504,12 @@ class ProbeTests(unittest.TestCase):
             "link", "symlink", "mkfifo", "mknod", "putenv", "unsetenv",
         }
         for item in ast.walk(tree):
+            if isinstance(item, ast.Name):
+                self.assertNotIn(item.id, {"__builtins__", "__loader__", "__spec__"})
+            if isinstance(item, ast.Attribute):
+                self.assertFalse(item.attr.startswith("__"))
+                if item.attr in forbidden:
+                    self.assertIn(qualified(item), {"platform.system", "data.replace"})
             if isinstance(item, ast.Call):
                 name = qualified(item.func)
                 member = name.rsplit(".", 1)[-1]
@@ -467,6 +532,12 @@ class ProbeTests(unittest.TestCase):
                     for argument, expected in zip(item.args[1:], (0x80000000, 1, None, 3, 0x00200000, None)):
                         self.assertIsInstance(argument, ast.Constant)
                         self.assertEqual(argument.value, expected)
+                if name == "check":
+                    self.assertGreaterEqual(len(item.args), 3)
+                    self.assertTrue(
+                        isinstance(item.args[2], ast.Lambda)
+                        or isinstance(item.args[2], ast.Name) and item.args[2].id == "bool"
+                    )
                 if member in {"open", "fdopen"}:
                     self.assertFalse(any(isinstance(arg, ast.Starred) for arg in item.args))
                     self.assertFalse(any(keyword.arg is None for keyword in item.keywords))
@@ -582,6 +653,26 @@ class ProbeTests(unittest.TestCase):
             "import os\nos.open('input', os.O_RDONLY | os.O_NOFOLLOW)",
         ):
             with self.subTest(source=source):
+                self.assert_runtime_static_boundaries(source)
+
+    def test_static_control_rejects_allowlisted_callable_rebinding(self):
+        for source in (
+            "import os\nopen = os.remove\nopen('output')",
+            "open = len\nopen('output')",
+            "open: object = len\nopen('output')",
+            "(open := len)('output')",
+            "for open in (): open('output')",
+            "def shadow(open): return open('output')",
+            "def open(path): return 1\nopen('output')",
+            "from pathlib import Path\nPath = str\nPath('output')",
+            "import platform\nimport os\nplatform.system = os.cpu_count\nplatform.system()",
+            "import json\njson.loads = json.dumps\njson.loads('{}')",
+            "import json\njson.__dict__['loads'] = json.dumps\njson.loads('{}')",
+            "__builtins__['open'] = len\nopen('output')",
+            "try:\n pass\nexcept Exception as open:\n open('output')",
+            "match len:\n case open: open('output')",
+        ):
+            with self.subTest(source=source), self.assertRaises(AssertionError):
                 self.assert_runtime_static_boundaries(source)
 
 
