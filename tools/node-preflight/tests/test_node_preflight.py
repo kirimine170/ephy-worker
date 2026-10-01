@@ -342,9 +342,14 @@ class ProbeTests(unittest.TestCase):
             path.write_bytes(b"a" * (n.MAX_SOURCE_BYTES+1))
             self.assertEqual(n.source_reference_probe(root)["reason"], "source_too_large")
 
-    def test_no_subprocess_network_eval_or_write_calls(self):
-        tree = ast.parse(Path(n.__file__).read_text(encoding="utf-8"))
-        imports = {alias.name.split('.')[0] for item in ast.walk(tree) if isinstance(item, (ast.Import, ast.ImportFrom)) for alias in item.names}
+    def assert_runtime_static_boundaries(self, source):
+        tree = ast.parse(source)
+        imports = set()
+        for item in ast.walk(tree):
+            if isinstance(item, ast.Import):
+                imports.update(alias.name.split('.')[0] for alias in item.names)
+            elif isinstance(item, ast.ImportFrom) and item.module is not None:
+                imports.add(item.module.split('.')[0])
         self.assertFalse(imports & {"subprocess", "socket", "requests", "httpx", "urllib"})
         forbidden = {"eval", "exec", "system", "popen", "write_text", "write_bytes", "mkdir", "makedirs", "unlink", "rmtree", "rename", "replace"}
         for item in ast.walk(tree):
@@ -361,6 +366,40 @@ class ProbeTests(unittest.TestCase):
                     if item.func.attr == "replace":
                         self.assertIsInstance(item.func.value, ast.Name)
                         self.assertEqual(item.func.value.id, "data")
+
+    def test_no_subprocess_network_eval_or_write_calls(self):
+        self.assert_runtime_static_boundaries(Path(n.__file__).read_text(encoding="utf-8"))
+
+    def test_static_control_rejects_from_import_modules(self):
+        # These strings are parsed only; no network or subprocess code is executed.
+        controls = (
+            "from urllib import request\nrequest.urlopen('https://example.invalid')",
+            "from urllib.request import urlopen as open_url\nopen_url('https://example.invalid')",
+            "from subprocess import run\nrun(['never-executed'])",
+            "from subprocess import run as launch\nlaunch(['never-executed'])",
+            "from socket import socket as connect\nconnect()",
+            "from httpx import get\nget('https://example.invalid')",
+        )
+        for source in controls:
+            with self.subTest(source=source), self.assertRaises(AssertionError):
+                self.assert_runtime_static_boundaries(source)
+
+    def test_static_control_keeps_direct_import_and_call_rejections(self):
+        for source in (
+            "import urllib.request as request",
+            "import subprocess as child",
+            "import socket",
+            "import os\nos.system('never-executed')",
+            "eval('never-executed')",
+            "from pathlib import Path\nPath('never-written').write_text('x')",
+        ):
+            with self.subTest(source=source), self.assertRaises(AssertionError):
+                self.assert_runtime_static_boundaries(source)
+
+    def test_static_control_accepts_harmless_from_import(self):
+        self.assert_runtime_static_boundaries(
+            "from pathlib import Path\nfrom decimal import Decimal\nimport platform\nplatform.system()"
+        )
 
 
     def test_metadata_missing_version_is_unknown(self):
