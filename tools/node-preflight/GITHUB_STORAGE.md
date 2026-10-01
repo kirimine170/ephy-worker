@@ -1,18 +1,26 @@
 # GitHub保管版の位置付け
 
-このdirectoryは，既に作成した独立版 `ephy-node-preflight` 0.1.0のsourceをGitHubへ一元保管するためのものです．**未検証・採用不可のDraft PR**として公開し，通常のWorker実装や正式なself-improvement candidateへの採用を意味しません．
+このdirectoryは，既に作成した独立版 `ephy-node-preflight` 0.1.0のsourceをGitHubへ一元保管するためのものです．[PR #11](https://github.com/kirimine170/ephy-worker/pull/11)は，当初**未検証・採用不可のDraft PR**として公開し，その後，利用者が指定したCodex Review／P0・P1修正／CIの経路を経てsquash mergeされました．独立した補助CLIであり，Workerの登録能力や正式なself-improvement workflowの採用を意味しません．
 
-今回に限り，正式な検証・監査が未完了でも保管／レビュー用Draft PRへ置くことについて，利用者の明示的な承認を得ています．governance本文，既存のquality gate，Worker API，config，依存関係，CIの定義は変更しません．`review_ready`，`external_pr_review_ready`，formal audit完了を主張せず，merge／release／deployはこの保管作業の対象外です．
+今回に限り，正式な検証・監査が未完了でも保管／レビュー用Draft PRへ置くこと，その後に上記経路でmergeすることについて，利用者の明示的な承認を得ています．この案件固有の例外はgovernance本文や既存のquality gateを変更せず，`review_ready`，`external_pr_review_ready`，formal audit完了を成立させません．Worker API，config，依存関係，CIの定義もこの補助CLIの保管では変更していません．release／deployは実施していません．
 
 ## 保存した内容
 
-- 最初の保管commitでは配布済み独立版をbyte単位で保存しました．その後，Codex ReviewのP1に対応し，Python prereleaseの判定，static controlの閉じた構文／import／member／call引数とreceiver契約，再束縛拒否，読取専用open判定，回帰test，関連説明を限定修正しています．合成sampleと期待JSONは変更していません．
-- `MANIFEST.sha256` は，元配布版と同じ11ファイルについて，現在の修正後bytesを照合するhashです．この追加説明はmanifestの対象ではありません．元配布版のidentityは以下のSHA-256と最初の保管commitで保持します．
-- `SCOPE.json` のpublicationと `VERIFICATION.md` は，GitHub移送前の独立版を作成・検証した時点の記録です．現在の保管場所と確認対象headは，このDraft PRとGitHubのcommitを参照してください．
+- 元配布版から，Codex ReviewのP1に対応し，Python prereleaseの判定，static controlの閉じた構文／import／member／call引数とreceiver契約，再束縛拒否，読取専用open判定，回帰test，関連説明を限定修正しています．合成sampleと期待JSONは変更していません．archiveとGit履歴の対応は次節に記載します．
+- `MANIFEST.sha256` は，元配布版と同じ11ファイルについて，修正後bytesを照合するhashです．この追加説明はmanifestの対象ではありません．元配布版のidentityは以下のSHA-256で区別し，現在のsourceのhashやtest結果として流用しません．
+- `SCOPE.json` のpublicationと `VERIFICATION.md` は，GitHub移送前の独立版を作成・検証した時点の記録です．元CLIの51 testと，GitHub修正後の65 testは対象bytesが異なります．現在の保管場所，変更履歴，確認対象commitは以下と各PRの記録を参照してください．
 - ZIP，Python cache，実行バイナリ，実端末のreport，credential，個人情報，会話記録は追加していません．sampleは合成データです．
 - 元CLIのSHA-256：`263a86b46120c77c25be4d5922c56f633090d9d19f3d2c5e486e7ae7eec6149a`．
 - 元配布ZIPのSHA-256：`08c12c38a0c997078e2fc4790a746869f605776a93085dcc464c4b120f8212d0`．ZIP本体はGitへ保存しません．
-- 移送base：`0f6c3cb7a272bc67e2a0a0dc828e579df6823d98`．既存のresume修正PRとは別のbranch／PRです．
+
+## archive，旧branch，squash mergeの対応
+
+- 独立版のupstream参照点と旧保管branchの開始baseは `0f6c3cb7a272bc67e2a0a0dc828e579df6823d98` です．これはPR #11の最終baseやmain上のsquash commitの親を表しません．
+- [旧branchの最初の保管commit](https://github.com/kirimine170/ephy-worker/commit/c982844d265fc7db90f40985bcaaca47b617e613)は `c982844d265fc7db90f40985bcaaca47b617e613`，その親は上記 `0f6c3cb7a272bc67e2a0a0dc828e579df6823d98` です．元配布ZIPの12ファイルは，このcommitの `tools/node-preflight/` 内の対応ファイルとbyte単位で一致します．追加した本書はZIPに含まれません．この照合はarchiveの来歴を示し，現在のmain ancestryや修正後sourceの検証を代替しません．
+- PR #11の最終baseは `146012483e63de19f97c655b730978221604de32`，[旧branchの最終head](https://github.com/kirimine170/ephy-worker/commit/005b8c141abb402073e3d5165b19c62cbc0c7b44)は `005b8c141abb402073e3d5165b19c62cbc0c7b44` です．旧branch側の保存／修正commit群は，このheadとPR履歴で参照する過去の記録です．
+- mainへ入った実際の[squash merge commit](https://github.com/kirimine170/ephy-worker/commit/75e954512404107ca1b992fba3238a5b8f67119c)は `75e954512404107ca1b992fba3238a5b8f67119c`，唯一の親は `146012483e63de19f97c655b730978221604de32` です．旧branchの保存／修正commit群は，このsquash commitの祖先には含まれません．
+- 旧最終headとsquash mergeのrepository treeは，ともに `9e7ce9c1eb19c5a277f792a0c5f1a6697cd2d12f` です．同じsnapshotである根拠はtree identityであり，commit identityや親子関係の同一性ではありません．merge時CLIのSHA-256は `61933858d57cfe587d039126a133d6679b51ca6bb193681d0525a424101f04fd` です．
+- 後続PRのbase／head／diff／CI／reviewは，そのPR自身に結び付けて確認します．上記archiveや旧headの検証結果を，新しいheadの合格証拠として読み替えません．
 
 ## repository内からの再現手順
 
@@ -38,9 +46,9 @@ rootの既存pytest設定は `tests/` を対象とするため，この独立CLI
 
 ## 検証と未確認の境界
 
-- Linux cloud／Python 3.12.14で，この独立CLIの65 unit testと，合成sample 3件のJSON・exit codeを再確認しています．alpha／beta／candidateの誤通過を拒否し，final releaseの挙動を保持します．固定された構文，import／member／call allowlist，from-import，callable再束縛，callback値，receiver binding，open mode／flagsの変更を検査し，HTTP通信，process起動，書込／削除／touch等の不正controlを実行せずASTで拒否します．CLIが使わないdecorator／metaclass／動的構文は許可しません．
-- GitHub移送先のbaseと追加後のsnapshotに対し，既存repository validatorとsecret-pattern scanを実行しています．
-- Windows／macOSはAPI mockによるunit testのみで，実機確認ではありません．Windowsのsource attestationは意図的に `unknown` です．
+- PR #11の旧最終head `005b8c141abb402073e3d5165b19c62cbc0c7b44` で，Linux cloud／Python 3.12.14による独立CLIの65 unit testと，合成sample 3件のJSON・exit codeを確認しました．alpha／beta／candidateの誤通過を拒否し，final releaseの挙動を保持します．固定された構文，import／member／call allowlist，from-import，callable再束縛，callback値，receiver binding，open mode／flagsの変更を検査し，HTTP通信，process起動，書込／削除／touch等の不正controlを実行せずASTで拒否します．CLIが使わないdecorator／metaclass／動的構文は許可しません．
+- 旧最終headの[CI](https://github.com/kirimine170/ephy-worker/actions/runs/36888635393)と，squash merge `75e954512404107ca1b992fba3238a5b8f67119c` の[post-merge CI](https://github.com/kirimine170/ephy-worker/actions/runs/36890656405)は成功しています．repository validator／secret-pattern scanを含みます．この2つのcommitを区別して記録します．
+- macOSは独立版作成時にはAPI mockのみでしたが，squash merge `75e954512404107ca1b992fba3238a5b8f67119c` で[初回実機CLI／test結果](https://github.com/kirimine170/ephy-worker/pull/11#issuecomment-5935971232)を追加確認しました．Windows実機は未確認で，Windowsのsource attestationは意図的に `unknown` です．
 - full Worker regression，実Worker登録／Job，2台間通信，formal Pi workflow gate，正式な独立監査は，独立CLIのtest結果で代替しません．
 - PRのCIとCodex Reviewは，その時点の正確なheadで別に確認します．新しいpushがあれば以前の結果を新headの合格根拠にはしません．
 
