@@ -425,10 +425,17 @@ def validate_proposal_stop(directory: Path, bundle: Path, result: dict, attestat
         or frozen[-1].get("proposal_stop_required") is not True
         or frozen[-1].get("controller_sha256") != file_hash(Path(__file__))
         or events[: len(frozen)] != frozen
-        or [event.get("stage") for event in tail] != ["auditor start", "auditor end", "proposal stop"]
-        or tail[0].get("expected_model") != LEAD
-        or tail[1].get("pid") != attestation["observed_auditor"]["pid"]
-        or tail[1].get("trace_sha256") != post.get("audit_trace_sha256")
+        or [event.get("stage") for event in tail]
+        != ["model loaded", "auditor start", "auditor end", "proposal stop"]
+        or tail[0].get("model") != LEAD
+        or not isinstance(tail[0].get("server_pid"), int)
+        or tail[0]["server_pid"] <= 0
+        or tail[0]["server_pid"] != frozen[-1].get("server_pid")
+        or tail[0].get("router_entry", {}).get("id") != LEAD
+        or tail[0].get("router_entry", {}).get("status", {}).get("value") != "loaded"
+        or tail[1].get("expected_model") != LEAD
+        or tail[2].get("pid") != attestation["observed_auditor"]["pid"]
+        or tail[2].get("trace_sha256") != post.get("audit_trace_sha256")
         or tail[-1].get("decision") != result["decision"]
     ):
         raise GateFailure("Missing or invalid post-audit proposal stop binding")
@@ -1115,6 +1122,7 @@ class FormalRunner:
                 snapshot_sha256=digest(encode(final)),
                 proposal_stop_required=True,
                 controller_sha256=file_hash(Path(__file__)),
+                server_pid=self.server.pid,
             )
             artifacts = {
                 name: safe_path(Path(self.runtime["governance_root"]), path).read_bytes()

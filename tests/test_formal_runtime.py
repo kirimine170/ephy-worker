@@ -648,27 +648,71 @@ def test_injected_document_requires_actual_matching_context_bytes(tmp_path):
 
 @pytest.mark.parametrize(
     "mutation",
-    ["none", "missing_stop", "wrong_decision", "extra_event", "wrong_prefix", "wrong_trace", "wrong_hash"],
+    [
+        "none",
+        "missing_stop",
+        "wrong_decision",
+        "extra_event",
+        "wrong_prefix",
+        "wrong_trace",
+        "wrong_hash",
+        "missing_load",
+        "duplicate_load",
+        "wrong_load_model",
+        "wrong_router_model",
+        "not_loaded",
+        "different_server",
+        "invalid_server",
+        "load_after_start",
+    ],
 )
-def test_post_audit_stop_is_bound_and_rechecked(tmp_path, mutation):
+def test_post_audit_stop_is_bound_and_rechecked(tmp_path, monkeypatch, mutation):
     bundle, audit_input = bundle_fixture(tmp_path)
     frozen = [
         {
             "stage": "freeze",
             "proposal_stop_required": True,
             "controller_sha256": file_hash(REPOSITORY / "src/ephy_worker/formal_runtime.py"),
+            "server_pid": 456,
         }
     ]
     (bundle / "workflow_events.txt").write_bytes(encode(frozen))
     (tmp_path / "audit-result.json").write_bytes(encode({"decision": "ACCEPT_PROPOSAL"}))
     (tmp_path / "auditor-trace.jsonl").write_text("trace", encoding="utf-8")
     trace_sha = file_hash(tmp_path / "auditor-trace.jsonl")
+    # Execute the production load boundary with an offline router, rather than omit its event.
+    runner = FormalRunner.__new__(FormalRunner)
+    runner.directory = tmp_path
+    runner.server = SimpleNamespace(pid=456)
+    runner.loaded_model = "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M"
+    runner.deadline = time.monotonic() + 60
+    runner.events = copy.deepcopy(frozen)
+    runner.resources = lambda: None
+    runner.state = lambda *_: None
+    runner.verify_model_artifacts = lambda model: None
+    routes = []
+    loaded = False
+
+    def router(route, body=None):
+        nonlocal loaded
+        routes.append(route)
+        if route == "/models/load":
+            assert body == {"model": "gpt-oss-20b-MXFP4"}
+            loaded = True
+        return {
+            "data": [{"id": "gpt-oss-20b-MXFP4", "status": {"value": "loaded" if loaded else "unloaded"}}]
+        }
+
+    runner.router_request = router
+    monkeypatch.setattr("ephy_worker.formal_runtime.time.sleep", lambda *_: None)
+    runner.load_model("gpt-oss-20b-MXFP4")
+    assert routes == ["/models/unload", "/models", "/models", "/models", "/models/load", "/models"]
     post = {
         "job_id": audit_input["job_id"],
         "frozen_workflow_sha256": file_hash(bundle / "workflow_events.txt"),
         "audit_result_sha256": file_hash(tmp_path / "audit-result.json"),
         "audit_trace_sha256": trace_sha,
-        "events": frozen
+        "events": runner.events
         + [
             {"stage": "auditor start", "expected_model": "gpt-oss-20b-MXFP4"},
             {"stage": "auditor end", "pid": 123, "trace_sha256": trace_sha},
@@ -685,6 +729,22 @@ def test_post_audit_stop_is_bound_and_rechecked(tmp_path, mutation):
         post["events"][0] = {"stage": "different freeze"}
     elif mutation == "wrong_trace":
         post["audit_trace_sha256"] = "0" * 64
+    elif mutation == "missing_load":
+        post["events"].pop(1)
+    elif mutation == "duplicate_load":
+        post["events"].insert(1, copy.deepcopy(post["events"][1]))
+    elif mutation == "wrong_load_model":
+        post["events"][1]["model"] = "other-model"
+    elif mutation == "wrong_router_model":
+        post["events"][1]["router_entry"]["id"] = "other-model"
+    elif mutation == "not_loaded":
+        post["events"][1]["router_entry"]["status"]["value"] = "unloaded"
+    elif mutation == "different_server":
+        post["events"][1]["server_pid"] = 789
+    elif mutation == "invalid_server":
+        post["events"][1]["server_pid"] = 0
+    elif mutation == "load_after_start":
+        post["events"][1], post["events"][2] = post["events"][2], post["events"][1]
     (tmp_path / "post-audit-workflow.json").write_bytes(encode(post))
     attestation = {
         "proposal_stopped": True,
