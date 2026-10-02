@@ -10,6 +10,7 @@ import sys
 from contextlib import suppress
 from pathlib import Path
 
+import psutil
 import pytest
 from pydantic import ValidationError
 
@@ -19,6 +20,8 @@ from ephy_worker.coding_executor import (
     CodingExecutionError,
     CodingExecutor,
     FakePiRunner,
+    PiRpcRunner,
+    WorkingTreeSnapshot,
     _macos_write_guard,
     _stop_process,
 )
@@ -75,6 +78,58 @@ def _profile(**updates) -> CodingModelProfile:
     }
     values.update(updates)
     return CodingModelProfile(**values)
+
+
+class ScriptPiRpcRunner(PiRpcRunner):
+    """Execute the same real RPC subprocess fixture on Windows and POSIX."""
+
+    def __init__(self, script: Path):
+        self.script = script
+
+    def invocation(self, profile: CodingModelProfile) -> list[str]:
+        return [sys.executable, str(self.script), *super().invocation(profile)[1:]]
+
+
+def test_snapshot_cleanup_removes_only_allocated_repository(tmp_path):
+    repository, revision = _repository(tmp_path)
+    snapshot = WorkingTreeSnapshot(repository, revision, [])
+    snapshot.create()
+    allocated = snapshot.temporary_root
+    assert allocated is not None
+    snapshot.cleanup()
+    assert not allocated.exists()
+    assert (repository / "value.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+
+
+def test_snapshot_cleanup_rejects_changed_target(tmp_path):
+    repository, revision = _repository(tmp_path)
+    snapshot = WorkingTreeSnapshot(repository, revision, [])
+    snapshot.create()
+    allocated = snapshot.temporary_root
+    snapshot.temporary_root = repository
+    with pytest.raises(OSError, match="allocated directory"):
+        snapshot.cleanup()
+    assert (repository / "value.py").exists()
+    snapshot.temporary_root = allocated
+    snapshot.cleanup()
+
+
+def test_snapshot_cleanup_does_not_swallow_permission_failure(tmp_path, monkeypatch):
+    repository, revision = _repository(tmp_path)
+    snapshot = WorkingTreeSnapshot(repository, revision, [])
+    copied, _, _ = snapshot.create()
+    target = copied / "value.py"
+    failure = PermissionError("Synthetic ACL rejection")
+
+    def refused(root, *, onexc):
+        onexc(os.unlink, str(target), failure)
+
+    with monkeypatch.context() as patch:
+        patch.setattr("ephy_worker.coding_executor.shutil.rmtree", refused)
+        with pytest.raises(PermissionError, match="ACL rejection"):
+            snapshot.cleanup()
+    assert target.exists()
+    snapshot.cleanup()
 
 
 def test_retired_server_type_is_rejected():
@@ -326,16 +381,15 @@ async def test_pi_model_error_has_specific_diagnostic(tmp_path):
         "'success': False, 'error': 'model not found'}), flush=True)\n",
         encoding="utf-8",
     )
-    fake_pi.chmod(0o755)
     profile = _profile(
         profile_id="real",
         provider="openai",
         model_id="missing-model",
         server_type="pi",
-        pi_executable=str(fake_pi),
+        pi_executable=sys.executable,
     )
 
-    result, _ = await CodingExecutor().execute(
+    result, _ = await CodingExecutor(runner=ScriptPiRpcRunner(fake_pi)).execute(
         _job(repository, revision, model_profile="real", mock_changes=[]),
         profile,
         tmp_path / "artifacts",
@@ -370,16 +424,15 @@ async def test_pi_retryable_model_error_is_cleared_by_terminal_success(tmp_path)
         "    print(json.dumps(event), flush=True)\n",
         encoding="utf-8",
     )
-    fake_pi.chmod(0o755)
     profile = _profile(
         profile_id="real",
         provider="llama_router",
         model_id="local-model",
         server_type="llama.cpp",
-        pi_executable=str(fake_pi),
+        pi_executable=sys.executable,
     )
 
-    result, _ = await CodingExecutor().execute(
+    result, _ = await CodingExecutor(runner=ScriptPiRpcRunner(fake_pi)).execute(
         _job(repository, revision, model_profile="real", mock_changes=[]),
         profile,
         tmp_path / "artifacts",
@@ -403,17 +456,16 @@ async def test_pi_process_is_terminated_on_timeout(tmp_path, monkeypatch):
         "time.sleep(30)\n",
         encoding="utf-8",
     )
-    fake_pi.chmod(0o755)
     monkeypatch.setenv("FAKE_PI_PID_FILE", str(pid_file))
     profile = _profile(
         profile_id="real",
         provider="openai",
         model_id="slow-model",
         server_type="pi",
-        pi_executable=str(fake_pi),
+        pi_executable=sys.executable,
     )
 
-    result, _ = await CodingExecutor().execute(
+    result, _ = await CodingExecutor(runner=ScriptPiRpcRunner(fake_pi)).execute(
         _job(
             repository,
             revision,
@@ -427,8 +479,7 @@ async def test_pi_process_is_terminated_on_timeout(tmp_path, monkeypatch):
 
     assert result.result.failure.code == "execution_timeout"
     pid = int(pid_file.read_text(encoding="utf-8"))
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
+    assert not psutil.pid_exists(pid)
 
 
 def test_dry_run_resolves_revision_without_allocating_worktree(tmp_path):
