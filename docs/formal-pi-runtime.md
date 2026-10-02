@@ -14,6 +14,10 @@ canonical auditの22 artifact，3 schema，完全性markerを再利用する．r
 
 audit contractのA／B／C各必須項目へ対応する25個の固定check IDをsystem envelopeへ配送し，省略・重複・架空IDを拒否する．governance gateの隣接runtimeから配送される監査契約とschemaも正本と同じhashへ固定する．モデルmanifestはrouter presetの実pathと全shardに結び付け，各stage前後に実bytesを再検証する．確認画面はagentの要約ではなく固定specの課題・scope・検査・モデル・上限を表示する．別途承認されたIntegration roleの手動applyでは`candidate.patch`を選び，監査binding，実session／trace，現在candidateをread-onlyで再検証し，確認後にも再確認する．
 
+routerの起動・unload・RAM解放待ちの後，load要求直前にモデルを再hashする．independent verifierのidentityは申告値からコピーせず，実行中Python，controller source，解決されたcommand executable，固定commandと実環境から導出し，期待値と照合する．commandの実path・hash・PID・argv・環境hashを外側で保存し，freezeはその観測済みidentityを必須とする．Integration時は監査結果JSONをraw出力，session最後のassistant message，stdout最後のmessage_endへ照合する．attestationだけのhash更新で判定を置換できるとは扱わない．
+
+Windows回帰fixtureはPythonで実際のRPC subprocessを起動し，POSIX shebangの実行可能性に依存しない．source snapshotのcleanupは割り当てた一時領域だけを対象にし，WindowsでGitが生成した独立ファイルのread-only属性のみを解除する．ACL拒否，hard link，領域外targetは再試行で迂回せず失敗を保存する．OSのACLやsecurity設定は変更しない．CIはLinuxとWindowsの両方で既存検査を実行する．
+
 ## 有限の再帰実行
 
 `python -m ephy_worker.formal_campaign --plan <controller-owned-plan.json> --state <new-state-directory> --execute-authorized`は，ユーザーの明示的な実行依頼を受けたtrusted controller用入口である．agentには公開しない．spec配列，最大連続失敗，campaign全体の期限を固定する．上限は20件／24時間で，controllerのkernel-held lockで重複運転を拒否する．各Jobは新しいIDとclean worktreeを持つ．model serverも所有processだけを起動・停止し，他のPi／llama／Strata processまたは占有portがあれば停止する．

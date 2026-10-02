@@ -1,9 +1,12 @@
 """Negative controls for the controller, independent of live inference."""
 
 import copy
+import json
 import subprocess
 import sys
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -28,10 +31,12 @@ from ephy_worker.formal_runtime import (
     FormalRunner,
     exclusive_lock,
     injected_context_pins,
+    observed_verifier_identity,
     snapshot,
     stage_evidence,
     submit,
     validate_contract,
+    validate_observed_audit_output,
 )
 
 REPOSITORY = Path(__file__).resolve().parents[1]
@@ -85,6 +90,7 @@ def bundle_fixture(tmp_path):
             "invocation_config_sha256": "f" * 64,
         },
     }
+    artifacts["verification_results"] = encode({"verifier_identity": job["verifier_identity"]})
     bundle = tmp_path / "bundle"
     audit_input = freeze_bundle(bundle, job, artifacts)
     return bundle, audit_input
@@ -386,3 +392,142 @@ def test_model_rehash_detects_change_after_preflight(tmp_path):
     ini.write_text(f"[test]\nmodel={other.as_posix()}\n", encoding="utf-8")
     with pytest.raises(GateFailure, match="exact router preset"):
         runner.verify_model_artifacts("test")
+
+
+@pytest.mark.parametrize("during", ["startup", "unload"])
+def test_model_replaced_while_waiting_is_rejected_before_load(tmp_path, monkeypatch, during):
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"original")
+    ini = tmp_path / "models.ini"
+    ini.write_text(f"[test]\nmodel={model.as_posix()}\n", encoding="utf-8")
+    runner = FormalRunner.__new__(FormalRunner)
+    runner.runtime = {
+        "models_ini": str(ini),
+        "model_manifests": {"test": [{"path": str(model), "size_bytes": 8, "sha256": file_hash(model)}]},
+    }
+    runner.server = None if during == "startup" else SimpleNamespace(pid=1)
+    runner.loaded_model = None if during == "startup" else "other"
+    runner.deadline = time.monotonic() + 60
+    runner.resources = lambda: None
+    runner.state = lambda *_: None
+    routes = []
+
+    def startup():
+        model.write_bytes(b"modified")
+        runner.server = SimpleNamespace(pid=1)
+
+    def router(route, body=None):
+        routes.append(route)
+        if route == "/models" and during == "unload":
+            model.write_bytes(b"modified")
+        assert route != "/models/load", "Wrong bytes reached the load request"
+        return {"data": [{"id": "test", "status": {"value": "unloaded"}}]}
+
+    runner.start_server = startup
+    runner.router_request = router
+    monkeypatch.setattr("ephy_worker.formal_runtime.time.sleep", lambda *_: None)
+    with pytest.raises(GateFailure, match="Model artifact changed"):
+        runner.load_model("test")
+    assert routes.count("/models") == 3
+    assert "/models/load" not in routes
+
+
+def verifier_runner(tmp_path):
+    directory = tmp_path / "job"
+    directory.mkdir()
+    candidate = tmp_path / "candidate"
+    subprocess.run(["git", "init", str(candidate)], check=True, capture_output=True)
+    (candidate / "doc.md").write_text("unchanged", encoding="utf-8")
+    runner = FormalRunner.__new__(FormalRunner)
+    runner.runtime = {"python": sys.executable}
+    runner.contract = contract()
+    from ephy_worker.formal_runtime import executable_identity
+
+    runtime = REPOSITORY / "src/ephy_worker/formal_runtime.py"
+    artifacts = REPOSITORY / "src/ephy_worker/formal_artifacts.py"
+    pins = {str(path.resolve()): file_hash(path) for path in (Path(sys.executable), runtime, artifacts)}
+    git_identity = executable_identity("git")
+    pins[git_identity["path"]] = git_identity["sha256"]
+    runner.contract["runtime_hashes"] = pins
+    runner.job = {
+        "verifier_identity": observed_verifier_identity(runner.runtime, runner.contract),
+        "environment_sha256": "e" * 64,
+    }
+    runner.directory, runner.candidate = directory, candidate
+    runner.baseline_snapshot = snapshot(candidate)
+    runner.transcripts = []
+    runner.deadline = time.monotonic() + 60
+    runner.resources = runner.intact = lambda: None
+    return runner
+
+
+def test_observed_verifier_matches_real_check_processes(tmp_path):
+    runner = verifier_runner(tmp_path)
+    result = runner.run_checks("verification")
+    assert result["passed"]
+    assert result["verifier_identity"] == runner.job["verifier_identity"]
+    assert all(check["pid"] > 0 and check["exit_code"] == 0 for check in result["checks"])
+    assert all(
+        check["executable"]["path"] == str(Path(sys.executable).resolve()) for check in result["checks"]
+    )
+    assert len({check["effective_environment_sha256"] for check in result["checks"]}) == 1
+
+
+@pytest.mark.parametrize("field", ["executor_id", "runtime_sha256", "invocation_config_sha256"])
+def test_fabricated_verifier_identity_stops_before_checks(tmp_path, field):
+    runner = verifier_runner(tmp_path)
+    runner.job["verifier_identity"][field] = "fabricated"
+    runner.command = lambda *_: pytest.fail("Fabricated identity reached verifier command")
+    with pytest.raises(GateFailure, match="Observed independent verifier"):
+        runner.run_checks("verification")
+
+
+def test_wrong_actual_verifier_python_is_rejected(tmp_path):
+    runner = verifier_runner(tmp_path)
+    fake = tmp_path / "other-python.exe"
+    fake.write_bytes(b"different executable")
+    runner.runtime["python"] = str(fake)
+    with pytest.raises(GateFailure, match="running interpreter"):
+        runner.verifier_identity()
+
+
+def test_freeze_requires_observed_verifier(tmp_path):
+    bundle, audit_input = bundle_fixture(tmp_path)
+    manifest = read_json(bundle / "evidence-manifest.json")
+    entries = {entry["artifact_id"]: entry for entry in manifest["artifacts"]}
+    artifacts = {name: (bundle / entries[name]["path"]).read_bytes() for name in ARTIFACTS}
+    job = {"verifier_identity": audit_input["stage_contract"]["verifier_identity"]}
+    artifacts["verification_results"] = encode({"verifier_identity": {"executor_id": "fabricated"}})
+    with pytest.raises(GateFailure, match="observed independent verification"):
+        freeze_bundle(tmp_path / "new-bundle", job, artifacts)
+    assert not (tmp_path / "new-bundle").exists()
+
+
+@pytest.mark.parametrize("mutation", ["none", "result", "raw", "session", "stdout", "failed_session"])
+def test_auditor_output_binding_rejects_forged_accept(tmp_path, mutation):
+    # Genuine rejection plus forged acceptance must never be rescued by rehashing an attestation.
+    rejection = {"decision": "REJECT_PROPOSAL"}
+    acceptance = {"decision": "ACCEPT_PROPOSAL"}
+    raw = json.dumps(rejection)
+    message = {"role": "assistant", "stopReason": "stop", "content": [{"type": "text", "text": raw}]}
+    session = {"type": "message", "message": copy.deepcopy(message)}
+    stdout = {"type": "message_end", "message": copy.deepcopy(message)}
+    result = rejection
+    if mutation == "result":
+        result = acceptance
+    elif mutation == "raw":
+        raw = json.dumps(acceptance)
+        result = acceptance
+    elif mutation in ("session", "stdout"):
+        record = session if mutation == "session" else stdout
+        record["message"]["content"][0]["text"] = json.dumps(acceptance)
+    elif mutation == "failed_session":
+        session["message"]["stopReason"] = "error"
+    (tmp_path / "audit-result.raw.txt").write_text(raw, encoding="utf-8")
+    (tmp_path / "auditor-session.jsonl").write_text(json.dumps(session) + "\n", encoding="utf-8")
+    (tmp_path / "auditor.stdout.log").write_text(json.dumps(stdout) + "\n", encoding="utf-8")
+    if mutation == "none":
+        validate_observed_audit_output(tmp_path, result)
+    else:
+        with pytest.raises(GateFailure):
+            validate_observed_audit_output(tmp_path, result)

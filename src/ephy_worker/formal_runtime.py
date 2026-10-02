@@ -220,6 +220,84 @@ def invocation_identity(runtime: dict, contract: dict, role: str) -> str:
     )
 
 
+def command_environment(cwd: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env.update(
+        PYTHONPATH=str(cwd / "src"),
+        PYTHONUTF8="1",
+        PYTHONIOENCODING="utf-8",
+        PYTHONDONTWRITEBYTECODE="1",
+        PIP_NO_INDEX="1",
+        UV_OFFLINE="1",
+    )
+    return env
+
+
+def executable_identity(argument: str) -> dict[str, str]:
+    path = Path(argument) if Path(argument).is_absolute() else Path(shutil.which(argument) or "")
+    if not path.is_file():
+        raise GateFailure("Verifier executable unavailable: " + argument)
+    path = path.resolve(strict=True)
+    return {"path": str(path), "sha256": file_hash(path)}
+
+
+def observed_verifier_identity(runtime: dict, contract: dict) -> dict[str, str]:
+    """Derive identity from the running controller and its actual command resolution."""
+    python = Path(sys.executable).resolve(strict=True)
+    if Path(runtime["python"]).resolve(strict=True) != python:
+        raise GateFailure("Configured verifier Python differs from the running interpreter")
+    modules = [Path(__file__), Path(__file__).with_name("formal_artifacts.py")]
+    executables = [executable_identity(str(python)), executable_identity("git")]
+    for check in contract["checks"]:
+        executable = check["argv"][0].format(python=str(python))
+        executables.append(executable_identity(executable))
+    pins = {item["path"]: item["sha256"] for item in executables}
+    pins.update({str(path.resolve()): file_hash(path) for path in modules})
+    for path, sha in pins.items():
+        if contract["runtime_hashes"].get(path) != sha:
+            raise GateFailure("Actual verifier runtime lacks a matching frozen pin: " + path)
+    return {
+        "executor_id": "ephy_worker.formal_runtime.independent-verifier.v1",
+        "runtime_sha256": digest(encode({"files": pins, "python_version": sys.version})),
+        "invocation_config_sha256": digest(
+            encode(
+                {
+                    "checks": contract["checks"],
+                    "executables": executables,
+                    "environment_sha256": digest(encode(command_environment(Path("<measured-worktree>")))),
+                    "command_timeout_seconds": 600,
+                }
+            )
+        ),
+    }
+
+
+def final_assistant_text(path: Path, *, session: bool = False) -> str:
+    messages = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line:
+            continue
+        event = json.loads(line)
+        if event.get("type") == ("message" if session else "message_end"):
+            message = event.get("message", {})
+            if message.get("role") == "assistant":
+                messages.append(message)
+    if not messages or messages[-1].get("stopReason") != "stop":
+        raise GateFailure("No successful final assistant message in " + path.name)
+    return "".join(c.get("text", "") for c in messages[-1]["content"] if c.get("type") == "text")
+
+
+def validate_observed_audit_output(directory: Path, result: dict) -> None:
+    raw_path = safe_path(directory, "audit-result.raw.txt")
+    raw = raw_path.read_text(encoding="utf-8")
+    if (
+        read_json(raw_path) != result
+        or final_assistant_text(safe_path(directory, "auditor-session.jsonl"), session=True) != raw
+        or final_assistant_text(safe_path(directory, "auditor.stdout.log")) != raw
+    ):
+        raise GateFailure("Audit result differs from the auditor's actual final output")
+
+
 def stage_evidence(events: list[dict], model: str, role: str) -> dict:
     if any(event.get("kind") == "violation" for event in events):
         raise GateFailure("Formal stage tool/model/budget violation")
@@ -336,10 +414,10 @@ class FormalRunner:
 
     def load_model(self, model: str) -> None:
         self.resources()
-        self.verify_model_artifacts(model)
         if not self.server:
             self.start_server()
         if self.loaded_model == model:
+            self.verify_model_artifacts(model)
             return
         if self.loaded_model:
             self.router_request("/models/unload", {"model": self.loaded_model})
@@ -361,6 +439,8 @@ class FormalRunner:
             raise GateFailure("Model unload/RAM release timeout")
         self.loaded_model = None
         self.state("running", "Loading frozen model: " + model)
+        # Startup/unload/RAM waits may be long; check at the actual load boundary.
+        self.verify_model_artifacts(model)
         self.router_request("/models/load", {"model": model})
         until = min(self.deadline, time.monotonic() + 600)
         while time.monotonic() < until:
@@ -466,15 +546,9 @@ class FormalRunner:
         self.resources()
         self.intact()
         out, err = self.directory / (label + ".stdout.log"), self.directory / (label + ".stderr.log")
-        env = os.environ.copy()
-        env.update(
-            PYTHONPATH=str(cwd / "src"),
-            PYTHONUTF8="1",
-            PYTHONIOENCODING="utf-8",
-            PYTHONDONTWRITEBYTECODE="1",
-            PIP_NO_INDEX="1",
-            UV_OFFLINE="1",
-        )
+        env = command_environment(cwd)
+        executable = executable_identity(argv[0])
+        argv = [executable["path"], *argv[1:]]
         started = now()
         with out.open("xb") as stdout, err.open("xb") as stderr:
             process = subprocess.Popen(
@@ -508,6 +582,8 @@ class FormalRunner:
             "stderr": err.name,
             "stderr_sha256": file_hash(err),
             "environment_sha256": self.job["environment_sha256"],
+            "effective_environment_sha256": digest(encode(env)),
+            "executable": executable,
         }
         self.transcripts.append(
             {
@@ -517,9 +593,18 @@ class FormalRunner:
             }
         )
         self.intact()
+        if executable_identity(argv[0]) != executable:
+            raise GateFailure("Command executable changed during verification")
         return record
 
+    def verifier_identity(self) -> dict:
+        observed = observed_verifier_identity(self.runtime, self.contract)
+        if observed != self.job["verifier_identity"]:
+            raise GateFailure("Observed independent verifier identity differs from frozen expectation")
+        return observed
+
     def run_checks(self, label: str, baseline: bool = False) -> dict:
+        verifier = self.verifier_identity()
         before = snapshot_hash(self.candidate)
         checks = []
         for check in self.contract["checks"]:
@@ -533,6 +618,13 @@ class FormalRunner:
             }
             argv = [arg.format(**substitutions) for arg in check["argv"]]
             result = self.command(argv, self.candidate, label + "-" + check["id"], 600)
+            if (
+                result["argv"] != [executable_identity(argv[0])["path"], *argv[1:]]
+                or result["cwd"] != str(self.candidate)
+                or result["effective_environment_sha256"]
+                != digest(encode(command_environment(self.candidate)))
+            ):
+                raise GateFailure("Observed verifier command differs from frozen invocation")
             checks.append(
                 {
                     "id": check["id"],
@@ -555,7 +647,10 @@ class FormalRunner:
         )
         if set(changed) - set(self.contract["allowed_files"]):
             raise GateFailure("Candidate scope violation")
+        if self.verifier_identity() != verifier:
+            raise GateFailure("Independent verifier identity changed during checks")
         result = {
+            "verifier_identity": verifier,
             "baseline": baseline,
             "snapshot_sha256": before,
             "checks": checks,
@@ -665,14 +760,7 @@ class FormalRunner:
             identity=self.job["model_identities"][role],
         )
         self.provenance.append(evidence)
-        messages = []
-        for line in (self.directory / result["stdout"]).read_text(encoding="utf-8").splitlines():
-            event = json.loads(line)
-            if event.get("type") == "message_end" and event.get("message", {}).get("role") == "assistant":
-                messages.append(event["message"])
-        if not messages:
-            raise GateFailure("No complete final assistant message")
-        text = "".join(c.get("text", "") for c in messages[-1]["content"] if c.get("type") == "text")
+        text = final_assistant_text(self.directory / result["stdout"])
         self.event(role + " end", label=label, pid=result["pid"], trace_sha256=evidence["trace_sha256"])
         return text
 
@@ -780,6 +868,7 @@ class FormalRunner:
         }
         self.job["environment_sha256"] = digest(encode(env))
         self.environment = encode(env)
+        self.verifier_identity()
         self.state("preparing", "Checking frozen baseline before any model invocation")
         self.baseline_result = self.run_checks("baseline", baseline=True)
         if not self.baseline_result["passed"]:
@@ -911,6 +1000,7 @@ class FormalRunner:
             text = self.stage("auditor", prompt, "auditor", bundle, envelope)
             (self.directory / "audit-result.raw.txt").write_text(text, encoding="utf-8")
             audit_result = read_json(self.directory / "audit-result.raw.txt")
+            validate_observed_audit_output(self.directory, audit_result)
             validate_audit_result(audit_result, bundle, audit_input)
             inspect_bundle(
                 bundle,
@@ -931,6 +1021,8 @@ class FormalRunner:
                     "bundle_unchanged": True,
                     "observed_auditor": self.provenance[-1],
                     "audit_result_sha256": file_hash(self.directory / "audit-result.json"),
+                    "audit_result_raw_sha256": file_hash(self.directory / "audit-result.raw.txt"),
+                    "audit_stdout_sha256": file_hash(self.directory / "auditor.stdout.log"),
                     "audit_input_sha256": file_hash(bundle / "audit-input.json"),
                     "passed": True,
                 },
@@ -1011,6 +1103,7 @@ def verify_proposal_for_integration(job_file: Path) -> Path:
     audit_input = read_json(bundle / "audit-input.json")
     result_file = runner.directory / "audit-result.json"
     audit_result = read_json(result_file)
+    validate_observed_audit_output(runner.directory, audit_result)
     validate_audit_result(audit_result, bundle, audit_input)
     if audit_result["decision"] != "ACCEPT_PROPOSAL":
         raise GateFailure("Auditor did not accept the proposal")
@@ -1046,12 +1139,20 @@ def verify_proposal_for_integration(job_file: Path) -> Path:
         raise GateFailure("Integration execution attestation failed")
     if (
         attestation["audit_result_sha256"] != file_hash(result_file)
+        or attestation["audit_result_raw_sha256"] != file_hash(runner.directory / "audit-result.raw.txt")
+        or attestation["audit_stdout_sha256"] != file_hash(runner.directory / "auditor.stdout.log")
         or attestation["audit_input_sha256"] != file_hash(bundle / "audit-input.json")
         or observed["identity"] != runner.job["model_identities"]["auditor"]
         or observed["trace_sha256"] != file_hash(runner.directory / "auditor-trace.jsonl")
         or observed["session_sha256"] != file_hash(safe_path(runner.directory, observed["session_path"]))
     ):
         raise GateFailure("Integration audit execution identity mismatch")
+    verification = read_json(bundle / "verification_results.txt")
+    if (
+        verification["verifier_identity"] != runner.verifier_identity()
+        or audit_input["stage_contract"]["verifier_identity"] != verification["verifier_identity"]
+    ):
+        raise GateFailure("Integration independent verifier identity mismatch")
     if snapshot(runner.candidate) != read_json(bundle / "candidate_snapshot_manifest.txt"):
         raise GateFailure("Candidate changed after audit")
     patch = runner.directory / "candidate.patch"

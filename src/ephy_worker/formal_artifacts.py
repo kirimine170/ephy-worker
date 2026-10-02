@@ -225,6 +225,10 @@ def inspect_bundle(bundle: Path, manifest: dict, schema: dict) -> dict:
 def freeze_bundle(bundle: Path, job: dict, artifacts: dict[str, bytes]) -> dict:
     if set(artifacts) != set(ARTIFACTS):
         raise GateFailure("Incomplete canonical audit artifact set")
+    verification = json.loads(artifacts["verification_results"])
+    observed_verifier = verification.get("verifier_identity")
+    if not observed_verifier or observed_verifier != job["verifier_identity"]:
+        raise GateFailure("Frozen verifier identity has no matching observed independent verification")
     bundle.mkdir()  # never reuse an old bundle
     entries = []
     for name in ARTIFACTS:
@@ -275,7 +279,7 @@ def freeze_bundle(bundle: Path, job: dict, artifacts: dict[str, bytes]) -> dict:
             "required_sequence": SEQUENCE,
             "max_repair_attempts": job["contract"]["max_repairs"],
             "expected_models": job["model_identities"],
-            "verifier_identity": job["verifier_identity"],
+            "verifier_identity": observed_verifier,
         },
     }
     validate_schema(audit_input, json.loads(artifacts["audit_input_schema"]))
