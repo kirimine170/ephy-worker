@@ -10,6 +10,7 @@ try {
   mkdirSync(join(root, "docs"), { recursive: true });
   writeFileSync(join(root, "docs", "existing.md"), "existing");
   linkSync(join(root, "docs", "existing.md"), join(root, "docs", "linked.md"));
+  writeFileSync(join(root, "docs", "readable.md"), "existing");
   let serial = 0;
   function fresh(role = "implementer") {
     const config = join(temporary, `config-${++serial}.json`);
@@ -46,6 +47,14 @@ try {
   for (let n = 0; n < 3; n++) capped.call("before_provider_request", { payload: { model: "test-model" } });
   assert.throws(() => capped.call("before_provider_request", { payload: { model: "test-model" } }), /BUDGET_EXHAUSTED/);
   assert.ok(readFileSync(capped.trace, "utf8").includes("violation"));
+  for (const [text, isError, expected] of [["existing", false, true], ["partial", false, false],
+    ["existing", true, false], ["existing\n[truncated]", false, false]]) {
+    const gate = fresh("auditor");
+    gate.call("tool_call", { ...tool("read", "docs/readable.md"), toolCallId: "read-1" });
+    gate.call("tool_result", { toolName: "read", toolCallId: "read-1", isError,
+      content: [{ type: "text", text }] });
+    assert.equal(readFileSync(gate.trace, "utf8").includes('"kind":"evidence_read"'), expected);
+  }
   console.log("PASS: formal stage path, hard-link, role, model, output-token, request and latch controls");
 } finally {
   rmSync(temporary, { recursive: true, force: true });

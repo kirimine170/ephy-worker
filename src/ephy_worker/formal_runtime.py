@@ -227,7 +227,7 @@ def invocation_identity(runtime: dict, contract: dict, role: str) -> str:
     )
 
 
-def command_environment(cwd: Path) -> dict[str, str]:
+def command_environment(cwd: Path, temp_root: Path | None = None) -> dict[str, str]:
     # Keep only platform/locale inputs needed by the fixed subprocess commands.
     # Pi role/session variables and Python/Git injection variables are not inputs
     # to the verifier, so planning and authorized integration use identical bytes.
@@ -237,8 +237,6 @@ def command_environment(cwd: Path) -> dict[str, str]:
         "WINDIR",
         "COMSPEC",
         "PATHEXT",
-        "TEMP",
-        "TMP",
         "HOME",
         "USERPROFILE",
         "HOMEDRIVE",
@@ -258,6 +256,9 @@ def command_environment(cwd: Path) -> dict[str, str]:
         PYTHONDONTWRITEBYTECODE="1",
         PIP_NO_INDEX="1",
         UV_OFFLINE="1",
+        TEMP=str(temp_root or cwd / ".runner-temp"),
+        TMP=str(temp_root or cwd / ".runner-temp"),
+        TMPDIR=str(temp_root or cwd / ".runner-temp"),
     )
     return env
 
@@ -293,7 +294,9 @@ def observed_verifier_identity(runtime: dict, contract: dict) -> dict[str, str]:
                 {
                     "checks": contract["checks"],
                     "executables": executables,
-                    "environment_sha256": digest(encode(command_environment(Path("<measured-worktree>")))),
+                    "environment_sha256": digest(
+                        encode(command_environment(Path("<measured-worktree>"), Path("<runner-temp>")))
+                    ),
                     "command_timeout_seconds": 600,
                 }
             )
@@ -325,6 +328,110 @@ def validate_observed_audit_output(directory: Path, result: dict) -> None:
         or final_assistant_text(safe_path(directory, "auditor.stdout.log")) != raw
     ):
         raise GateFailure("Audit result differs from the auditor's actual final output")
+
+
+def read_trace(directory: Path) -> list[dict]:
+    return [
+        json.loads(line)
+        for line in safe_path(directory, "auditor-trace.jsonl").read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+
+
+def observed_audit_artifacts(bundle: Path, events: list[dict]) -> set[str]:
+    """Credit actual complete tool results or byte-matching forced context only."""
+    ack = stage_evidence(events, LEAD, "auditor")["governance_ack"]
+    entries = {
+        entry["artifact_id"]: entry for entry in read_json(bundle / "evidence-manifest.json")["artifacts"]
+    }
+    observed = set()
+    ack_index = events.index(ack)
+    subsequent = events[ack_index + 1 :]
+    # A subsequent provider request establishes that the final context gate unlocked.
+    if any(event.get("kind") == "provider_request" for event in subsequent):
+        if ack.get("details", {}).get("policySha256") == entries["system_development_policy"]["sha256"]:
+            observed.add("system_development_policy")
+        injected = {
+            "audit_contract": "policies/independent-audit.md",
+            "audit_prompt": "prompts/audit-ephy-worker.md",
+            "audit_input_schema": "policies/audit-input.schema.json",
+            "evidence_manifest_schema": "policies/evidence-manifest.schema.json",
+            "audit_result_schema": "policies/audit-result.schema.json",
+        }
+        documents = ack.get("details", {}).get("requiredContext", [])
+        content = "".join(
+            item.get("text", "") for item in ack.get("content", []) if item.get("type") == "text"
+        )
+        for name, path in injected.items():
+            data = safe_path(bundle, entries[name]["path"]).read_bytes()
+            matching = [
+                d
+                for d in documents
+                if d.get("path") == path
+                and d.get("sha256") == entries[name]["sha256"]
+                and d.get("bytes") == len(data)
+            ]
+            if len(matching) == 1:
+                document = matching[0]
+                block = (
+                    f"BEGIN REQUIRED GOVERNANCE DOCUMENT path={path} sha256={document['sha256']} "
+                    f"bytes={len(data)} lines={document['lines']}\n"
+                    + data.decode("utf-8")
+                    + f"\nEND REQUIRED GOVERNANCE DOCUMENT path={path} sha256={document['sha256']}"
+                )
+                if block in content:
+                    observed.add(name)
+    calls = {}
+    for event in subsequent:
+        if event.get("kind") == "tool_call" and event.get("tool") == "read" and not event.get("blocked"):
+            calls[event.get("toolCallId")] = event.get("path")
+        elif event.get("kind") == "evidence_read" and event.get("full_content_delivered") is True:
+            identifier = event.get("toolCallId")
+            value = calls.pop(identifier, None)
+            if not isinstance(value, str) or not identifier:
+                raise GateFailure("Audit read result has no matching successful call")
+            path = Path(value)
+            if path.is_absolute():
+                try:
+                    value = path.relative_to(bundle).as_posix()
+                except ValueError as exc:
+                    raise GateFailure("Observed audit read escaped bundle") from exc
+            target = safe_path(bundle, value)
+            if target != safe_path(bundle, event["path"]):
+                raise GateFailure("Observed audit read path mismatch")
+            for name, entry in entries.items():
+                if event["path"] == entry["path"] and event.get("sha256") == entry["sha256"]:
+                    observed.add(name)
+    return observed
+
+
+def validate_proposal_stop(directory: Path, bundle: Path, result: dict, attestation: dict) -> None:
+    """The temporal postcondition is runner-observed after audit, never guessed by it."""
+    path = safe_path(directory, "post-audit-workflow.json")
+    post = read_json(path)
+    audit_input = read_json(bundle / "audit-input.json")
+    frozen = read_json(bundle / "workflow_events.txt")
+    events = post.get("events", [])
+    tail = events[len(frozen) :]
+    if (
+        attestation.get("proposal_stopped") is not True
+        or attestation.get("post_audit_workflow_sha256") != file_hash(path)
+        or post.get("job_id") != audit_input["job_id"]
+        or post.get("frozen_workflow_sha256") != file_hash(bundle / "workflow_events.txt")
+        or post.get("audit_result_sha256") != file_hash(directory / "audit-result.json")
+        or post.get("audit_trace_sha256") != file_hash(directory / "auditor-trace.jsonl")
+        or not frozen
+        or frozen[-1].get("stage") != "freeze"
+        or frozen[-1].get("proposal_stop_required") is not True
+        or frozen[-1].get("controller_sha256") != file_hash(Path(__file__))
+        or events[: len(frozen)] != frozen
+        or [event.get("stage") for event in tail] != ["auditor start", "auditor end", "proposal stop"]
+        or tail[0].get("expected_model") != LEAD
+        or tail[1].get("pid") != attestation["observed_auditor"]["pid"]
+        or tail[1].get("trace_sha256") != post.get("audit_trace_sha256")
+        or tail[-1].get("decision") != result["decision"]
+    ):
+        raise GateFailure("Missing or invalid post-audit proposal stop binding")
 
 
 def stage_evidence(events: list[dict], model: str, role: str) -> dict:
@@ -571,11 +678,22 @@ class FormalRunner:
             if file_hash(Path(self.contract[name])) != self.contract[name + "_sha256"]:
                 raise GateFailure(f"Fixed checker evidence changed: {name}")
 
-    def command(self, argv: list[str], cwd: Path, label: str, seconds: int) -> dict:
+    def command(
+        self,
+        argv: list[str],
+        cwd: Path,
+        label: str,
+        seconds: int,
+        stage_environment: dict[str, str] | None = None,
+    ) -> dict:
         self.resources()
         self.intact()
         out, err = self.directory / (label + ".stdout.log"), self.directory / (label + ".stderr.log")
-        env = command_environment(cwd)
+        temp = self.directory / "temp"
+        temp.mkdir(exist_ok=True)
+        env = command_environment(cwd, temp)
+        if stage_environment is not None:
+            env.update(stage_environment)
         executable = executable_identity(argv[0])
         argv = [executable["path"], *argv[1:]]
         started = now()
@@ -612,6 +730,8 @@ class FormalRunner:
             "stderr_sha256": file_hash(err),
             "environment_sha256": self.job["environment_sha256"],
             "effective_environment_sha256": digest(encode(env)),
+            "temp_root": str(temp),
+            "temp_variables": {key: env[key] for key in ("TEMP", "TMP", "TMPDIR")},
             "executable": executable,
         }
         self.transcripts.append(
@@ -651,7 +771,9 @@ class FormalRunner:
                 result["argv"] != [executable_identity(argv[0])["path"], *argv[1:]]
                 or result["cwd"] != str(self.candidate)
                 or result["effective_environment_sha256"]
-                != digest(encode(command_environment(self.candidate)))
+                != digest(encode(command_environment(self.candidate, self.directory / "temp")))
+                or result["temp_root"] != str(self.directory / "temp")
+                or set(result["temp_variables"].values()) != {str(self.directory / "temp")}
             ):
                 raise GateFailure("Observed verifier command differs from frozen invocation")
             checks.append(
@@ -717,21 +839,20 @@ class FormalRunner:
         system_path.write_text(system, encoding="utf-8")
         trace = self.directory / (label + "-trace.jsonl")
         # Managed configuration is dedicated to this run; no global/auth settings or discovery.
-        previous = os.environ.copy()
-        os.environ.update(
-            PI_CODING_AGENT_DIR=self.runtime["managed_dir"],
-            PI_OFFLINE="1",
-            DUAL_LLAMA_BASE_URL=self.runtime["base_url"],
-            DUAL_GOVERNANCE_ROLE=role,
-            DUAL_GOVERNANCE_POLICY=self.runtime["policy"],
-            DUAL_GOVERNANCE_CONTEXT_ROOT=self.runtime["governance_root"],
-            DUAL_JOB_RUNNER=self.runtime["runner"],
-            DUAL_RUNNER_SMOKE_TEST=self.runtime["runner_test"],
-            EPHY_FORMAL_STAGE_CONFIG=str(config_path),
-            EPHY_FORMAL_TRACE=str(trace),
-        )
+        stage_environment = {
+            "PI_CODING_AGENT_DIR": self.runtime["managed_dir"],
+            "PI_OFFLINE": "1",
+            "DUAL_LLAMA_BASE_URL": self.runtime["base_url"],
+            "DUAL_GOVERNANCE_ROLE": role,
+            "DUAL_GOVERNANCE_POLICY": self.runtime["policy"],
+            "DUAL_GOVERNANCE_CONTEXT_ROOT": self.runtime["governance_root"],
+            "DUAL_JOB_RUNNER": self.runtime["runner"],
+            "DUAL_RUNNER_SMOKE_TEST": self.runtime["runner_test"],
+            "EPHY_FORMAL_STAGE_CONFIG": str(config_path),
+            "EPHY_FORMAL_TRACE": str(trace),
+        }
         if role == "auditor":
-            os.environ["DUAL_AUDIT_BUNDLE_ROOT"] = str(root)
+            stage_environment["DUAL_AUDIT_BUNDLE_ROOT"] = str(root)
         session = self.directory / (label + "-session.jsonl")
         if role == "implementer":
             system_path.write_text(
@@ -770,11 +891,9 @@ class FormalRunner:
             "@" + str(task_path),
         ]
         self.event(role + " start", label=label, expected_model=model)
-        try:
-            result = self.command(argv, root, label, self.contract["stage_seconds"])
-        finally:
-            os.environ.clear()
-            os.environ.update(previous)
+        result = self.command(
+            argv, root, label, self.contract["stage_seconds"], stage_environment=stage_environment
+        )
         if result["exit_code"] != 0:
             raise GateFailure("Managed Pi stage failed: " + label)
         self.verify_model_artifacts(model)
@@ -895,7 +1014,7 @@ class FormalRunner:
             "offline": True,
             "locale": "UTF-8",
             "pythonpath": "<measured-worktree>/src",
-            "temp_root": str(self.directory),
+            "temp_root": str(self.directory / "temp"),
             "contract_sha256": self.contract_sha,
         }
         self.job["environment_sha256"] = digest(encode(env))
@@ -990,7 +1109,13 @@ class FormalRunner:
                         raise GateFailure("Cannot capture new-file patch")
                     patch += addition.stdout
             (self.directory / "candidate.patch").write_bytes(patch)
-            self.event("freeze", patch_sha256=digest(patch), snapshot_sha256=digest(encode(final)))
+            self.event(
+                "freeze",
+                patch_sha256=digest(patch),
+                snapshot_sha256=digest(encode(final)),
+                proposal_stop_required=True,
+                controller_sha256=file_hash(Path(__file__)),
+            )
             artifacts = {
                 name: safe_path(Path(self.runtime["governance_root"]), path).read_bytes()
                 for name, path in CONTROL_PATHS.items()
@@ -1034,11 +1159,18 @@ class FormalRunner:
             prompt += " Every PASS must cite all artifact IDs in required_audit_evidence for that check, "
             prompt += "with their manifest hashes and relevant locations. Coverage does not replace reading "
             prompt += "and assessing the evidence; never invent a citation to satisfy coverage."
+            prompt += (
+                " Cited artifacts must have a successful full read or matching forced context delivery. "
+            )
+            prompt += "For W11 assess the frozen proposal-only boundary and absence of adoption so far; "
+            prompt += "the controller must separately bind the actual post-audit stop before review_ready."
             text = self.stage("auditor", prompt, "auditor", bundle, envelope)
             (self.directory / "audit-result.raw.txt").write_text(text, encoding="utf-8")
             audit_result = read_json(self.directory / "audit-result.raw.txt")
             validate_observed_audit_output(self.directory, audit_result)
-            validate_audit_result(audit_result, bundle, audit_input)
+            events = read_trace(self.directory)
+            observed_artifacts = observed_audit_artifacts(bundle, events)
+            validate_audit_result(audit_result, bundle, audit_input, observed_artifacts)
             inspect_bundle(
                 bundle,
                 read_json(bundle / "evidence-manifest.json"),
@@ -1050,6 +1182,17 @@ class FormalRunner:
             if not unchanged:
                 raise GateFailure("Candidate/bundle changed during audit")
             write_json(self.directory / "audit-result.json", audit_result)
+            self.event("proposal stop", decision=audit_result["decision"])
+            write_json(
+                self.directory / "post-audit-workflow.json",
+                {
+                    "job_id": self.job["id"],
+                    "events": self.events,
+                    "frozen_workflow_sha256": audit_input["final_bindings"]["workflow_events_sha256"],
+                    "audit_result_sha256": file_hash(self.directory / "audit-result.json"),
+                    "audit_trace_sha256": file_hash(self.directory / "auditor-trace.jsonl"),
+                },
+            )
             write_json(
                 self.directory / "audit-execution-attestation.json",
                 {
@@ -1062,9 +1205,17 @@ class FormalRunner:
                     "audit_stdout_sha256": file_hash(self.directory / "auditor.stdout.log"),
                     "audit_input_sha256": file_hash(bundle / "audit-input.json"),
                     "passed": True,
+                    "proposal_stopped": True,
+                    "post_audit_workflow_sha256": file_hash(self.directory / "post-audit-workflow.json"),
+                    "observed_audit_artifacts": sorted(observed_artifacts),
                 },
             )
-            self.event("proposal stop", decision=audit_result["decision"])
+            validate_proposal_stop(
+                self.directory,
+                bundle,
+                audit_result,
+                read_json(self.directory / "audit-execution-attestation.json"),
+            )
             self.job["outcome"] = (
                 "accepted_proposal" if audit_result["decision"] == "ACCEPT_PROPOSAL" else "audit_rejected"
             )
@@ -1141,7 +1292,9 @@ def verify_proposal_for_integration(job_file: Path) -> Path:
     result_file = runner.directory / "audit-result.json"
     audit_result = read_json(result_file)
     validate_observed_audit_output(runner.directory, audit_result)
-    validate_audit_result(audit_result, bundle, audit_input)
+    events = read_trace(runner.directory)
+    observed_artifacts = observed_audit_artifacts(bundle, events)
+    validate_audit_result(audit_result, bundle, audit_input, observed_artifacts)
     if audit_result["decision"] != "ACCEPT_PROPOSAL":
         raise GateFailure("Auditor did not accept the proposal")
     inspect_bundle(
@@ -1155,6 +1308,9 @@ def verify_proposal_for_integration(job_file: Path) -> Path:
     ):
         raise GateFailure("Integration Job/base identity mismatch")
     attestation = read_json(runner.directory / "audit-execution-attestation.json")
+    if sorted(observed_artifacts) != attestation.get("observed_audit_artifacts"):
+        raise GateFailure("Integration observed audit delivery mismatch")
+    validate_proposal_stop(runner.directory, bundle, audit_result, attestation)
     observed = attestation["observed_auditor"]
     if observed.get("model_id") != LEAD or runner.job["model_identities"]["auditor"]["model_id"] != LEAD:
         raise GateFailure("Integration auditor model mismatch")

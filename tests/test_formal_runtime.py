@@ -33,12 +33,14 @@ from ephy_worker.formal_runtime import (
     command_environment,
     exclusive_lock,
     injected_context_pins,
+    observed_audit_artifacts,
     observed_verifier_identity,
     snapshot,
     stage_evidence,
     submit,
     validate_contract,
     validate_observed_audit_output,
+    validate_proposal_stop,
 )
 
 REPOSITORY = Path(__file__).resolve().parents[1]
@@ -183,7 +185,7 @@ def test_bundle_schema_and_actual_bytes(tmp_path):
     schema = read_json(bundle / "evidence_manifest_schema.json")
     assert inspect_bundle(bundle, manifest, schema)["all_artifacts_match"]
     result = accepted_result(bundle, audit_input)
-    validate_audit_result(result, bundle, audit_input)
+    validate_audit_result(result, bundle, audit_input, set(ARTIFACTS))
     (bundle / "candidate_patch.txt").write_text("modified after freeze")
     with pytest.raises(GateFailure, match="changed"):
         inspect_bundle(bundle, manifest, schema)
@@ -206,7 +208,7 @@ def test_false_acceptance_rejected(tmp_path, mutation):
     else:
         result["workflow"]["checks"][0]["status"] = "FAIL"
     with pytest.raises(GateFailure):
-        validate_audit_result(result, bundle, audit_input)
+        validate_audit_result(result, bundle, audit_input, set(ARTIFACTS))
 
 
 @pytest.mark.parametrize("check_id", [item for ids in AUDIT_CHECKS.values() for item in ids])
@@ -221,7 +223,7 @@ def test_pass_without_required_relevant_evidence_is_rejected(tmp_path, check_id)
     )
     check["evidence"].pop()
     with pytest.raises(GateFailure, match="relevant audit evidence coverage"):
-        validate_audit_result(result, bundle, audit_input)
+        validate_audit_result(result, bundle, audit_input, set(ARTIFACTS))
 
 
 def test_all_task_spec_citations_cannot_authorize_acceptance(tmp_path):
@@ -232,7 +234,7 @@ def test_all_task_spec_citations_cannot_authorize_acceptance(tmp_path):
         for check in result[domain]["checks"]:
             check["evidence"] = [{**task, "location": "whole artifact"}]
     with pytest.raises(GateFailure, match="relevant audit evidence coverage"):
-        validate_audit_result(result, bundle, audit_input)
+        validate_audit_result(result, bundle, audit_input, set(ARTIFACTS))
 
 
 def test_audit_evidence_mapping_covers_exact_contract_checks():
@@ -373,7 +375,7 @@ def test_complete_mandatory_audit_checks_required(tmp_path, mutation):
     else:
         result["candidate"]["checks"].append(copy.deepcopy(result["candidate"]["checks"][0]))
     with pytest.raises(GateFailure):
-        validate_audit_result(result, bundle, audit_input)
+        validate_audit_result(result, bundle, audit_input, set(ARTIFACTS))
 
 
 def test_actual_gate_adjacent_context_paths_are_pinned(tmp_path):
@@ -510,12 +512,12 @@ def test_observed_verifier_matches_real_check_processes(tmp_path):
 def test_role_change_uses_same_verifier_environment_and_real_commands(tmp_path, monkeypatch):
     monkeypatch.setenv("DUAL_GOVERNANCE_ROLE", "planner")
     runner = verifier_runner(tmp_path)
-    before = command_environment(runner.candidate)
+    before = command_environment(runner.candidate, runner.directory / "temp")
     monkeypatch.setenv("DUAL_GOVERNANCE_ROLE", "integration")
     monkeypatch.setenv("DUAL_STAGE_TRACE", "integration-trace")
     monkeypatch.setenv("PYTHONSTARTUP", "untrusted.py")
     monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
-    assert command_environment(runner.candidate) == before
+    assert command_environment(runner.candidate, runner.directory / "temp") == before
     result = runner.run_checks("integration")
     assert result["passed"] and result["verifier_identity"] == runner.job["verifier_identity"]
     assert all(check["pid"] > 0 for check in result["checks"])
@@ -529,6 +531,173 @@ def test_changed_verifier_platform_environment_still_fails_closed(tmp_path, monk
     runner.command = lambda *_: pytest.fail("Changed environment reached check process")
     with pytest.raises(GateFailure, match="Observed independent verifier"):
         runner.run_checks("verification")
+
+
+def test_verifier_tempfile_uses_declared_private_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEMP", str(tmp_path / "shared"))
+    monkeypatch.setenv("TMP", str(tmp_path / "other-shared"))
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "posix-shared"))
+    runner = verifier_runner(tmp_path)
+    command = [
+        sys.executable,
+        "-c",
+        "import tempfile; print(tempfile.gettempdir()); f=tempfile.NamedTemporaryFile(); print(f.name)",
+    ]
+    result = runner.command(command, runner.candidate, "temp-probe", 30)
+    output = (runner.directory / result["stdout"]).read_text(encoding="utf-8").splitlines()
+    assert Path(output[0]) == runner.directory / "temp"
+    assert Path(output[1]).parent == runner.directory / "temp"
+    assert set(result["temp_variables"].values()) == {str(runner.directory / "temp")}
+
+
+def test_managed_stage_environment_reaches_real_process_without_verifier_inheritance(tmp_path):
+    runner = verifier_runner(tmp_path)
+    # The controller supplies stage-only configuration explicitly, never through os.environ.
+    stage = {
+        "DUAL_GOVERNANCE_ROLE": "auditor",
+        "PI_CODING_AGENT_DIR": "managed",
+        "EPHY_FORMAL_STAGE_CONFIG": "config",
+        "EPHY_FORMAL_TRACE": "trace",
+    }
+    result = runner.command(
+        [
+            sys.executable,
+            "-c",
+            "import json,os; print(json.dumps({k:os.environ[k] for k in " + repr(list(stage)) + "}))",
+        ],
+        runner.candidate,
+        "stage-env-probe",
+        30,
+        stage_environment=stage,
+    )
+    assert read_json(runner.directory / result["stdout"]) == stage
+    assert not set(stage) & set(command_environment(runner.candidate, runner.directory / "temp"))
+
+
+@pytest.mark.parametrize("mutation", ["none", "no_reads", "wrong_hash", "missing_call", "partial"])
+def test_audit_citations_require_observed_successful_delivery(tmp_path, mutation):
+    bundle, audit_input = bundle_fixture(tmp_path)
+    entries = read_json(bundle / "evidence-manifest.json")["artifacts"]
+    events = trace()
+    events[0]["model"] = events[3]["model"] = "gpt-oss-20b-MXFP4"
+    events[1]["details"]["role"] = "auditor"
+    events.insert(2, {"kind": "provider_request", "model": "gpt-oss-20b-MXFP4"})
+    for entry in entries:
+        name = entry["artifact_id"]
+        if mutation == "no_reads":
+            continue
+        if mutation != "missing_call" or name != "task_spec":
+            events.insert(
+                -2,
+                {
+                    "kind": "tool_call",
+                    "tool": "read",
+                    "path": entry["path"],
+                    "toolCallId": name,
+                    "blocked": False,
+                },
+            )
+        events.insert(
+            -2,
+            {
+                "kind": "evidence_read",
+                "path": entry["path"],
+                "toolCallId": name,
+                "sha256": "0" * 64 if mutation == "wrong_hash" and name == "task_spec" else entry["sha256"],
+                "full_content_delivered": not (mutation == "partial" and name == "task_spec"),
+            },
+        )
+    result = accepted_result(bundle, audit_input)
+    if mutation == "none":
+        observed = observed_audit_artifacts(bundle, events)
+        assert observed == set(ARTIFACTS)
+        validate_audit_result(result, bundle, audit_input, observed)
+    else:
+        with pytest.raises(GateFailure, match="observed|matching"):
+            validate_audit_result(result, bundle, audit_input, observed_audit_artifacts(bundle, events))
+
+
+def test_injected_document_requires_actual_matching_context_bytes(tmp_path):
+    bundle, _ = bundle_fixture(tmp_path)
+    entries = {e["artifact_id"]: e for e in read_json(bundle / "evidence-manifest.json")["artifacts"]}
+    data = (bundle / "audit_contract.txt").read_bytes()
+    path = "policies/independent-audit.md"
+    sha = entries["audit_contract"]["sha256"]
+    events = trace()
+    events[0]["model"] = events[3]["model"] = "gpt-oss-20b-MXFP4"
+    ack = events[1]
+    ack["details"].update(
+        role="auditor",
+        policySha256=entries["system_development_policy"]["sha256"],
+        requiredContext=[{"path": path, "sha256": sha, "bytes": len(data), "lines": 1}],
+    )
+    ack["content"] = [
+        {
+            "type": "text",
+            "text": f"BEGIN REQUIRED GOVERNANCE DOCUMENT path={path} "
+            f"sha256={sha} bytes={len(data)} lines=1\n"
+            + data.decode()
+            + f"\nEND REQUIRED GOVERNANCE DOCUMENT path={path} sha256={sha}",
+        }
+    ]
+    events.insert(2, {"kind": "provider_request", "model": "gpt-oss-20b-MXFP4"})
+    assert observed_audit_artifacts(bundle, events) == {"system_development_policy", "audit_contract"}
+    ack["content"][0]["text"] = "claimed but not delivered"
+    assert observed_audit_artifacts(bundle, events) == {"system_development_policy"}
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["none", "missing_stop", "wrong_decision", "extra_event", "wrong_prefix", "wrong_trace", "wrong_hash"],
+)
+def test_post_audit_stop_is_bound_and_rechecked(tmp_path, mutation):
+    bundle, audit_input = bundle_fixture(tmp_path)
+    frozen = [
+        {
+            "stage": "freeze",
+            "proposal_stop_required": True,
+            "controller_sha256": file_hash(REPOSITORY / "src/ephy_worker/formal_runtime.py"),
+        }
+    ]
+    (bundle / "workflow_events.txt").write_bytes(encode(frozen))
+    (tmp_path / "audit-result.json").write_bytes(encode({"decision": "ACCEPT_PROPOSAL"}))
+    (tmp_path / "auditor-trace.jsonl").write_text("trace", encoding="utf-8")
+    trace_sha = file_hash(tmp_path / "auditor-trace.jsonl")
+    post = {
+        "job_id": audit_input["job_id"],
+        "frozen_workflow_sha256": file_hash(bundle / "workflow_events.txt"),
+        "audit_result_sha256": file_hash(tmp_path / "audit-result.json"),
+        "audit_trace_sha256": trace_sha,
+        "events": frozen
+        + [
+            {"stage": "auditor start", "expected_model": "gpt-oss-20b-MXFP4"},
+            {"stage": "auditor end", "pid": 123, "trace_sha256": trace_sha},
+            {"stage": "proposal stop", "decision": "ACCEPT_PROPOSAL"},
+        ],
+    }
+    if mutation == "missing_stop":
+        post["events"].pop()
+    elif mutation == "wrong_decision":
+        post["events"][-1]["decision"] = "REJECT_PROPOSAL"
+    elif mutation == "extra_event":
+        post["events"].append({"stage": "apply"})
+    elif mutation == "wrong_prefix":
+        post["events"][0] = {"stage": "different freeze"}
+    elif mutation == "wrong_trace":
+        post["audit_trace_sha256"] = "0" * 64
+    (tmp_path / "post-audit-workflow.json").write_bytes(encode(post))
+    attestation = {
+        "proposal_stopped": True,
+        "observed_auditor": {"pid": 123},
+        "post_audit_workflow_sha256": file_hash(tmp_path / "post-audit-workflow.json"),
+    }
+    if mutation == "wrong_hash":
+        attestation["post_audit_workflow_sha256"] = "0" * 64
+    if mutation == "none":
+        validate_proposal_stop(tmp_path, bundle, {"decision": "ACCEPT_PROPOSAL"}, attestation)
+    else:
+        with pytest.raises(GateFailure, match="proposal stop binding"):
+            validate_proposal_stop(tmp_path, bundle, {"decision": "ACCEPT_PROPOSAL"}, attestation)
 
 
 @pytest.mark.parametrize("field", ["executor_id", "runtime_sha256", "invocation_config_sha256"])

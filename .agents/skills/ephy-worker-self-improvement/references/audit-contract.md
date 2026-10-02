@@ -136,6 +136,10 @@ Check that：
 - the audited patch and evidence hashes match the independently verified final state．
 - the Job stopped as an unapplied proposal without commit，push，PR，merge，apply，or deploy．
 
+The frozen bundle precedes audit，so it cannot contain a future stop event．For the proposal-stop check，the auditor assesses the frozen runner stop obligation and absence of adoption actions up to audit．After audit exits，the runner MUST record the actual stop in a separate post-audit workflow artifact，bind the frozen workflow prefix，audit result，trace，and completed auditor process，and bind that artifact in its execution attestation before exposing `review_ready`．Integration MUST revalidate this postcondition．An auditor PASS alone never proves that future event．
+
+Every cited artifact and claimed document read MUST have runner-observed successful full tool-result delivery or byte-matching forced context delivery．A call without a successful complete result，partial／truncated output，grep／directory listing，or model assertion does not establish a full read．If required content cannot be delivered completely，do not invent reads or citations; stop without approval．
+
 ## Decision rules
 
 - `ACCEPT_PROPOSAL`：evidence integrity，candidate correctness，and workflow validity are all `PASS`，with no missing required evidence or blocker finding．

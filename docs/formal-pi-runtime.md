@@ -24,6 +24,10 @@ CIのPython UTF-8 modeと標準入出力encodingを明示し，Windowsの既定c
 
 ## 有限の再帰実行
 
+監査引用とdocuments_readは，guardが成功した全文read結果のraw hashを記録したartifact，またはackと次provider callの間に全文・hash一致の強制context配送を観測した文書へ限定する．失敗・部分・truncation・grepだけの結果は全文readと扱わない．監査前bundleに将来のstopを記載したとは主張しない．W11は凍結された未採用境界とrunnerのstop義務を監査し，監査後にrunnerが実際のproposal stopを別workflowへ保存する．frozen prefix，audit結果，実trace，auditor processと結び付けてからreview_readyへ進み，Integrationも再検査する．
+
+検証processのTEMP／TMP／TMPDIRはjob配下のtempへ固定し，環境契約と実transcriptに同じrootを記録する．Pi stage固有のmanaged directory・role・policy・provider・trace設定はrunnerが明示的なstage環境として構築して渡す．親環境のrole変数を独立verifierへ継承せず，必要なPi設定を消してgate未接続で実行することも許さない．
+
 `python -m ephy_worker.formal_campaign --plan <controller-owned-plan.json> --state <new-state-directory> --execute-authorized`は，ユーザーの明示的な実行依頼を受けたtrusted controller用入口である．agentには公開しない．spec配列，最大連続失敗，campaign全体の期限を固定する．上限は20件／24時間で，controllerのkernel-held lockで重複運転を拒否する．各Jobは新しいIDとclean worktreeを持つ．model serverも所有processだけを起動・停止し，他のPi／llama／Strata processまたは占有portがあれば停止する．
 
 `--resume`は同じplan identityの記録だけを再開する．中断したJobは証拠を残して失敗と記録し，同じcandidateの実装・検証・監査を再実行しない．完了済みcampaignは追加実行しない．`STOP`またはJobの`cancel.request`で停止できる．結果を自動apply／commit／push／mergeせず，成功proposal，失敗，仮説なし，未実装を別の`outcome`へ記録する．
