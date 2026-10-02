@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -199,6 +200,72 @@ class TransferEvaluationTests(unittest.TestCase):
             verdict = validate_candidate(self.frozen, task_id, repository)
         self.assertFalse(verdict["checker_unchanged"])
         self.assertFalse(verdict["passed"])
+
+    @unittest.skipUnless(os.name == "posix", "requires Unix executable mode bits")
+    def test_mode_only_out_of_scope_change_is_rejected_before_execution(self):
+        task_id, repository = self.candidate()
+        path = repository / "tests/test_behavior.py"
+        original = path.read_bytes()
+        path.chmod(path.stat().st_mode | 0o111)
+        self.assertEqual(path.read_bytes(), original)
+        git_changes = subprocess.check_output(["git", "diff", "--summary"], cwd=repository, text=True)
+        self.assertIn("mode change", git_changes)
+        with patch("ephy_worker.transfer_evaluation.subprocess.run") as run:
+            verdict = validate_candidate(self.frozen, task_id, repository)
+        run.assert_not_called()
+        self.assertFalse(verdict["passed"])
+        self.assertIn("tests/test_behavior.py", verdict["outside_scope"])
+
+    @unittest.skipUnless(os.name == "posix", "requires Unix executable mode bits")
+    def test_mode_change_during_validation_breaks_candidate_integrity(self):
+        task_id, repository = self.candidate()
+        real_run = subprocess.run
+
+        def mutate(command, **kwargs):
+            result = real_run(command, **kwargs)
+            path = repository / "batches.py"
+            path.chmod(path.stat().st_mode | 0o111)
+            return result
+
+        with patch("ephy_worker.transfer_evaluation.subprocess.run", side_effect=mutate):
+            verdict = validate_candidate(self.frozen, task_id, repository)
+        self.assertTrue(verdict["correctness_passed"])
+        self.assertFalse(verdict["candidate_unchanged"])
+        self.assertFalse(verdict["passed"])
+        self.assertEqual(verdict["status"], "integrity_failure")
+
+    @unittest.skipUnless(os.name == "posix", "requires Unix executable mode bits")
+    def test_executable_bit_migration_during_validation_is_detected(self):
+        task_id, repository = self.candidate()
+        path = repository / "batches.py"
+        path.chmod(0o744)
+        baseline = validate_candidate(self.frozen, task_id, repository)
+        real_run = subprocess.run
+
+        def mutate(command, **kwargs):
+            result = real_run(command, **kwargs)
+            path.chmod(0o645)
+            return result
+
+        with patch("ephy_worker.transfer_evaluation.subprocess.run", side_effect=mutate):
+            verdict = validate_candidate(self.frozen, task_id, repository)
+        self.assertTrue(baseline["passed"])
+        self.assertTrue(verdict["correctness_passed"])
+        self.assertFalse(verdict["candidate_unchanged"])
+        self.assertFalse(verdict["passed"])
+        after = validate_candidate(self.frozen, task_id, repository)
+        self.assertNotEqual(baseline["candidate_sha256"], after["candidate_sha256"])
+
+    @unittest.skipUnless(os.name == "posix", "requires Unix executable mode bits")
+    def test_candidate_digest_binds_executable_state(self):
+        task_id, repository = self.candidate()
+        before = validate_candidate(self.frozen, task_id, repository)
+        path = repository / "batches.py"
+        path.chmod(path.stat().st_mode | 0o111)
+        after = validate_candidate(self.frozen, task_id, repository)
+        self.assertTrue(before["passed"])
+        self.assertTrue(after["passed"])
+        self.assertNotEqual(before["candidate_sha256"], after["candidate_sha256"])
 
     def test_scope_checked_before_fixed_test_exec(self):
         task_id, repository = self.candidate()

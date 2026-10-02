@@ -248,7 +248,7 @@ def comparison_plan(
     }
 
 
-def _candidate_files(root: Path) -> dict[str, bytes]:
+def _candidate_files(root: Path) -> dict[str, tuple[bytes, int]]:
     if any(path.is_symlink() for path in (root, *root.parents)) or not root.is_dir():
         raise ValueError("candidate must be a real directory")
     files = {}
@@ -263,7 +263,9 @@ def _candidate_files(root: Path) -> dict[str, bytes]:
             continue
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             raise ValueError(f"candidate contains non-regular or hardlinked file: {relative}")
-        files[relative.as_posix()] = path.read_bytes()
+        # Preserve executable state as well as bytes: chmod-only edits are
+        # candidate changes even when an implementation still passes tests.
+        files[relative.as_posix()] = (path.read_bytes(), info.st_mode & 0o111)
     return files
 
 
@@ -279,13 +281,25 @@ def validate_candidate(frozen: FrozenTransferSuite, task_id: str, candidate: Pat
         raise ValueError("fixed suite must be outside the candidate")
     expected = {path: content.encode() for path, content in task.fixture.files.items()}
     before = _candidate_files(candidate)
-    changed = sorted(path for path in set(before) | set(expected) if before.get(path) != expected.get(path))
+    # Generated fixtures contain ordinary non-executable files. Keep this
+    # baseline independent of candidate-controlled Git index/configuration.
+    expected_snapshot = {path: (data, 0) for path, data in expected.items()}
+    changed = sorted(
+        path
+        for path in set(before) | set(expected_snapshot)
+        if before.get(path) != expected_snapshot.get(path)
+    )
     outside = sorted(set(changed) - set(task.allowed_files))
     payload = {
         "task_id": task_id,
         "suite_sha256": frozen.suite_sha256,
         "checker_sha256": frozen.checker_sha256,
-        "candidate_sha256": _json_digest({path: _digest(data) for path, data in before.items()}),
+        "candidate_sha256": _json_digest(
+            {
+                path: {"sha256": _digest(data), "executable_bits": executable}
+                for path, (data, executable) in before.items()
+            }
+        ),
         "changed_files": changed,
         "scope_passed": not outside,
         "outside_scope": outside,
