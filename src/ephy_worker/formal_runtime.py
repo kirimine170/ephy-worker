@@ -7,9 +7,11 @@ It deliberately refuses executable candidates without a verifier sandbox.
 from __future__ import annotations
 
 import argparse
+import configparser
 import importlib.metadata
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -24,6 +26,7 @@ import psutil
 
 from .formal_artifacts import (
     ARTIFACTS,
+    AUDIT_CHECKS,
     CONTROL_PATHS,
     GateFailure,
     digest,
@@ -41,6 +44,19 @@ from .formal_artifacts import (
 
 LEAD = "gpt-oss-20b-MXFP4"
 WORKER = "Qwen3-Coder-Next-Q4_K_M"
+
+
+def injected_context_pins(runtime: dict, controls: dict) -> dict[str, str]:
+    """Bind the exact files the gate resolves relative to its own module."""
+    managed = Path(runtime["governance_gate"]).resolve().parent.parent
+    mapping = {
+        "policies/independent-audit.md": "audit_contract",
+        "prompts/audit-ephy-worker.md": "audit_prompt",
+        "policies/audit-input.schema.json": "audit_input_schema",
+        "policies/evidence-manifest.schema.json": "evidence_manifest_schema",
+        "policies/audit-result.schema.json": "audit_result_schema",
+    }
+    return {str(safe_path(managed, path)): controls[name] for path, name in mapping.items()}
 
 
 def git(root: Path, *args: str) -> bytes:
@@ -320,6 +336,7 @@ class FormalRunner:
 
     def load_model(self, model: str) -> None:
         self.resources()
+        self.verify_model_artifacts(model)
         if not self.server:
             self.start_server()
         if self.loaded_model == model:
@@ -360,6 +377,29 @@ class FormalRunner:
                 return
             time.sleep(2)
         raise GateFailure("Frozen model load timeout")
+
+    def verify_model_artifacts(self, model: str) -> None:
+        manifest = self.runtime["model_manifests"][model]
+        config = configparser.ConfigParser(interpolation=None)
+        config.read_string("[__router__]\n" + Path(self.runtime["models_ini"]).read_text(encoding="utf-8"))
+        first = Path(config[model]["model"]).resolve(strict=True)
+        shard = re.fullmatch(r"(.+)-00001-of-(\d{5})\.gguf", first.name)
+        expected = (
+            [
+                first.with_name(f"{shard[1]}-{index:05d}-of-{shard[2]}.gguf")
+                for index in range(1, int(shard[2]) + 1)
+            ]
+            if shard
+            else [first]
+        )
+        if not manifest or [Path(entry["path"]).resolve(strict=True) for entry in manifest] != expected:
+            raise GateFailure("Model manifest does not cover the exact router preset/shards")
+        for entry in manifest:
+            self.resources()
+            path = Path(entry["path"])
+            if path.stat().st_size != entry["size_bytes"] or file_hash(path) != entry["sha256"]:
+                raise GateFailure("Model artifact changed before/after invocation")
+            self.resources()
 
     def state(self, status: str, message: str = "") -> None:
         self.job.update(status=status, message=message, updatedAt=now(), runnerPid=os.getpid())
@@ -610,6 +650,7 @@ class FormalRunner:
             os.environ.update(previous)
         if result["exit_code"] != 0:
             raise GateFailure("Managed Pi stage failed: " + label)
+        self.verify_model_artifacts(model)
         events = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines() if line]
         evidence = stage_evidence(events, model, role)
         expected_policy = self.job["controls"]["system_development_policy"]
@@ -663,8 +704,17 @@ class FormalRunner:
             str(Path(__file__).with_name(name))
             for name in ("formal_runtime.py", "formal_artifacts.py", "formal_campaign.py")
         )
+        context_pins = injected_context_pins(self.runtime, self.job["controls"])
+        context_pins[self.runtime["policy"]] = self.job["controls"]["system_development_policy"]
+        required_runtime.update(context_pins)
+        required_runtime.add(
+            str(safe_path(Path(self.runtime["governance_root"]), "docs/self-improvement-mvp.md"))
+        )
         if not required_runtime.issubset(self.contract["runtime_hashes"]):
             raise GateFailure("Missing mandatory executable/config pin")
+        for path, expected in context_pins.items():
+            if self.contract["runtime_hashes"][path] != expected or file_hash(Path(path)) != expected:
+                raise GateFailure("Injected context differs from canonical control: " + path)
         for role in ("planner", "implementer", "auditor"):
             if self.job["model_identities"][role]["invocation_config_sha256"] != invocation_identity(
                 self.runtime, self.contract, role
@@ -682,10 +732,7 @@ class FormalRunner:
             manifest = self.runtime["model_manifests"][model]
             if digest(encode(manifest)) != identity["model_artifact_manifest_sha256"]:
                 raise GateFailure("Model artifact manifest identity mismatch")
-            for entry in manifest:
-                path = Path(entry["path"])
-                if path.stat().st_size != entry["size_bytes"] or file_hash(path) != entry["sha256"]:
-                    raise GateFailure("Model artifact changed before invocation")
+            self.verify_model_artifacts(model)
         if self.candidate.exists():
             raise GateFailure("Candidate path already exists; preserve it and submit a new job")
         git(self.repository, "worktree", "add", "--detach", str(self.candidate), self.job["baseRevision"])
@@ -855,8 +902,12 @@ class FormalRunner:
                 "audit_input_schema_valid": True,
                 "expected_auditor": self.job["model_identities"]["auditor"],
                 "hashes": frozen,
+                "required_audit_checks": AUDIT_CHECKS,
             }
             prompt = artifacts["audit_prompt"].decode().replace("$1", str(bundle / "audit-input.json"))
+            prompt += "\nEmit every fixed check ID from required_audit_checks in its domain. "
+            prompt += "IDs correspond in order to every mandatory bullet of audit-contract sections A/B/C. "
+            prompt += "Never omit, duplicate or invent an ID; use INCONCLUSIVE for unreadable evidence."
             text = self.stage("auditor", prompt, "auditor", bundle, envelope)
             (self.directory / "audit-result.raw.txt").write_text(text, encoding="utf-8")
             audit_result = read_json(self.directory / "audit-result.raw.txt")
@@ -949,10 +1000,74 @@ def submit(spec: dict, root: Path) -> Path:
     return directory / "job.json"
 
 
+def verify_proposal_for_integration(job_file: Path) -> Path:
+    """Read-only adoption gate outside the model Job; never infer approval from status alone."""
+    runner = FormalRunner(job_file)
+    validate_contract(runner.contract)
+    runner.intact()
+    if runner.job["status"] != "review_ready" or runner.job.get("outcome") != "accepted_proposal":
+        raise GateFailure("Proposal is not accepted and review_ready")
+    bundle = runner.directory / "audit-bundle"
+    audit_input = read_json(bundle / "audit-input.json")
+    result_file = runner.directory / "audit-result.json"
+    audit_result = read_json(result_file)
+    validate_audit_result(audit_result, bundle, audit_input)
+    if audit_result["decision"] != "ACCEPT_PROPOSAL":
+        raise GateFailure("Auditor did not accept the proposal")
+    inspect_bundle(
+        bundle,
+        read_json(bundle / "evidence-manifest.json"),
+        read_json(bundle / "evidence_manifest_schema.json"),
+    )
+    if (
+        audit_input["job_id"] != runner.job["id"]
+        or audit_input["baseline_commit"] != runner.job["baseRevision"]
+    ):
+        raise GateFailure("Integration Job/base identity mismatch")
+    attestation = read_json(runner.directory / "audit-execution-attestation.json")
+    observed = attestation["observed_auditor"]
+    if observed.get("model_id") != LEAD or runner.job["model_identities"]["auditor"]["model_id"] != LEAD:
+        raise GateFailure("Integration auditor model mismatch")
+    events = [
+        json.loads(line)
+        for line in (runner.directory / "auditor-trace.jsonl").read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    trace_evidence = stage_evidence(events, LEAD, "auditor")
+    if (
+        trace_evidence["governance_ack"]["details"].get("policySha256")
+        != runner.job["controls"]["system_development_policy"]
+    ):
+        raise GateFailure("Integration auditor governance identity mismatch")
+    if not all(
+        attestation.get(field) is True
+        for field in ("passed", "schema_valid", "candidate_unchanged", "bundle_unchanged")
+    ):
+        raise GateFailure("Integration execution attestation failed")
+    if (
+        attestation["audit_result_sha256"] != file_hash(result_file)
+        or attestation["audit_input_sha256"] != file_hash(bundle / "audit-input.json")
+        or observed["identity"] != runner.job["model_identities"]["auditor"]
+        or observed["trace_sha256"] != file_hash(runner.directory / "auditor-trace.jsonl")
+        or observed["session_sha256"] != file_hash(safe_path(runner.directory, observed["session_path"]))
+    ):
+        raise GateFailure("Integration audit execution identity mismatch")
+    if snapshot(runner.candidate) != read_json(bundle / "candidate_snapshot_manifest.txt"):
+        raise GateFailure("Candidate changed after audit")
+    patch = runner.directory / "candidate.patch"
+    if file_hash(patch) != audit_input["final_bindings"]["candidate_patch_sha256"]:
+        raise GateFailure("Audited patch changed before integration")
+    return patch
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--job", type=Path, required=True)
+    parser.add_argument("--verify-proposal-only", action="store_true")
     args = parser.parse_args()
+    if args.verify_proposal_only:
+        print(json.dumps({"patch": str(verify_proposal_for_integration(args.job)), "verified": True}))
+        return
     runner = FormalRunner(args.job)
     with exclusive_lock(Path(runner.runtime["resource_lock"])):
         runner.run()

@@ -9,6 +9,7 @@ import pytest
 
 from ephy_worker.formal_artifacts import (
     ARTIFACTS,
+    AUDIT_CHECKS,
     CONTROL_PATHS,
     FINAL_BINDINGS,
     GateFailure,
@@ -23,7 +24,15 @@ from ephy_worker.formal_artifacts import (
     validate_schema,
 )
 from ephy_worker.formal_campaign import run_campaign
-from ephy_worker.formal_runtime import exclusive_lock, snapshot, stage_evidence, submit, validate_contract
+from ephy_worker.formal_runtime import (
+    FormalRunner,
+    exclusive_lock,
+    injected_context_pins,
+    snapshot,
+    stage_evidence,
+    submit,
+    validate_contract,
+)
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 
@@ -122,12 +131,12 @@ def accepted_result(bundle, audit_input):
         },
     }
     result["human_report"]["blockers"] = []
-    for domain, prefix in (("integrity", "I"), ("candidate", "C"), ("workflow", "W")):
+    for domain, ids in AUDIT_CHECKS.items():
         result[domain] = {
             "status": "PASS",
             "checks": [
                 {
-                    "check_id": prefix + "01_TEST",
+                    "check_id": check_id,
                     "status": "PASS",
                     "summary": "Synthetic",
                     "evidence": [
@@ -138,6 +147,7 @@ def accepted_result(bundle, audit_input):
                         }
                     ],
                 }
+                for check_id in ids
             ],
         }
     return result
@@ -304,3 +314,75 @@ def test_duplicate_json_keys_rejected(tmp_path):
     path.write_text('{"x": 1, "x": 2}')
     with pytest.raises(GateFailure, match="Duplicate"):
         read_json(path)
+
+
+@pytest.mark.parametrize("mutation", ["omit", "invent", "duplicate"])
+def test_complete_mandatory_audit_checks_required(tmp_path, mutation):
+    bundle, audit_input = bundle_fixture(tmp_path)
+    result = accepted_result(bundle, audit_input)
+    if mutation == "omit":
+        result["workflow"]["checks"].pop()
+    elif mutation == "invent":
+        for domain in AUDIT_CHECKS:
+            result[domain]["checks"] = result[domain]["checks"][:1]
+            result[domain]["checks"][0]["check_id"] = {
+                "integrity": "I01",
+                "candidate": "C01",
+                "workflow": "W01",
+            }[domain] + "_TEST"
+    else:
+        result["candidate"]["checks"].append(copy.deepcopy(result["candidate"]["checks"][0]))
+    with pytest.raises(GateFailure):
+        validate_audit_result(result, bundle, audit_input)
+
+
+def test_actual_gate_adjacent_context_paths_are_pinned(tmp_path):
+    managed = tmp_path / "runtime"
+    gate = managed / "extensions" / "governance-gate.ts"
+    gate.parent.mkdir(parents=True)
+    gate.write_text("gate")
+    mapping = {
+        "policies/independent-audit.md": "audit_contract",
+        "prompts/audit-ephy-worker.md": "audit_prompt",
+        "policies/audit-input.schema.json": "audit_input_schema",
+        "policies/evidence-manifest.schema.json": "evidence_manifest_schema",
+        "policies/audit-result.schema.json": "audit_result_schema",
+    }
+    controls = {}
+    for relative, name in mapping.items():
+        path = managed / relative
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(name)
+        controls[name] = file_hash(path)
+    pins = injected_context_pins({"governance_gate": str(gate)}, controls)
+    assert len(pins) == 5
+    assert all(file_hash(Path(path)) == expected for path, expected in pins.items())
+    (managed / "policies/independent-audit.md").write_text("stale or changed")
+    assert (
+        file_hash(managed / "policies/independent-audit.md")
+        != pins[str(managed / "policies/independent-audit.md")]
+    )
+
+
+def test_model_rehash_detects_change_after_preflight(tmp_path):
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"original")
+    ini = tmp_path / "models.ini"
+    ini.write_text(f"version=1\n[*]\nc=32768\n[test]\nmodel={model.as_posix()}\n", encoding="utf-8")
+    runner = FormalRunner.__new__(FormalRunner)
+    runner.resources = lambda: None
+    runner.runtime = {
+        "models_ini": str(ini),
+        "model_manifests": {
+            "test": [{"path": str(model), "size_bytes": model.stat().st_size, "sha256": file_hash(model)}]
+        },
+    }
+    runner.verify_model_artifacts("test")
+    model.write_bytes(b"modified")  # same size; size checking alone must not pass
+    with pytest.raises(GateFailure, match="Model artifact changed"):
+        runner.verify_model_artifacts("test")
+    other = tmp_path / "different-model.gguf"
+    other.write_bytes(b"original")
+    ini.write_text(f"[test]\nmodel={other.as_posix()}\n", encoding="utf-8")
+    with pytest.raises(GateFailure, match="exact router preset"):
+        runner.verify_model_artifacts("test")

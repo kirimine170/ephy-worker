@@ -69,6 +69,41 @@ SEQUENCE = [
     "proposal stop",
 ]
 
+# One fixed ID per mandatory bullet in audit-contract.md, sections A/B/C.
+AUDIT_CHECKS = {
+    "integrity": (
+        "I01_ENVELOPE_IDENTITY",
+        "I02_ARTIFACT_INTEGRITY",
+        "I03_CANDIDATE_BINDING",
+        "I04_VERIFICATION_BINDING",
+        "I05_FROZEN_CONTROLS",
+        "I06_PROVENANCE",
+        "I07_COMPLETE_FILE_COVERAGE",
+    ),
+    "candidate": (
+        "C01_ACCEPTANCE",
+        "C02_SCOPE",
+        "C03_NO_UNRELATED_CHANGES",
+        "C04_TEST_MEANING",
+        "C05_NO_WEAKENING",
+        "C06_REQUIRED_CHECKS",
+        "C07_ENVIRONMENT_BINDING",
+    ),
+    "workflow": (
+        "W01_PREFLIGHT",
+        "W02_CONTEXT_ACK",
+        "W03_READONLY_PLANNER",
+        "W04_QWEN_IMPLEMENTATION",
+        "W05_MODEL_IDENTITIES",
+        "W06_INDEPENDENT_VERIFICATION",
+        "W07_BOUNDED_REPAIRS",
+        "W08_INFRASTRUCTURE_STOP",
+        "W09_FINAL_FREEZE",
+        "W10_EXACT_AUDITED_STATE",
+        "W11_PROPOSAL_STOP",
+    ),
+}
+
 
 class GateFailure(RuntimeError):
     """An infrastructure/identity failure is never a candidate repair request."""
@@ -272,6 +307,9 @@ def validate_audit_result(result: dict, bundle: Path, audit_input: dict) -> None
             raise GateFailure("Document identity mismatch")
     for domain in ("integrity", "candidate", "workflow"):
         # No empty-domain or invented citations may authorize review_ready.
+        ids = [check["check_id"] for check in result[domain]["checks"]]
+        if len(ids) != len(set(ids)) or set(ids) != set(AUDIT_CHECKS[domain]):
+            raise GateFailure("Missing, duplicate or invented mandatory audit check: " + domain)
         for check in result[domain]["checks"]:
             for ref in check["evidence"]:
                 if (

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -90,6 +90,48 @@ const JobIdParams = Type.Object({
 
 function now(): string {
 	return new Date().toISOString();
+}
+
+export function selectAuditedPatch(job: BackgroundJob): string {
+	const patch = path.join(job.jobDir, job.schemaVersion === 2 ? "candidate.patch" : "changes.patch");
+	if (job.schemaVersion !== 2) return patch;
+	const hash = (file: string) => {
+		const info = fs.lstatSync(file);
+		if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1) throw new Error("Unsafe integration artifact");
+		return createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+	};
+	const inputFile = path.join(job.jobDir, "audit-bundle", "audit-input.json");
+	const resultFile = path.join(job.jobDir, "audit-result.json");
+	const input = JSON.parse(fs.readFileSync(inputFile, "utf8"));
+	const result = JSON.parse(fs.readFileSync(resultFile, "utf8"));
+	const attestation = JSON.parse(fs.readFileSync(path.join(job.jobDir, "audit-execution-attestation.json"), "utf8"));
+	const expectedPatch = input.final_bindings?.candidate_patch_sha256;
+	if (job.status !== "review_ready" || input.job_id !== job.id || result.job_id !== job.id ||
+		input.baseline_commit !== job.baseRevision || result.audit_id !== input.audit_id ||
+		result.decision !== "ACCEPT_PROPOSAL" || !/^[a-f0-9]{64}$/.test(expectedPatch ?? "") ||
+		result.bound_inputs?.candidate_patch_sha256 !== expectedPatch || hash(patch) !== expectedPatch ||
+		hash(path.join(job.jobDir, "audit-bundle", "candidate_patch.txt")) !== expectedPatch ||
+		attestation.passed !== true || attestation.schema_valid !== true ||
+		attestation.candidate_unchanged !== true || attestation.bundle_unchanged !== true ||
+		attestation.audit_result_sha256 !== hash(resultFile) || attestation.audit_input_sha256 !== hash(inputFile) ||
+		result.bound_inputs?.audit_input_sha256 !== hash(inputFile)) {
+		throw new Error("Formal audited patch identity/attestation mismatch");
+	}
+	return patch;
+}
+
+async function verifyFormalIntegration(pi: ExtensionAPI, job: BackgroundJob): Promise<void> {
+	if (job.schemaVersion !== 2) return;
+	const formal = job as BackgroundJob & { runtime: { python: string; controller_source: string }; contract: { runtime_hashes: Record<string, string> } };
+	const files = [formal.runtime.python, ...["formal_runtime.py", "formal_artifacts.py", "formal_campaign.py"].map(name => path.join(formal.runtime.controller_source, "ephy_worker", name))];
+	for (const file of files) {
+		const expected = formal.contract.runtime_hashes[file] ?? Object.entries(formal.contract.runtime_hashes).find(([key]) => path.resolve(key) === path.resolve(file))?.[1];
+		if (!expected || createHash("sha256").update(fs.readFileSync(file)).digest("hex") !== expected) throw new Error("Integration verifier runtime pin mismatch");
+	}
+	const check = await pi.exec(formal.runtime.python, ["-c",
+		"import sys; sys.path.insert(0,sys.argv.pop(1)); from ephy_worker.formal_runtime import main; main()",
+		formal.runtime.controller_source, "--job", path.join(job.jobDir, "job.json"), "--verify-proposal-only"], { cwd: job.repoRoot, timeout: 30_000 });
+	if (check.code !== 0) throw new Error(`Formal integration verification failed: ${check.stderr || check.stdout}`);
 }
 
 function getStateDir(): string {
@@ -323,7 +365,24 @@ export default function (pi: ExtensionAPI): void {
 			const timeoutMinutes = params.timeoutMinutes ?? 60;
 			const maxRepairAttempts = params.maxRepairAttempts ?? 2;
 			const commands = (params.verificationCommands ?? []).map((command) => command.trim()).filter(Boolean);
-			const confirmation = [
+			if (formalSpec && (formalSpec.repoRoot !== repoRoot || formalSpec.baseRevision !== headResult.stdout.trim())) {
+				throw new Error("Formal spec repository/base differs from submission context");
+			}
+			const confirmation = formalSpec ? [
+				`Formal spec SHA-256: ${params.formalSpecSha256}`,
+				`Repository: ${repoRoot}`,
+				`Base: ${formalSpec.baseRevision}`,
+				`Task: ${formalSpec.contract.task}`,
+				`Semantic scope: ${formalSpec.contract.semantic_scope}`,
+				`Allowed files: ${JSON.stringify(formalSpec.contract.allowed_files)}`,
+				`Whole-job timeout: ${formalSpec.contract.timeout_seconds} seconds`,
+				`Stage timeout: ${formalSpec.contract.stage_seconds} seconds`,
+				`Repair limit: ${formalSpec.contract.max_repairs}`,
+				`Output tokens per stage: ${formalSpec.contract.output_token_budget}`,
+				`Models: ${JSON.stringify(formalSpec.model_identities)}`,
+				`Frozen checks: ${JSON.stringify(formalSpec.contract.checks)}`,
+				"Fresh isolated proposal only. No automatic apply, commit, push or merge.",
+			].join("\n") : [
 				`Title: ${params.title}`,
 				`Repository: ${repoRoot}`,
 				`Base: ${headResult.stdout.trim().slice(0, 12)}`,
@@ -374,6 +433,9 @@ export default function (pi: ExtensionAPI): void {
 			};
 			if (formalSpec) {
 				Object.assign(job, formalSpec, { schemaVersion: 2, humanAuthorization: "explicit-execute-proposal-only" });
+				job.task = formalSpec.contract.task;
+				job.timeoutMinutes = formalSpec.contract.timeout_seconds / 60;
+				job.maxRepairAttempts = formalSpec.contract.max_repairs;
 			}
 			fs.mkdirSync(jobDir, { recursive: true });
 			fs.writeFileSync(path.join(jobDir, "TASK.md"), renderTask(job), "utf8");
@@ -462,7 +524,8 @@ export default function (pi: ExtensionAPI): void {
 			if (job.status !== "review_ready") {
 				return { content: [{ type: "text", text: `Job ${job.id} is ${job.status}, not review_ready.` }], details: job };
 			}
-			const patchFile = path.join(job.jobDir, "changes.patch");
+			const patchFile = selectAuditedPatch(job);
+			await verifyFormalIntegration(pi, job);
 			if (!fs.existsSync(patchFile) || fs.statSync(patchFile).size === 0) {
 				return { content: [{ type: "text", text: `Job ${job.id} has no patch to apply.` }], details: job };
 			}
@@ -520,6 +583,8 @@ export default function (pi: ExtensionAPI): void {
 					details: job,
 				};
 			}
+			selectAuditedPatch(job); // Recheck bound bytes after the confirmation and final git check.
+			await verifyFormalIntegration(pi, job);
 			const applied = await pi.exec("git", ["apply", patchFile], { cwd: job.repoRoot, timeout: 30_000 });
 			if (applied.code !== 0) {
 				return { content: [{ type: "text", text: `Patch application failed:\n${applied.stderr || applied.stdout}` }], details: job };
