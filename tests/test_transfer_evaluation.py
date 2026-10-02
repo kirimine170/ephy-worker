@@ -319,6 +319,47 @@ class TransferEvaluationTests(unittest.TestCase):
         )
         self.assertNotEqual(invalid.returncode, 0)
 
+    def test_tool_accepts_escaped_sources_at_decoded_byte_limit(self):
+        # JSON escaping expands the envelope, not the decoded source budget.
+        sources = ["#" + "\\" * 65535, "#" + "あ" * 21845, "#" + "a" * 65535]
+        for source in sources:
+            self.assertEqual(len(source.encode("utf-8")), 65536)
+            encoded = json.dumps({"source": source}, ensure_ascii=True)
+            if source.endswith("a"):
+                encoded = '{"source":"' + "".join(f"\\u{ord(c):04x}" for c in source) + '"}'
+            self.assertGreater(len(encoded), 131073)
+            with self.subTest(source_kind=source[-1]):
+                result = subprocess.run(
+                    [sys.executable, "-I", "-B", str(self.assets / "inspect_python.py")],
+                    input=encoded,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    json.loads(result.stdout), {"functions": [], "branches": [], "comparisons": []}
+                )
+
+    def test_tool_rejects_oversized_source_and_envelope_without_truncating(self):
+        cases = [
+            (json.dumps({"source": "#" + "a" * 65536}), "at most 65536 bytes"),
+            (json.dumps({"source": "#" + "あ" * 21846}), "at most 65536 bytes"),
+            (json.dumps({"source": "#"}) + " " * (1 << 20), "JSON envelope exceeds"),
+        ]
+        for encoded, error in cases:
+            with self.subTest(error=error):
+                result = subprocess.run(
+                    [sys.executable, "-I", "-B", str(self.assets / "inspect_python.py")],
+                    input=encoded,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(error, result.stderr)
+                self.assertEqual(result.stdout, "")
+
     def test_lookup_rejects_ignored_key_and_mutated_stored_value(self):
         task = self.frozen.task("heldout-present-value")
         wrong_implementations = [

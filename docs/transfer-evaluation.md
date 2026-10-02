@@ -18,7 +18,7 @@ heldoutは公開synthetic fixtureの運用上の分割であり，秘密の試�
 
 - `none`：課題のgoal，編集可能file，初期implementationだけを渡す．
 - `skill`：同じ入力に，一般的な境界／意味保持の修正手順を追加する．
-- `tool`：同じ入力に，受け取ったPython sourceをAST解析するread-only toolを追加する．toolはfile pathを受け取らず，sourceの実行，file読書き，networkを行わない．新しいMCP serverは作らない．
+- `tool`：同じ入力に，受け取ったPython sourceをAST解析するread-only toolを追加する．toolはfile pathを受け取らず，sourceの実行，file読書き，networkを行わない．新しいMCP serverは作らない．JSON envelopeは1,048,576文字以内として完全に読み取り，超過時は切詰めず明示拒否する．decoded sourceには別途65,536 UTF-8 bytes上限を適用し，JSON escapeによる増加をsource量へ混同しない．
 
 同一model設定，同一task，environment，budget，repeat indexで比較する．variant以外のhashが変わる比較は認めない．skillとtoolを同時に追加する条件はこの版に含めない．補助の文字数やtool往復も共通context／token／time budgetに含める．反復ごとに条件順を回転するが，完全な無作為化やserver warm-up制御を代替しない．
 

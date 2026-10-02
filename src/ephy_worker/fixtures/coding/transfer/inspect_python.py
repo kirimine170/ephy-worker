@@ -6,9 +6,14 @@ import ast
 import json
 import sys
 
+MAX_SOURCE_BYTES = 65536
+# A JSON escape can occupy six characters for one ASCII source byte.
+# Keep a separate bounded envelope allowance, including framing/whitespace.
+MAX_ENVELOPE_CHARS = 1 << 20
+
 
 def inspect_source(source: str) -> dict:
-    if not isinstance(source, str) or len(source.encode("utf-8")) > 65536:
+    if not isinstance(source, str) or len(source.encode("utf-8")) > MAX_SOURCE_BYTES:
         raise ValueError("source must be a UTF-8 string of at most 65536 bytes")
     tree = ast.parse(source)
     return {
@@ -35,7 +40,10 @@ def inspect_source(source: str) -> dict:
 
 
 def main() -> int:
-    request = json.loads(sys.stdin.read(131073))
+    envelope = sys.stdin.read(MAX_ENVELOPE_CHARS + 1)
+    if len(envelope) > MAX_ENVELOPE_CHARS:
+        raise ValueError("JSON envelope exceeds 1048576 characters")
+    request = json.loads(envelope)
     if not isinstance(request, dict) or set(request) != {"source"}:
         raise ValueError("request must contain only source")
     print(json.dumps(inspect_source(request["source"]), sort_keys=True))
