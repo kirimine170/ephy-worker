@@ -13,6 +13,7 @@ import pytest
 from ephy_worker.formal_artifacts import (
     ARTIFACTS,
     AUDIT_CHECKS,
+    AUDIT_EVIDENCE,
     CONTROL_PATHS,
     FINAL_BINDINGS,
     GateFailure,
@@ -29,6 +30,7 @@ from ephy_worker.formal_artifacts import (
 from ephy_worker.formal_campaign import run_campaign
 from ephy_worker.formal_runtime import (
     FormalRunner,
+    command_environment,
     exclusive_lock,
     injected_context_pins,
     observed_verifier_identity,
@@ -147,10 +149,11 @@ def accepted_result(bundle, audit_input):
                     "summary": "Synthetic",
                     "evidence": [
                         {
-                            "artifact_id": "task_spec",
-                            "sha256": entries["task_spec"]["sha256"],
+                            "artifact_id": name,
+                            "sha256": entries[name]["sha256"],
                             "location": "whole test artifact",
                         }
+                        for name in AUDIT_EVIDENCE[check_id]
                     ],
                 }
                 for check_id in ids
@@ -204,6 +207,37 @@ def test_false_acceptance_rejected(tmp_path, mutation):
         result["workflow"]["checks"][0]["status"] = "FAIL"
     with pytest.raises(GateFailure):
         validate_audit_result(result, bundle, audit_input)
+
+
+@pytest.mark.parametrize("check_id", [item for ids in AUDIT_CHECKS.values() for item in ids])
+def test_pass_without_required_relevant_evidence_is_rejected(tmp_path, check_id):
+    bundle, audit_input = bundle_fixture(tmp_path)
+    result = accepted_result(bundle, audit_input)
+    check = next(
+        check
+        for domain in AUDIT_CHECKS
+        for check in result[domain]["checks"]
+        if check["check_id"] == check_id
+    )
+    check["evidence"].pop()
+    with pytest.raises(GateFailure, match="relevant audit evidence coverage"):
+        validate_audit_result(result, bundle, audit_input)
+
+
+def test_all_task_spec_citations_cannot_authorize_acceptance(tmp_path):
+    bundle, audit_input = bundle_fixture(tmp_path)
+    result = accepted_result(bundle, audit_input)
+    task = next(item for item in result["documents_read"] if item["artifact_id"] == "task_spec")
+    for domain in AUDIT_CHECKS:
+        for check in result[domain]["checks"]:
+            check["evidence"] = [{**task, "location": "whole artifact"}]
+    with pytest.raises(GateFailure, match="relevant audit evidence coverage"):
+        validate_audit_result(result, bundle, audit_input)
+
+
+def test_audit_evidence_mapping_covers_exact_contract_checks():
+    assert set(AUDIT_EVIDENCE) == {item for ids in AUDIT_CHECKS.values() for item in ids}
+    assert all(set(names) <= set(ARTIFACTS) and names for names in AUDIT_EVIDENCE.values())
 
 
 def test_duplicate_manifest_path_and_external_schema_ref(tmp_path):
@@ -471,6 +505,30 @@ def test_observed_verifier_matches_real_check_processes(tmp_path):
         check["executable"]["path"] == str(Path(sys.executable).resolve()) for check in result["checks"]
     )
     assert len({check["effective_environment_sha256"] for check in result["checks"]}) == 1
+
+
+def test_role_change_uses_same_verifier_environment_and_real_commands(tmp_path, monkeypatch):
+    monkeypatch.setenv("DUAL_GOVERNANCE_ROLE", "planner")
+    runner = verifier_runner(tmp_path)
+    before = command_environment(runner.candidate)
+    monkeypatch.setenv("DUAL_GOVERNANCE_ROLE", "integration")
+    monkeypatch.setenv("DUAL_STAGE_TRACE", "integration-trace")
+    monkeypatch.setenv("PYTHONSTARTUP", "untrusted.py")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    assert command_environment(runner.candidate) == before
+    result = runner.run_checks("integration")
+    assert result["passed"] and result["verifier_identity"] == runner.job["verifier_identity"]
+    assert all(check["pid"] > 0 for check in result["checks"])
+    assert all(check["effective_environment_sha256"] == digest(encode(before)) for check in result["checks"])
+
+
+def test_changed_verifier_platform_environment_still_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("LANG", "C.UTF-8")
+    runner = verifier_runner(tmp_path)
+    monkeypatch.setenv("LANG", "different-locale")
+    runner.command = lambda *_: pytest.fail("Changed environment reached check process")
+    with pytest.raises(GateFailure, match="Observed independent verifier"):
+        runner.run_checks("verification")
 
 
 @pytest.mark.parametrize("field", ["executor_id", "runtime_sha256", "invocation_config_sha256"])

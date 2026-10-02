@@ -27,6 +27,7 @@ import psutil
 from .formal_artifacts import (
     ARTIFACTS,
     AUDIT_CHECKS,
+    AUDIT_EVIDENCE,
     CONTROL_PATHS,
     GateFailure,
     digest,
@@ -60,7 +61,13 @@ def injected_context_pins(runtime: dict, controls: dict) -> dict[str, str]:
 
 
 def git(root: Path, *args: str) -> bytes:
-    result = subprocess.run(["git", "-C", str(root), *args], capture_output=True, timeout=60, check=False)
+    result = subprocess.run(
+        ["git", "-C", str(root), *args],
+        capture_output=True,
+        timeout=60,
+        check=False,
+        env=command_environment(root),
+    )
     if result.returncode:
         raise GateFailure(result.stderr.decode("utf-8", errors="replace"))
     return result.stdout
@@ -221,7 +228,29 @@ def invocation_identity(runtime: dict, contract: dict, role: str) -> str:
 
 
 def command_environment(cwd: Path) -> dict[str, str]:
-    env = os.environ.copy()
+    # Keep only platform/locale inputs needed by the fixed subprocess commands.
+    # Pi role/session variables and Python/Git injection variables are not inputs
+    # to the verifier, so planning and authorized integration use identical bytes.
+    keys = (
+        "PATH",
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "TEMP",
+        "TMP",
+        "HOME",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TZ",
+    )
+    env = {key: os.environ[key] for key in keys if key in os.environ}
     env.update(
         PYTHONPATH=str(cwd / "src"),
         PYTHONUTF8="1",
@@ -635,7 +664,10 @@ class FormalRunner:
         if snapshot_hash(self.candidate) != before:
             raise GateFailure("Independent verification changed candidate")
         diff = subprocess.run(
-            ["git", "-C", str(self.candidate), "diff", "--check"], capture_output=True, check=False
+            ["git", "-C", str(self.candidate), "diff", "--check"],
+            capture_output=True,
+            check=False,
+            env=command_environment(self.candidate),
         )
         if diff.returncode:
             checks.append({"id": "diff", "passed": False, "exit_code": diff.returncode})
@@ -952,6 +984,7 @@ class FormalRunner:
                         cwd=self.candidate,
                         capture_output=True,
                         check=False,
+                        env=command_environment(self.candidate),
                     )
                     if addition.returncode not in (0, 1):
                         raise GateFailure("Cannot capture new-file patch")
@@ -992,11 +1025,15 @@ class FormalRunner:
                 "expected_auditor": self.job["model_identities"]["auditor"],
                 "hashes": frozen,
                 "required_audit_checks": AUDIT_CHECKS,
+                "required_audit_evidence": AUDIT_EVIDENCE,
             }
             prompt = artifacts["audit_prompt"].decode().replace("$1", str(bundle / "audit-input.json"))
             prompt += "\nEmit every fixed check ID from required_audit_checks in its domain. "
             prompt += "IDs correspond in order to every mandatory bullet of audit-contract sections A/B/C. "
             prompt += "Never omit, duplicate or invent an ID; use INCONCLUSIVE for unreadable evidence."
+            prompt += " Every PASS must cite all artifact IDs in required_audit_evidence for that check, "
+            prompt += "with their manifest hashes and relevant locations. Coverage does not replace reading "
+            prompt += "and assessing the evidence; never invent a citation to satisfy coverage."
             text = self.stage("auditor", prompt, "auditor", bundle, envelope)
             (self.directory / "audit-result.raw.txt").write_text(text, encoding="utf-8")
             audit_result = read_json(self.directory / "audit-result.raw.txt")
