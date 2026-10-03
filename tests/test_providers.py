@@ -6,6 +6,7 @@ from urllib.parse import parse_qs
 
 import httpx
 import pytest
+from anyio import ClosedResourceError
 from pydantic import BaseModel
 
 from ephy_worker.budget import Budget, BudgetExceeded
@@ -295,6 +296,251 @@ async def test_model_timeout_and_cancel_propagate():
     with pytest.raises(asyncio.CancelledError):
         await task
     await runner.aclose()
+
+
+def cleanup_error_shapes():
+    return [
+        ClosedResourceError("fixture cleanup"),
+        ExceptionGroup("cleanup", [ExceptionGroup("nested", [ClosedResourceError()])]),
+    ]
+
+
+@pytest.mark.parametrize("cleanup_error", cleanup_error_shapes())
+@pytest.mark.parametrize("repeat_cancel", [False, True])
+async def test_model_preserves_cancel_over_closed_cleanup(monkeypatch, cleanup_error, repeat_cancel):
+    entered, cleaning, released, cleaned = (asyncio.Event() for _ in range(4))
+
+    async def closing_agent(self, *args, **kwargs):
+        entered.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cleaning.set()
+            if repeat_cancel:
+                try:
+                    await released.wait()
+                except asyncio.CancelledError:
+                    # Reproduce a backend cleanup error replacing a second cancellation．
+                    raise cleanup_error
+            raise cleanup_error
+        finally:
+            cleaned.set()
+
+    monkeypatch.setattr("ephy_worker.models.Agent.run", closing_agent)
+    runner = ModelRunner(profile(), Budget(Limits()), transport=httpx.MockTransport(pytest.fail))
+    task = asyncio.create_task(runner.run(Answer, "fixture", stage="fixture"))
+    try:
+        await entered.wait()
+        task.cancel()
+        await cleaning.wait()
+        if repeat_cancel:
+            assert not task.done()
+            task.cancel()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+        assert task.cancelled()
+        assert caught.value.__cause__ is cleanup_error
+        assert cleaned.is_set()
+        assert runner.budget.counts["model_requests"] == 0
+    finally:
+        released.set()
+        await runner.aclose()
+    assert runner.client.is_closed()
+
+
+@pytest.mark.parametrize("cleanup_error", cleanup_error_shapes())
+async def test_model_retains_unrequested_closed_cleanup(monkeypatch, cleanup_error):
+    async def closing_agent(self, *args, **kwargs):
+        raise cleanup_error
+
+    monkeypatch.setattr("ephy_worker.models.Agent.run", closing_agent)
+    runner = ModelRunner(profile(), Budget(Limits()), transport=httpx.MockTransport(pytest.fail))
+    try:
+        with pytest.raises(type(cleanup_error)) as caught:
+            await runner.run(Answer, "fixture", stage="fixture")
+        assert caught.value is cleanup_error
+        assert runner.budget.counts["model_requests"] == 0
+    finally:
+        await runner.aclose()
+
+
+async def test_model_retains_closed_error_after_previously_handled_cancel(monkeypatch):
+    cleanup_error = ClosedResourceError("not caused by a new cancellation")
+
+    async def closing_agent(self, *args, **kwargs):
+        raise cleanup_error
+
+    monkeypatch.setattr("ephy_worker.models.Agent.run", closing_agent)
+    runner = ModelRunner(profile(), Budget(Limits()), transport=httpx.MockTransport(pytest.fail))
+
+    async def previously_cancelled():
+        task = asyncio.current_task()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.sleep(0)
+        assert task.cancelling() == 1
+        with pytest.raises(ClosedResourceError) as caught:
+            await runner.run(Answer, "fixture", stage="fixture")
+        assert caught.value is cleanup_error
+
+    task = asyncio.create_task(previously_cancelled())
+    try:
+        await task
+        assert not task.cancelled()
+    finally:
+        await runner.aclose()
+
+
+async def test_model_delivers_pending_cancel_before_entering_agent(monkeypatch):
+    entered = []
+
+    async def closing_agent(self, *args, **kwargs):
+        entered.append(True)
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            raise ClosedResourceError("fixture cleanup") from None
+
+    monkeypatch.setattr("ephy_worker.models.Agent.run", closing_agent)
+    runner = ModelRunner(profile(), Budget(Limits()), transport=httpx.MockTransport(pytest.fail))
+
+    async def pending_cancel():
+        asyncio.current_task().cancel()
+        await runner.run(Answer, "fixture", stage="fixture")
+
+    task = asyncio.create_task(pending_cancel())
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert task.cancelled()
+        assert entered == []
+        assert runner.budget.counts["model_requests"] == 0
+    finally:
+        await runner.aclose()
+
+
+@pytest.mark.parametrize(
+    "other_error",
+    [
+        RuntimeError("unrelated failure"),
+        ExceptionGroup("mixed", [ClosedResourceError(), RuntimeError("unrelated failure")]),
+        ExceptionGroup("nested mixed", [ExceptionGroup("closed", [ClosedResourceError()]), ValueError()]),
+        BaseExceptionGroup("mixed cancel", [ClosedResourceError(), asyncio.CancelledError()]),
+    ],
+)
+async def test_model_preserves_other_errors_competing_with_cancel(monkeypatch, other_error):
+    entered = asyncio.Event()
+
+    async def failing_agent(self, *args, **kwargs):
+        entered.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            raise other_error
+
+    monkeypatch.setattr("ephy_worker.models.Agent.run", failing_agent)
+    runner = ModelRunner(profile(), Budget(Limits()), transport=httpx.MockTransport(pytest.fail))
+    task = asyncio.create_task(runner.run(Answer, "fixture", stage="fixture"))
+    try:
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(type(other_error)) as caught:
+            await task
+        assert caught.value is other_error
+        assert not task.cancelled()
+        assert runner.budget.counts["model_requests"] == 0
+    finally:
+        await runner.aclose()
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("nested", [False, True])
+async def test_model_cancel_checks_unwrapped_group_context(monkeypatch, mixed, nested):
+    entered = asyncio.Event()
+    cleanup_error = ClosedResourceError("fixture cleanup")
+    other = ValueError("genuine failure") if mixed else ClosedResourceError("another cleanup")
+    sibling = ExceptionGroup("nested", [other]) if nested else other
+    group = ExceptionGroup("graph cleanup", [cleanup_error, sibling])
+
+    async def unwrapping_agent(self, *args, **kwargs):
+        entered.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            try:
+                raise group
+            except ExceptionGroup as caught:
+                # Match Graph's first-member unwrap，including the cyclic context．
+                raise caught.exceptions[0]
+
+    monkeypatch.setattr("ephy_worker.models.Agent.run", unwrapping_agent)
+    runner = ModelRunner(profile(), Budget(Limits()), transport=httpx.MockTransport(pytest.fail))
+    task = asyncio.create_task(runner.run(Answer, "fixture", stage="fixture"))
+    try:
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(ClosedResourceError if mixed else asyncio.CancelledError) as caught:
+            await task
+        assert task.cancelled() is not mixed
+        if mixed:
+            assert caught.value is cleanup_error
+        else:
+            assert caught.value.__cause__ is cleanup_error
+        assert cleanup_error.__context__ is group
+        assert group.exceptions[0] is cleanup_error
+    finally:
+        await runner.aclose()
+
+
+async def test_model_cancel_preserves_closed_error_with_other_cause(monkeypatch):
+    entered = asyncio.Event()
+    cleanup_error, other = ClosedResourceError("cleanup"), ValueError("genuine failure")
+
+    async def failing_agent(self, *args, **kwargs):
+        entered.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            raise cleanup_error from other
+
+    monkeypatch.setattr("ephy_worker.models.Agent.run", failing_agent)
+    runner = ModelRunner(profile(), Budget(Limits()), transport=httpx.MockTransport(pytest.fail))
+    task = asyncio.create_task(runner.run(Answer, "fixture", stage="fixture"))
+    try:
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(ClosedResourceError) as caught:
+            await task
+        assert caught.value is cleanup_error
+        assert caught.value.__cause__ is other
+        assert not task.cancelled()
+    finally:
+        await runner.aclose()
+
+
+async def test_model_cancel_closes_active_mock_request():
+    entered, cleaned = asyncio.Event(), asyncio.Event()
+
+    async def stalled(request):
+        entered.set()
+        try:
+            await asyncio.Future()
+        finally:
+            cleaned.set()
+
+    runner = ModelRunner(profile(), Budget(Limits()), transport=httpx.MockTransport(stalled))
+    task = asyncio.create_task(runner.run(Answer, "fixture", stage="fixture"))
+    try:
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert task.cancelled()
+        assert cleaned.is_set()
+        assert runner.budget.counts["model_requests"] == 1
+    finally:
+        await runner.aclose()
+    assert runner.client.is_closed()
 
 
 async def test_context_limit_prevents_network():
