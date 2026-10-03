@@ -59,6 +59,8 @@ def run_campaign(plan_file: Path, state_root: Path, *, resume: bool = False) -> 
                         message="Controller interrupted; Job is not replayed",
                         updatedAt=now(),
                     )
+                    if job.get("runtime", {}).get("backend") == "external_strata":
+                        job["outcome"] = "infrastructure_failed"
                     write_json(job_file, job, exclusive=False)
                 state["results"].append({"job_file": str(job_file), "status": job["status"]})
                 state["next_index"] += 1

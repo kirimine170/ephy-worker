@@ -133,15 +133,21 @@ def job_fixture(tmp_path):
     identity = frozen_identity(tmp_path)
     identity_path = tmp_path / "identity.json"
     write_json(identity_path, identity)
+    managed = tmp_path / "managed-pi"
+    managed.mkdir()
+    settings_path = managed / "settings.json"
+    write_json(settings_path, {"retry": {"enabled": False}, "compaction": {"enabled": False}})
     runtime = {
         "backend": "external_strata",
         "provider_id": "strata-local",
         "review_mode": "external_codex",
         "base_url": identity["base_url"],
         "models_ini": str(identity_path),
+        "managed_dir": str(managed),
         "model_roles": {role: identity["model_id"] for role in ("planner", "implementer", "auditor")},
     }
     pins = {str(Path(strata.__file__).resolve()): file_hash(Path(strata.__file__))}
+    pins[str(settings_path)] = file_hash(settings_path)
     for entry in (identity["listener"], identity["engine"]):
         pins[entry["executable"]] = entry["executable_sha256"]
     pins[identity["configuration"]["path"]] = identity["configuration"]["sha256"]
@@ -287,6 +293,108 @@ def test_campaign_never_adopts_or_retries_infrastructure(tmp_path, monkeypatch, 
         0 if failure == "none" else 1 if failure == "infrastructure" else 3
     )
     assert "deadline_at" in state
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["none", "unmanaged", "missing", "unpinned", "defaults", "retry", "compaction", "changed", "type"],
+)
+def test_external_profile_pins_and_disables_pi_automatic_requests(tmp_path, mutation):
+    job_file, job = job_fixture(tmp_path)
+    settings_path = Path(job["runtime"]["managed_dir"]) / "settings.json"
+    if mutation == "unmanaged":
+        del job["runtime"]["managed_dir"]
+    elif mutation == "missing":
+        settings_path.unlink()
+    elif mutation == "unpinned":
+        del job["contract"]["runtime_hashes"][str(settings_path)]
+    elif mutation in ("defaults", "retry", "compaction", "type", "changed"):
+        settings = {"retry": {"enabled": False}, "compaction": {"enabled": False}}
+        if mutation == "defaults":
+            settings = {}
+        elif mutation in ("retry", "compaction"):
+            settings[mutation]["enabled"] = True
+        elif mutation == "type":
+            settings["retry"]["enabled"] = "false"
+        else:
+            settings["verbose"] = True
+        write_json(settings_path, settings, exclusive=False)
+        if mutation != "changed":
+            # A controller pin cannot make unsafe automatic requests admissible.
+            job["contract"]["runtime_hashes"][str(settings_path)] = file_hash(settings_path)
+    write_json(job_file, job, exclusive=False)
+    if mutation == "none":
+        assert strata.StrataRunner(job_file).server_owned is False
+    else:
+        with pytest.raises(GateFailure):
+            strata.StrataRunner(job_file)
+
+
+def test_resume_stops_interrupted_strata_after_prior_success(tmp_path, monkeypatch):
+    from datetime import UTC, datetime, timedelta
+
+    from test_formal_runtime import contract
+
+    from ephy_worker import formal_campaign as campaign
+    from ephy_worker.formal_artifacts import digest, encode, read_json
+    from ephy_worker.formal_runtime import submit
+
+    spec = {
+        "repoRoot": "unused",
+        "baseRevision": "a" * 40,
+        "contract": contract(),
+        "runtime": {"backend": "external_strata", "resource_lock": str(tmp_path / "lock")},
+        "controls": {},
+        "model_identities": {},
+        "verifier_identity": {},
+    }
+    plan = {
+        "specs": [copy.deepcopy(spec) for _ in range(3)],
+        "max_consecutive_failures": 3,
+        "timeout_seconds": 14400,
+        "resource_lock": spec["runtime"]["resource_lock"],
+    }
+    plan_file = tmp_path / "plan.json"
+    write_json(plan_file, plan)
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    successful = submit(spec, state_root)
+    job = read_json(successful)
+    job.update(status="external_review_pending", outcome="external_review_pending")
+    write_json(successful, job, exclusive=False)
+    interrupted = submit(spec, state_root)
+    active = read_json(interrupted)
+    active.update(status="running")
+    active.pop("outcome", None)
+    write_json(interrupted, active, exclusive=False)
+    retained = interrupted.parent / "retained-evidence.txt"
+    retained.write_bytes(b"keep interrupted evidence")
+    deadline = (datetime.now(UTC) + timedelta(hours=4)).isoformat()
+    state = {
+        "plan_sha256": digest(encode(plan)),
+        "status": "running",
+        "results": [{"job_file": str(successful), "status": "external_review_pending"}],
+        "next_index": 1,
+        "consecutive_failures": 0,
+        "active_job": str(interrupted),
+        "elapsed_seconds": 2,
+        "deadline_at": deadline,
+    }
+    write_json(state_root / "campaign.json", state)
+    monkeypatch.setattr(strata, "verify_external_proposal", lambda _: tmp_path / "unapplied.patch")
+    monkeypatch.setattr(campaign, "submit", lambda *_: pytest.fail("No next job after interruption"))
+    monkeypatch.setattr(strata, "make_runner", lambda *_: pytest.fail("No model starts on resume"))
+    result = campaign.run_campaign(plan_file, state_root, resume=True)
+    assert result["status"] == "stopped"
+    assert result["reason"] == "Interrupted Strata infrastructure failure; no replay"
+    assert result["next_index"] == 2
+    assert result["consecutive_failures"] == 1
+    assert result["active_job"] is None
+    assert result["deadline_at"] == deadline
+    assert len(result["results"]) == 2
+    assert read_json(interrupted)["outcome"] == "infrastructure_failed"
+    assert retained.read_bytes() == b"keep interrupted evidence"
+    assert len(list((state_root / "jobs").iterdir())) == 2
 
 
 def test_external_campaign_rejects_more_than_four_hours(tmp_path):

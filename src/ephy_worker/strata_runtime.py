@@ -186,14 +186,27 @@ class StrataRunner(FormalRunner):
             raise GateFailure("Strata roles must pin the observed running model")
         if self.runtime["base_url"] != identity["base_url"]:
             raise GateFailure("Strata endpoint differs from frozen identity")
+        managed_dir = self.runtime.get("managed_dir")
+        if not isinstance(managed_dir, str) or not Path(managed_dir).is_absolute():
+            raise GateFailure("Strata requires a dedicated managed Pi settings directory")
+        settings_path = safe_path(Path(managed_dir), "settings.json")
         required = {
             str(Path(__file__).resolve()),
             identity["listener"]["executable"],
             identity["engine"]["executable"],
             identity["configuration"]["path"],
+            str(settings_path),
         }
         if not required.issubset(self.contract["runtime_hashes"]):
             raise GateFailure("Missing Strata deployment/runtime pins")
+        if file_hash(settings_path) != self.contract["runtime_hashes"][str(settings_path)]:
+            raise GateFailure("Managed Pi settings changed after submission")
+        settings = read_json(settings_path)
+        if not isinstance(settings, dict) or any(
+            not isinstance(settings.get(name), dict) or settings[name].get("enabled") is not False
+            for name in ("retry", "compaction")
+        ):
+            raise GateFailure("Strata requires Pi retries and compaction explicitly disabled")
         self.identity = identity
         self.server = ExistingService(identity["listener"]["pid"])
         self.server_owned = False

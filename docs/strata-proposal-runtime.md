@@ -11,7 +11,10 @@ behavior. The external profile requires `backend: external_strata`,
 `provider_id: strata-local`, `review_mode: external_codex`, and all three
 `model_roles` pinned to the actual API model ID. Use `tools/pi-local/strata-provider.ts`
 and `tools/pi-local/strata-worker.md`; the existing governance gate must be the
-last extension. Keep retry disabled in the dedicated managed Pi directory.
+last extension. The dedicated managed Pi `settings.json` must be pinned in
+`runtime_hashes` and contain `retry.enabled: false` and `compaction.enabled: false`.
+Missing pins, changed bytes, default settings or enabled automatic requests
+reject the profile before a Pi process starts.
 
 ## Freeze the existing service
 
@@ -93,6 +96,8 @@ before further trials. Three consecutive failed candidates stop the campaign;
 infrastructure, permissions, resource, budget, identity or scope failures stop
 immediately without repair. A `STOP` file requests cancellation. Resume never
 replays an interrupted job and retains the original absolute deadline.
+An interrupted active Strata job is recorded as an infrastructure failure and
+stops a resumed campaign even when an earlier trial succeeded.
 
 Every successful trial remains an isolated external-review proposal. Repeated
 successful trials are reliability measurements; they do not establish an
