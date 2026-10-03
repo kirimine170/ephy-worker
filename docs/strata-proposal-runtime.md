@@ -58,6 +58,11 @@ checks raw HTTP POST counts with the actual pinned Pi binary against a synthetic
 server. Its controls cover caps 1/2/8, remaining output tokens, an in-flight
 response, scope/model/identity failure, HTTP errors without hidden retries, and
 evidence-storage failure before sending.
+The guard removes Pi's competing `max_completion_tokens` field, which Strata
+otherwise prioritizes over `max_tokens`. Raw POST controls check both fields,
+including a later payload hook and a reduced remaining budget. A response whose
+reported usage exceeds its admitted per-response cap terminates the owned Pi
+process before any next request, even when the total stage budget remains.
 This is transport evidence, not a real model or completed workflow.
 
 An already admitted response can finish within its stage deadline. Timeouts kill

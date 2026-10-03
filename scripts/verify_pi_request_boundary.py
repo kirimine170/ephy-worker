@@ -57,7 +57,11 @@ def run_case(pi: Path, directory: Path, case: str, limit: int) -> dict:
             payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             with lock:
                 state["posts"].append(
-                    {"model": payload.get("model"), "max_tokens": payload.get("max_tokens")}
+                    {
+                        "model": payload.get("model"),
+                        "max_tokens": payload.get("max_tokens"),
+                        "max_completion_tokens": payload.get("max_completion_tokens"),
+                    }
                 )
                 number = len(state["posts"])
                 state["active"] += 1
@@ -107,8 +111,20 @@ def run_case(pi: Path, directory: Path, case: str, limit: int) -> dict:
                         "choices": [],
                         "usage": {
                             "prompt_tokens": 1,
-                            "completion_tokens": 2 if case == "tokens" else 1,
-                            "total_tokens": 3 if case == "tokens" else 2,
+                            "completion_tokens": 2
+                            if case == "tokens"
+                            else 7
+                            if case == "response_cap"
+                            else (5 if number == 1 else 2)
+                            if case == "remaining"
+                            else 1,
+                            "total_tokens": 3
+                            if case == "tokens"
+                            else 8
+                            if case == "response_cap"
+                            else (6 if number == 1 else 3)
+                            if case == "remaining"
+                            else 2,
                         },
                     },
                 ]
@@ -145,7 +161,7 @@ def run_case(pi: Path, directory: Path, case: str, limit: int) -> dict:
                 "provider_id": "strata-local",
                 "allowed_files": [],
                 "max_requests": limit,
-                "output_token_budget": 2 if case == "tokens" else 200,
+                "output_token_budget": 2 if case == "tokens" else 7 if case == "remaining" else 200,
                 "max_response_tokens": 6,
             }
         ),
@@ -208,6 +224,14 @@ def run_case(pi: Path, directory: Path, case: str, limit: int) -> dict:
         "--",
         "Read docs/readable.md repeatedly. This is a synthetic transport fixture; no other tools.",
     ]
+    if case == "later_hook":
+        later = directory / "later-payload-hook.ts"
+        later.write_text(
+            'export default function(pi) { pi.on("before_provider_request", '
+            "(event) => ({ ...event.payload, fixture_tail: true })); }",
+            encoding="utf-8",
+        )
+        argv[argv.index("--session") : argv.index("--session")] = ["--extension", str(later)]
     started = time.monotonic()
     try:
         with (directory / "stdout.jsonl").open("wb") as out, (directory / "stderr.log").open("wb") as err:
@@ -239,7 +263,9 @@ def run_case(pi: Path, directory: Path, case: str, limit: int) -> dict:
         0
         if case in ("identity", "model", "trace_io")
         else 1
-        if case in ("tokens", "scope", "http_error", "in_flight")
+        if case in ("tokens", "scope", "http_error", "in_flight", "response_cap", "later_hook")
+        else 2
+        if case == "remaining"
         else limit
     )
     admitted = [event for event in events if event["kind"] == "provider_request"]
@@ -248,7 +274,11 @@ def run_case(pi: Path, directory: Path, case: str, limit: int) -> dict:
         len(state["posts"]) == expected
         and len(admitted) == expected
         and state["maximum_active"] <= 1
-        and all(p["max_tokens"] == (2 if case == "tokens" else 6) for p in state["posts"])
+        and all(
+            p["max_tokens"] == (2 if case == "tokens" or (case == "remaining" and i == 1) else 6)
+            and p["max_completion_tokens"] is None
+            for i, p in enumerate(state["posts"])
+        )
     )
     if case == "trace_io":
         passed = passed and code == 78 and not trace.exists()
@@ -273,6 +303,7 @@ def run_case(pi: Path, directory: Path, case: str, limit: int) -> dict:
         "elapsed_seconds": time.monotonic() - started,
         "passed": passed,
         "real_model_contacted": False,
+        "captured_cap_fields": state["posts"],
     }
     (directory / "result.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     return result
@@ -297,6 +328,9 @@ def main():
         ("model", 8),
         ("http_error", 1),
         ("trace_io", 1),
+        ("response_cap", 8),
+        ("remaining", 8),
+        ("later_hook", 1),
     ):
         result = run_case(pi, args.artifacts / case, case, limit)
         results.append(result)
@@ -310,7 +344,7 @@ def main():
         REPOSITORY / "tools/pi-local/strata-provider.ts",
     ]
     summary = {
-        "passed": len(results) == 10 and all(r["passed"] for r in results),
+        "passed": len(results) == 13 and all(r["passed"] for r in results),
         "results": results,
         "sha256": {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in files},
         "synthetic_fixture_only": True,

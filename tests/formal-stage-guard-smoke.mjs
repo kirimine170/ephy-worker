@@ -44,10 +44,23 @@ try {
   assert.equal(fresh("auditor").call("tool_call", tool("write", "docs/new.md")).block, true);
   assert.equal(fresh("planner").call("tool_call", tool("write", "docs/new.md")).block, true);
   const budget = fresh();
+  const constrained = budget.call("before_provider_request", {
+    payload: { model: "test-model", max_completion_tokens: 16384 } });
+  assert.equal(constrained.max_tokens, 6);
+  assert.equal("max_completion_tokens" in constrained, false);
+  budget.call("message_end", { message: { role: "assistant", model: "test-model", provider: "dual-local",
+    usage: { output: 4 }, stopReason: "stop" } });
   assert.equal(budget.call("before_provider_request", { payload: { model: "test-model" } }).max_tokens, 6);
   budget.call("message_end", { message: { role: "assistant", model: "test-model", provider: "dual-local",
-    usage: { output: 8 }, stopReason: "stop" } });
+    usage: { output: 4 }, stopReason: "stop" } });
   assert.equal(budget.call("before_provider_request", { payload: { model: "test-model" } }).max_tokens, 2);
+  const oversized = fresh();
+  oversized.call("before_provider_request", { payload: { model: "test-model" } });
+  assert.throws(() => oversized.call("message_end", { message: {
+    role: "assistant", model: "test-model", provider: "dual-local",
+    usage: { output: 7 }, stopReason: "stop" } }), /MANAGED_STAGE_EXIT/);
+  assert.throws(() => oversized.call("before_provider_request", {
+    payload: { model: "test-model" } }), /MANAGED_STAGE_EXIT/);
   assert.throws(() => fresh().call("before_provider_request", { payload: { model: "wrong" } }), /MANAGED_STAGE_EXIT/);
   assert.throws(() => fresh().call("message_end", { message: { role: "assistant", model: "test-model",
     provider: "dual-local", stopReason: "stop" } }), /MANAGED_STAGE_EXIT/);
@@ -55,7 +68,9 @@ try {
   for (let n = 0; n < 3; n++) capped.call("before_provider_request", { payload: { model: "test-model" } });
   assert.throws(() => capped.call("before_provider_request", { payload: { model: "test-model" } }), /MANAGED_STAGE_EXIT/);
   assert.ok(readFileSync(capped.trace, "utf8").includes("violation"));
-  fresh("implementer", "strata-local").call("message_end", { message: {
+  const strata = fresh("implementer", "strata-local");
+  strata.call("before_provider_request", { payload: { model: "test-model" } });
+  strata.call("message_end", { message: {
     role: "assistant", model: "test-model", provider: "strata-local",
     usage: { output: 1 }, stopReason: "stop" } });
   assert.throws(() => fresh("implementer", "strata-local").call("message_end", { message: {

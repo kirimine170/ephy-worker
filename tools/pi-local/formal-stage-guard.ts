@@ -15,6 +15,7 @@ export default function (pi: ExtensionAPI) {
   let failed = false;
   let outputTokens = 0;
   let requests = 0;
+  let responseTokenCap = 0;
   const record = (kind: string, value: object) => {
     try { appendFileSync(trace, JSON.stringify({ at: new Date().toISOString(), kind, ...value }) + "\n"); }
     catch { stopManagedStage("Could not persist formal stage evidence"); }
@@ -69,9 +70,13 @@ export default function (pi: ExtensionAPI) {
       stopRequest("Stage request/token budget exhausted");
     }
     ++requests;
-    record("provider_request", { model: event.payload.model, requests, outputTokens });
-    return { ...event.payload,
-      max_tokens: Math.min(config.max_response_tokens, config.output_token_budget - outputTokens) };
+    responseTokenCap = Math.min(config.max_response_tokens, config.output_token_budget - outputTokens);
+    const payload = { ...event.payload, max_tokens: responseTokenCap };
+    // Pi can supply this alias even for local providers. Strata prioritizes it
+    // over max_tokens, so retaining its larger value defeats the frozen cap.
+    delete payload.max_completion_tokens;
+    record("provider_request", { model: payload.model, requests, outputTokens, responseTokenCap });
+    return payload;
   });
   pi.on("tool_call", (event: any) => {
     if (failed) return reject("Formal stage is permanently latched");
@@ -105,7 +110,10 @@ export default function (pi: ExtensionAPI) {
       }
       outputTokens += output;
       record("assistant", { model: message.model, provider: message.provider, outputTokens,
-        stopReason: message.stopReason });
+        responseTokens: output, responseTokenCap, stopReason: message.stopReason });
+      if (output > responseTokenCap) {
+        stopRequest("Provider exceeded per-response token cap");
+      }
       if (outputTokens > config.output_token_budget) {
         stopRequest("Provider exceeded output-token cap");
       }
