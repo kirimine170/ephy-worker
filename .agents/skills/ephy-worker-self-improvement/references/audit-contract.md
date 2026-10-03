@@ -6,13 +6,13 @@
 - Evidence manifest schema：`ephy.evidence-manifest.v1`
 - Output schema：`ephy.audit-result.v1`
 
-Use this contract only after Qwen implementation and independent verification have finished．The auditor evaluates the frozen final candidate and workflow evidence．It never implements，repairs，re-runs checks，or authorizes external application．
+Use this contract only after designated Pi implementation and independent verification have finished．The auditor evaluates the frozen final candidate and workflow evidence．It never implements，repairs，re-runs checks，or authorizes external application．
 
 ## Runner-enforced preconditions
 
 The runner MUST establish these conditions outside the model．A prompt instruction is not a substitute．
 
-- Start a fresh gpt-oss process after the final independent verification．Do not reuse the planner or implementer session．
+- Start a fresh designated-model process after the final independent verification．Do not reuse the planner or implementer session．
 - Expose only a frozen audit bundle．Do not give the auditor a writable live candidate．The absolute `$1` path is only the entrypoint to `audit-input.json`; every path it references MUST be normalized and relative to that file's bundle root．
 - Validate `audit-input.json` against [the audit input schema](audit-input.schema.json) and its evidence manifest against [the evidence manifest schema](evidence-manifest.schema.json) before launching the model．Resolve each path canonically and reject `..`，absolute paths，drive prefixes，backslashes，path escapes，symlink or reparse-point escapes，duplicates，and missing files．
 - After the bundle is frozen，validate the evidence manifest and recompute every declared artifact's raw-byte size and SHA-256．Write a runner-produced bundle integrity attestation that records the manifest SHA-256，manifest-schema result，recomputed values，and path-safety result．Then build the audit input that binds both the manifest and attestation by path and SHA-256．
@@ -111,14 +111,14 @@ Require this stage structure，where `N` is one initial attempt plus no more tha
 
 ```text
 preflight
-→ gpt-oss lead plan
+→ designated model plan
 → attempt 1..N {
-    Qwen implementation or repair
+    designated Pi implementation or repair
     → independent verification
     → candidate-origin failure and remaining attempts only: next attempt
   }
 → freeze final candidate and audit bundle
-→ fresh gpt-oss audit
+→ fresh designated-model audit
 → proposal stop
 ```
 
@@ -126,15 +126,19 @@ Check that：
 
 - preflight passed before any agent implementation．
 - required policy，skill，task，evaluation，environment，and audit identities were delivered and acknowledged before the relevant stage．
-- the gpt-oss planner did not edit the candidate．
-- the designated Qwen process performed every implementation or repair attempt．
+- the designated-model planner did not edit the candidate．
+- the designated Pi process performed every implementation or repair attempt．
 - expected and observed model identities and immutable hashes agree．
-- independent verification ran after each attempt and after Qwen's final change．
+- independent verification ran after each attempt and after the implementer's final change．
 - repairs stayed within the fixed limit，began only after a candidate-origin failure，and did not change the frozen contracts．
 - environment or runner failures were not passed to candidate repair．
 - the final candidate and bundle were frozen only after the last independent verification．
 - the audited patch and evidence hashes match the independently verified final state．
 - the Job stopped as an unapplied proposal without commit，push，PR，merge，apply，or deploy．
+
+The frozen bundle precedes audit，so it cannot contain a future stop event．For the proposal-stop check，the auditor assesses the frozen runner stop obligation and absence of adoption actions up to audit．After audit exits，the runner MUST record the actual stop in a separate post-audit workflow artifact，bind the frozen workflow prefix，audit result，trace，and completed auditor process，and bind that artifact in its execution attestation before exposing `review_ready`．Integration MUST revalidate this postcondition．An auditor PASS alone never proves that future event．
+
+Every cited artifact and claimed document read MUST have runner-observed successful full tool-result delivery or byte-matching forced context delivery．A call without a successful complete result，partial／truncated output，grep／directory listing，or model assertion does not establish a full read．If required content cannot be delivered completely，do not invent reads or citations; stop without approval．
 
 ## Decision rules
 

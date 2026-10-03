@@ -125,8 +125,8 @@ class GovernanceContractTests(unittest.TestCase):
         self.assertIn(POLICY_ID, policy)
         self.assertEqual(policy.rstrip().splitlines()[-1], POLICY_MARKER)
         self.assertIn("preflight", policy)
-        self.assertIn("Qwen implementation", policy)
-        self.assertIn("fresh gpt-oss audit", policy)
+        self.assertIn("Pi implementation", policy)
+        self.assertIn("fresh designated-model audit", policy)
         self.assertIn("proposal stop", policy)
         self.assertIn("元のユーザー依頼と過去会話を非破壊的に退避", policy)
         self.assertIn("一つのmodel-visible tool result", policy)
@@ -210,8 +210,8 @@ class GovernanceContractTests(unittest.TestCase):
         self.assertIn("references/eval-contract.md", skill)
         self.assertIn("references/audit-contract.md", skill)
         self.assertIn("references/audit-result.schema.json", skill)
-        self.assertIn("fresh gpt-oss", skill)
-        self.assertIn("Qwen", skill)
+        self.assertIn("fresh designated-model", skill)
+        self.assertIn("designated Pi worker", skill)
 
     def test_audit_contract_and_prompt_are_fail_closed(self) -> None:
         contract = read(

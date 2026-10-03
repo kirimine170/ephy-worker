@@ -143,6 +143,7 @@ class WorkingTreeSnapshot:
         self.source_revision = source_revision
         self.untracked_paths = untracked_paths
         self.temporary_root: Path | None = None
+        self._owned_root: Path | None = None
         self.repository: Path | None = None
         self.manifest: dict | None = None
 
@@ -174,6 +175,7 @@ class WorkingTreeSnapshot:
     def create(self) -> tuple[Path, str, dict]:
         files = self.files()
         self.temporary_root = Path(tempfile.mkdtemp(prefix="ephy-worker-source-"))
+        self._owned_root = self.temporary_root.resolve(strict=True)
         self.repository = self.temporary_root / "repository"
         self.repository.mkdir()
         copied: list[dict] = []
@@ -232,8 +234,31 @@ class WorkingTreeSnapshot:
 
     def cleanup(self) -> None:
         if self.temporary_root is not None:
-            shutil.rmtree(self.temporary_root)
+            root = self.temporary_root
+            if root.is_symlink() or root.resolve(strict=True) != self._owned_root:
+                raise OSError("Snapshot cleanup target is not the allocated directory")
+
+            def remove_readonly_object(function, path, exception):
+                target = Path(path)
+                metadata = target.lstat()
+                # Git marks its own objects read-only on Windows. Clear only that
+                # file attribute inside this allocation; ACL failures stay errors.
+                if (
+                    os.name != "nt"
+                    or not isinstance(exception, PermissionError)
+                    or function is not os.unlink
+                    or not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_nlink != 1
+                    or not getattr(metadata, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_READONLY
+                    or not target.resolve(strict=True).is_relative_to(self._owned_root)
+                ):
+                    raise exception
+                target.chmod(metadata.st_mode | stat.S_IWRITE)
+                function(path)
+
+            shutil.rmtree(root, onexc=remove_readonly_object)
             self.temporary_root = None
+            self._owned_root = None
             self.repository = None
 
 

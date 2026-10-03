@@ -13,6 +13,7 @@
 - 環境不備をcandidateのrepairへ渡しません．agentの自己申告やtest合格だけを承認根拠にしません．
 - proposal-onlyはcommit，push，PR，merge，apply，deployを許可しません．これらは別の明示的なユーザー承認が必要です．
 - managed Piの正式Jobでは，runnerがpolicy本文とhashをsystem payloadへ注入し，`governance_ack`成立前の変更可能toolを遮断します．このgateが使えない場合，正式な実装または監査として続行しません．
+- 今回の明示承認されたCodex bootstrapについては，[限定採用経路のADR](docs/adr/0004-authorized-codex-bootstrap-adoption.md)をProposedの整合案としてレビューします．この草案はactive policy例外やmerge readinessを成立させません．一般の自己改善Jobの来歴，監査，停止，権限gateは維持します．
 
 ## Code Review Rules
 
