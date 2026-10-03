@@ -29,7 +29,7 @@ from ephy_worker.formal_artifacts import (
     validate_schema,
     write_json,
 )
-from ephy_worker.formal_campaign import run_campaign
+from ephy_worker.formal_campaign import proposal_valid, run_campaign
 from ephy_worker.formal_runtime import (
     FormalRunner,
     command_environment,
@@ -825,9 +825,105 @@ def retain_campaign_fixture_freeze(root, plan, state):
     state["verifier_freeze_sha256"] = digest(encode(freeze))
 
 
+def mock_campaign_audit_for_identity_controls(monkeypatch):
+    # These legacy synthetic jobs isolate launch/freeze identity and never run an audit.
+    # Keep their existing assertions; the formal gate has separate rejection controls below.
+    monkeypatch.setattr(
+        "ephy_worker.formal_runtime.verify_proposal_for_integration",
+        lambda path: path.parent / "offline-control.patch",
+    )
+
+
+def test_formal_campaign_status_requires_audited_artifacts(tmp_path):
+    runner = verifier_runner(tmp_path)
+    draft = verifier_draft(runner)
+    draft["runtime"]["governance_root"] = str(REPOSITORY)
+    draft["controls"] = {
+        name: file_hash(REPOSITORY / relative) for name, relative in CONTROL_PATHS.items()
+    }
+    for name in ("checker", "checker_controls"):
+        path = tmp_path / (name + ".txt")
+        path.write_bytes(b"offline frozen checker fixture")
+        draft["contract"][name] = str(path)
+        draft["contract"][name + "_sha256"] = file_hash(path)
+    job_file = submit(freeze_submission_identity(draft), tmp_path / "state")
+    job = read_json(job_file)
+    job.update(status="review_ready", outcome="accepted_proposal")
+    write_json(job_file, job, exclusive=False)
+    original = job_file.read_bytes()
+    # Use the real read-only verifier: a status cannot replace the missing audit bundle.
+    with pytest.raises(FileNotFoundError, match="audit-input"):
+        proposal_valid(job_file)
+    assert job_file.read_bytes() == original
+
+
+@pytest.mark.parametrize("rejection", ["none", "candidate", "audit_bundle", "trace", "patch"])
+def test_campaign_resume_rechecks_formal_gate_before_next_job(tmp_path, monkeypatch, rejection):
+    from ephy_worker import formal_runtime as formal
+
+    plan_file, root, _ = campaign_fixture(tmp_path)
+    plan = read_json(plan_file)
+    root.mkdir()
+    first = submit(freeze_submission_identity(plan["specs"][0]), root)
+    job = read_json(first)
+    job.update(status="review_ready", outcome="accepted_proposal")
+    write_json(first, job, exclusive=False)
+    state = {
+        "plan_sha256": digest(encode(plan)),
+        "status": "running",
+        "results": [{"job_file": str(first), "status": "review_ready"}],
+        "next_index": 1,
+        "consecutive_failures": 0,
+        "active_job": None,
+        "elapsed_seconds": 0,
+    }
+    freeze = {
+        "plan_sha256": state["plan_sha256"],
+        "verifier_identities": [
+            freeze_submission_identity(draft)["verifier_identity"] for draft in plan["specs"]
+        ],
+        "observations": [{} for _ in plan["specs"]],
+    }
+    write_json(root / "verifier-freeze.json", freeze)
+    state["verifier_freeze_sha256"] = digest(encode(freeze))
+    write_json(root / "campaign.json", state)
+    original = first.read_bytes()
+    calls, launches = [], []
+
+    def verify(job_file):
+        # Controller routing control; production artifact validation is not mocked
+        # in the missing-bundle control above or the existing artifact controls.
+        calls.append(job_file)
+        if rejection != "none":
+            raise GateFailure("Frozen formal proposal rejected: " + rejection)
+        return job_file.parent / "unapplied.patch"
+
+    def run(runner):
+        if rejection != "none":
+            pytest.fail("Rejected first proposal reached a new model Job")
+        launches.append(runner.job["id"])
+        runner.state("review_ready", "Offline controller routing control")
+
+    monkeypatch.setattr(formal, "verify_proposal_for_integration", verify)
+    monkeypatch.setattr(FormalRunner, "run", run)
+    if rejection == "none":
+        result = run_campaign(plan_file, root, resume=True)
+        assert result["status"] == "completed" and result["next_index"] == 2
+        assert len(calls) == 2 and calls[0] == first and len(launches) == 1
+    else:
+        with pytest.raises(GateFailure, match="Frozen formal proposal rejected: " + rejection):
+            run_campaign(plan_file, root, resume=True)
+        result = read_json(root / "campaign.json")
+        assert result["status"] == "failed" and result["next_index"] == 1
+        assert calls == [first] and not launches
+        assert len(list((root / "jobs").iterdir())) == 1
+    assert first.read_bytes() == original
+
+
 @pytest.mark.parametrize("status", ["completed", "stopped", "failed"])
 @pytest.mark.parametrize("mutation", ["none", "missing", "changed"])
 def test_terminal_campaign_resume_validates_freeze_before_return(tmp_path, monkeypatch, status, mutation):
+    mock_campaign_audit_for_identity_controls(monkeypatch)
     plan_file, root, _ = campaign_fixture(tmp_path)
 
     def run(runner):
@@ -896,6 +992,7 @@ def test_resume_rejects_lost_freeze_before_mutating_active_job_or_history(
 def test_standard_campaign_freezes_drafts_then_stops_drift_before_next_submission(
     tmp_path, monkeypatch, mutation
 ):
+    mock_campaign_audit_for_identity_controls(monkeypatch)
     plan_file, root, _ = campaign_fixture(tmp_path)
     calls = []
 
@@ -929,6 +1026,7 @@ def test_standard_campaign_freezes_drafts_then_stops_drift_before_next_submissio
 def test_fresh_campaign_validates_retained_evidence_before_reporting_completion(
     tmp_path, monkeypatch, mutation
 ):
+    mock_campaign_audit_for_identity_controls(monkeypatch)
     plan_file, root, _ = campaign_fixture(tmp_path)
     calls = []
 
@@ -974,6 +1072,9 @@ import sys
 from pathlib import Path
 from ephy_worker.formal_runtime import FormalRunner
 from ephy_worker.formal_campaign import run_campaign
+import ephy_worker.formal_runtime as formal
+# This child tests launch-environment identity, not formal audit provenance.
+formal.verify_proposal_for_integration=lambda path: path.parent/'offline-control.patch'
 def run(runner):
     runner.verifier_identity()
     runner.state('review_ready','Offline identity control only')
@@ -995,6 +1096,7 @@ run_campaign(Path(sys.argv[1]),Path(sys.argv[2]))
 
 @pytest.mark.parametrize("mutation", ["none", "PATH", "record", "missing"])
 def test_campaign_resume_preserves_original_expectations_and_deadline(tmp_path, monkeypatch, mutation):
+    mock_campaign_audit_for_identity_controls(monkeypatch)
     plan_file, root, _ = campaign_fixture(tmp_path)
     calls = []
 

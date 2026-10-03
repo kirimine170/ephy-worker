@@ -18,7 +18,12 @@ def proposal_valid(job_file: Path) -> bool:
 
         verify_external_proposal(job_file)
         return True
-    return job["status"] == "review_ready"
+    if job["status"] == "review_ready":
+        from .formal_runtime import verify_proposal_for_integration
+
+        verify_proposal_for_integration(job_file)
+        return True
+    return False
 
 
 def retained_verifier_freeze(state_root: Path, state: dict, identity: str, count: int) -> dict:
