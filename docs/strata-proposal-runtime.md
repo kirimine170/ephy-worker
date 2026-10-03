@@ -150,7 +150,11 @@ job. Private redacted `verifier-submission-<index>.json` records preserve these
 comparisons, including rejected submissions with no job. Resume retains the
 original expectations and absolute deadline; missing or changed freeze evidence
 cannot be recovered by remeasuring. Legacy interrupted jobs are still accounted
-without replay, but no new trial can proceed without the bound freeze record.
+without replay. Every terminal-state return, including resume of a completed,
+stopped or failed campaign, also validates the retained freeze record. Missing
+or modified evidence rejects rather than reporting the old terminal result;
+the historical state and jobs remain unchanged. No new trial can proceed without
+the bound freeze record.
 
 Every successful trial remains an isolated external-review proposal. Repeated
 successful trials are reliability measurements; they do not establish an

@@ -342,6 +342,7 @@ def test_campaign_resume_never_replays_interrupted_job(tmp_path, monkeypatch):
         "active_job": str(job_file),
         "elapsed_seconds": 0,
     }
+    retain_campaign_fixture_freeze(state_root, plan, state)
     (state_root / "campaign.json").write_bytes(encode(state))
     monkeypatch.setattr(
         "ephy_worker.formal_campaign.FormalRunner.run",
@@ -813,6 +814,50 @@ def campaign_fixture(tmp_path):
     return path, tmp_path / "campaign", runner
 
 
+def retain_campaign_fixture_freeze(root, plan, state):
+    # Legacy interruption fixtures are synthetic metadata, never live inference.
+    freeze = {
+        "plan_sha256": digest(encode(plan)),
+        "verifier_identities": [spec["verifier_identity"] for spec in plan["specs"]],
+        "observations": [{} for _ in plan["specs"]],
+    }
+    write_json(root / "verifier-freeze.json", freeze)
+    state["verifier_freeze_sha256"] = digest(encode(freeze))
+
+
+@pytest.mark.parametrize("status", ["completed", "stopped", "failed"])
+@pytest.mark.parametrize("mutation", ["none", "missing", "changed"])
+def test_terminal_campaign_resume_validates_freeze_before_return(tmp_path, monkeypatch, status, mutation):
+    plan_file, root, _ = campaign_fixture(tmp_path)
+
+    def run(runner):
+        runner.verifier_identity()
+        runner.state("review_ready", "Offline identity control only")
+
+    monkeypatch.setattr(FormalRunner, "run", run)
+    run_campaign(plan_file, root)
+    state_file = root / "campaign.json"
+    terminal = read_json(state_file)
+    terminal["status"] = status
+    write_json(state_file, terminal, exclusive=False)
+    original_state = state_file.read_bytes()
+    freeze_file = root / "verifier-freeze.json"
+    if mutation == "missing":
+        freeze_file.unlink()
+    elif mutation == "changed":
+        freeze = read_json(freeze_file)
+        freeze["verifier_identities"][0]["runtime_sha256"] = "0" * 64
+        write_json(freeze_file, freeze, exclusive=False)
+    monkeypatch.setattr(FormalRunner, "run", lambda *_: pytest.fail("Terminal campaign restarted"))
+    if mutation == "none":
+        assert run_campaign(plan_file, root, resume=True) == terminal
+    else:
+        with pytest.raises(GateFailure, match="cannot recapture"):
+            run_campaign(plan_file, root, resume=True)
+    assert state_file.read_bytes() == original_state
+    assert len(list((root / "jobs").iterdir())) == 2
+
+
 @pytest.mark.parametrize("mutation", ["none", "PATH", "LANG"])
 def test_standard_campaign_freezes_drafts_then_stops_drift_before_next_submission(
     tmp_path, monkeypatch, mutation
@@ -844,6 +889,34 @@ def test_standard_campaign_freezes_drafts_then_stops_drift_before_next_submissio
     assert comparison["expected_identity"] == freeze["verifier_identities"][1]
     assert comparison["matches"] is (mutation == "none")
     assert len(list((root / "jobs").iterdir())) == len(calls)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "changed"])
+def test_fresh_campaign_validates_retained_evidence_before_reporting_completion(
+    tmp_path, monkeypatch, mutation
+):
+    plan_file, root, _ = campaign_fixture(tmp_path)
+    calls = []
+
+    def run(runner):
+        runner.verifier_identity()
+        calls.append(runner.job["id"])
+        runner.state("review_ready", "Offline identity control only")
+        if len(calls) == 2:
+            path = root / "verifier-freeze.json"
+            if mutation == "missing":
+                path.unlink()
+            else:
+                record = read_json(path)
+                record["verifier_identities"][1]["runtime_sha256"] = "0" * 64
+                write_json(path, record, exclusive=False)
+
+    monkeypatch.setattr(FormalRunner, "run", run)
+    with pytest.raises(GateFailure, match="cannot recapture"):
+        run_campaign(plan_file, root)
+    assert read_json(root / "campaign.json")["status"] == "completed"
+    assert len(calls) == 2 and len(list((root / "jobs").iterdir())) == 2
+    assert all(read_json(job)["status"] == "review_ready" for job in (root / "jobs").glob("*/job.json"))
 
 
 def test_standard_campaign_refuses_pre_frozen_parent_spec(tmp_path, monkeypatch):

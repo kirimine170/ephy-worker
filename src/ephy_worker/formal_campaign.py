@@ -21,6 +21,21 @@ def proposal_valid(job_file: Path) -> bool:
     return job["status"] == "review_ready"
 
 
+def retained_verifier_freeze(state_root: Path, state: dict, identity: str, count: int) -> dict:
+    """Validate retained expectations even when no further trial will execute."""
+    try:
+        freeze = read_json(state_root / "verifier-freeze.json")
+    except FileNotFoundError as exc:
+        raise GateFailure("Campaign verifier freeze is missing; cannot recapture") from exc
+    if (
+        state.get("verifier_freeze_sha256") != digest(encode(freeze))
+        or freeze.get("plan_sha256") != identity
+        or len(freeze.get("verifier_identities", [])) != count
+    ):
+        raise GateFailure("Campaign verifier freeze is missing or changed; cannot recapture")
+    return freeze
+
+
 def run_campaign(plan_file: Path, state_root: Path, *, resume: bool = False) -> dict:
     plan = read_json(plan_file)
     if set(plan) != {"specs", "max_consecutive_failures", "timeout_seconds", "resource_lock"}:
@@ -42,6 +57,7 @@ def run_campaign(plan_file: Path, state_root: Path, *, resume: bool = False) -> 
             if state["plan_sha256"] != identity:
                 raise GateFailure("Cannot resume under a changed campaign plan")
             if state["status"] in ("completed", "stopped", "failed"):
+                retained_verifier_freeze(state_root, state, identity, len(plan["specs"]))
                 return state
             # Interrupted candidate stays preserved. It counts as a failed attempt;
             # no unknown implementation/check/audit is replayed as completed.
@@ -116,23 +132,16 @@ def run_campaign(plan_file: Path, state_root: Path, *, resume: bool = False) -> 
 
         save()
         if state["status"] == "stopped":
+            retained_verifier_freeze(state_root, state, identity, len(plan["specs"]))
             return state
         if state["consecutive_failures"] >= plan["max_consecutive_failures"]:
             state.update(status="stopped", reason="Consecutive candidate failure limit reached")
             save()
+            retained_verifier_freeze(state_root, state, identity, len(plan["specs"]))
             return state
         try:
             # Resume loads the original expectations, never today's environment.
-            try:
-                freeze = read_json(state_root / "verifier-freeze.json")
-            except FileNotFoundError as exc:
-                raise GateFailure("Campaign verifier freeze is missing; cannot recapture") from exc
-            if (
-                state.get("verifier_freeze_sha256") != digest(encode(freeze))
-                or freeze.get("plan_sha256") != identity
-                or len(freeze.get("verifier_identities", [])) != len(plan["specs"])
-            ):
-                raise GateFailure("Campaign verifier freeze is missing or changed; cannot recapture")
+            freeze = retained_verifier_freeze(state_root, state, identity, len(plan["specs"]))
             while state["next_index"] < len(plan["specs"]):
                 if state["results"] and not proposal_valid(Path(state["results"][0]["job_file"])):
                     state["status"] = "stopped"
@@ -231,6 +240,7 @@ def run_campaign(plan_file: Path, state_root: Path, *, resume: bool = False) -> 
             raise
         finally:
             save()
+        retained_verifier_freeze(state_root, state, identity, len(plan["specs"]))
         return state
 
 

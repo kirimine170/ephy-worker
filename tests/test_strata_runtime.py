@@ -326,7 +326,7 @@ def test_external_profile_pins_and_disables_pi_automatic_requests(tmp_path, muta
 def test_resume_stops_interrupted_strata_after_prior_success(tmp_path, monkeypatch):
     from datetime import UTC, datetime, timedelta
 
-    from test_formal_runtime import contract
+    from test_formal_runtime import contract, retain_campaign_fixture_freeze
 
     from ephy_worker import formal_campaign as campaign
     from ephy_worker.formal_artifacts import digest, encode, read_json
@@ -373,6 +373,7 @@ def test_resume_stops_interrupted_strata_after_prior_success(tmp_path, monkeypat
         "elapsed_seconds": 2,
         "deadline_at": deadline,
     }
+    retain_campaign_fixture_freeze(state_root, plan, state)
     write_json(state_root / "campaign.json", state)
     monkeypatch.setattr(strata, "verify_external_proposal", lambda _: tmp_path / "unapplied.patch")
     monkeypatch.setattr(campaign, "submit", lambda *_: pytest.fail("No next job after interruption"))
