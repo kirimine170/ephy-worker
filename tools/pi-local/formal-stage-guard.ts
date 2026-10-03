@@ -2,6 +2,7 @@ import { appendFileSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
+import { stopManagedStage } from "./formal-stage-stop.ts";
 
 // Load BEFORE governance-gate, which remains the final payload/ack gate.
 export default function (pi: ExtensionAPI) {
@@ -14,8 +15,10 @@ export default function (pi: ExtensionAPI) {
   let failed = false;
   let outputTokens = 0;
   let requests = 0;
-  const record = (kind: string, value: object) => appendFileSync(trace,
-    JSON.stringify({ at: new Date().toISOString(), kind, ...value }) + "\n");
+  const record = (kind: string, value: object) => {
+    try { appendFileSync(trace, JSON.stringify({ at: new Date().toISOString(), kind, ...value }) + "\n"); }
+    catch { stopManagedStage("Could not persist formal stage evidence"); }
+  };
   function within(base: string, target: string) {
     const rel = relative(base, target);
     return rel !== ".." && !rel.startsWith("../") && !rel.startsWith("..\\") && !isAbsolute(rel);
@@ -25,6 +28,10 @@ export default function (pi: ExtensionAPI) {
     pi.setActiveTools([]);
     record("violation", { reason });
     return { block: true, terminate: true, reason };
+  }
+  function stopRequest(reason: string): never {
+    try { reject(reason); }
+    finally { stopManagedStage(reason); }
   }
   function pathCheck(value: string, writing: boolean) {
     const target = resolve(root, value);
@@ -51,15 +58,17 @@ export default function (pi: ExtensionAPI) {
     return undefined;
   }
   pi.on("before_provider_request", (event: any) => {
-    if (failed) throw new Error("FORMAL_STAGE_LATCHED");
+    if (failed) stopRequest("Formal stage is permanently latched");
+    if (!event?.payload || typeof event.payload !== "object") stopRequest("Invalid provider payload");
     if (event.payload.model !== config.model_id) {
-      reject("Wrong model in provider payload");
-      throw new Error("FORMAL_MODEL_MISMATCH");
+      stopRequest("Wrong model in provider payload");
     }
-    if (++requests > config.max_requests || outputTokens >= config.output_token_budget) {
-      reject("Stage request/token budget exhausted");
-      throw new Error("FORMAL_BUDGET_EXHAUSTED");
+    // Count admitted provider calls, including the currently in-flight call.
+    // Do not admit or increment the N+1 call. Pi retries are disabled by the controller.
+    if (requests >= config.max_requests || outputTokens >= config.output_token_budget) {
+      stopRequest("Stage request/token budget exhausted");
     }
+    ++requests;
     record("provider_request", { model: event.payload.model, requests, outputTokens });
     return { ...event.payload,
       max_tokens: Math.min(config.max_response_tokens, config.output_token_budget - outputTokens) };
@@ -87,21 +96,21 @@ export default function (pi: ExtensionAPI) {
   pi.on("message_end", (event: any) => {
     const message = event.message;
     if (message?.role === "assistant") {
-      if (message.model !== config.model_id || message.provider !== "dual-local") {
-        reject("Wrong model in observed assistant response");
-        throw new Error("FORMAL_MODEL_MISMATCH");
+      if (message.model !== config.model_id || message.provider !== (config.provider_id ?? "dual-local")) {
+        stopRequest("Wrong model in observed assistant response");
       }
       const output = message.usage?.output;
       if (!Number.isSafeInteger(output) || output < 0) {
-        reject("Missing model usage evidence");
-        throw new Error("FORMAL_USAGE_MISSING");
+        stopRequest("Missing model usage evidence");
       }
       outputTokens += output;
       record("assistant", { model: message.model, provider: message.provider, outputTokens,
         stopReason: message.stopReason });
       if (outputTokens > config.output_token_budget) {
-        reject("Provider exceeded output-token cap");
-        throw new Error("FORMAL_BUDGET_EXHAUSTED");
+        stopRequest("Provider exceeded output-token cap");
+      }
+      if (["error", "aborted", "length"].includes(message.stopReason)) {
+        stopRequest("Provider returned a failed assistant response");
       }
     }
   });

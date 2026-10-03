@@ -4,10 +4,21 @@ from __future__ import annotations
 
 import argparse
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from .formal_artifacts import GateFailure, digest, encode, now, read_json, write_json
 from .formal_runtime import FormalRunner, exclusive_lock, submit
+
+
+def proposal_valid(job_file: Path) -> bool:
+    job = read_json(job_file)
+    if job["status"] == "external_review_pending":
+        from .strata_runtime import verify_external_proposal
+
+        verify_external_proposal(job_file)
+        return True
+    return job["status"] == "review_ready"
 
 
 def run_campaign(plan_file: Path, state_root: Path, *, resume: bool = False) -> dict:
@@ -18,6 +29,11 @@ def run_campaign(plan_file: Path, state_root: Path, *, resume: bool = False) -> 
         raise GateFailure("Campaign must have finite jobs and a failure stop")
     if type(plan["timeout_seconds"]) is not int or not 1 <= plan["timeout_seconds"] <= 86400:
         raise GateFailure("Campaign deadline must be finite and <= 24 hours")
+    if (
+        any(spec["runtime"].get("backend") == "external_strata" for spec in plan["specs"])
+        and plan["timeout_seconds"] > 14400
+    ):
+        raise GateFailure("External Strata campaigns are bounded to four hours")
     identity = digest(encode(plan))
     with exclusive_lock(Path(plan["resource_lock"])):
         state_path = state_root / "campaign.json"
@@ -32,7 +48,12 @@ def run_campaign(plan_file: Path, state_root: Path, *, resume: bool = False) -> 
             if state.get("active_job"):
                 job_file = Path(state["active_job"])
                 job = read_json(job_file)
-                if job["status"] not in ("review_ready", "verification_failed", "failed"):
+                if job["status"] not in (
+                    "review_ready",
+                    "external_review_pending",
+                    "verification_failed",
+                    "failed",
+                ):
                     job.update(
                         status="failed",
                         message="Controller interrupted; Job is not replayed",
@@ -42,15 +63,23 @@ def run_campaign(plan_file: Path, state_root: Path, *, resume: bool = False) -> 
                 state["results"].append({"job_file": str(job_file), "status": job["status"]})
                 state["next_index"] += 1
                 state["consecutive_failures"] = (
-                    0 if job["status"] == "review_ready" else state["consecutive_failures"] + 1
+                    0 if proposal_valid(job_file) else state["consecutive_failures"] + 1
                 )
                 state["active_job"] = None
+                if (
+                    job.get("runtime", {}).get("backend") == "external_strata"
+                    and job.get("outcome") == "infrastructure_failed"
+                ):
+                    state.update(
+                        status="stopped", reason="Interrupted Strata infrastructure failure; no replay"
+                    )
         else:
             state_root.mkdir()  # never replace an old campaign
             write_json(state_root / "plan.json", plan)
             state = {
                 "plan_sha256": identity,
                 "started_at": now(),
+                "deadline_at": (datetime.now(UTC) + timedelta(seconds=plan["timeout_seconds"])).isoformat(),
                 "status": "running",
                 "next_index": 0,
                 "consecutive_failures": 0,
@@ -68,14 +97,20 @@ def run_campaign(plan_file: Path, state_root: Path, *, resume: bool = False) -> 
             write_json(state_path, state, exclusive=False)
 
         save()
+        if state["status"] == "stopped":
+            return state
         try:
             while state["next_index"] < len(plan["specs"]):
-                if state["results"] and state["results"][0]["status"] != "review_ready":
+                if state["results"] and not proposal_valid(Path(state["results"][0]["job_file"])):
                     state["status"] = "stopped"
                     state["reason"] = "First formal cycle did not validate; recursion not enabled"
                     break
                 if (
                     (state_root / "STOP").exists()
+                    or (
+                        state.get("deadline_at")
+                        and datetime.now(UTC) >= datetime.fromisoformat(state["deadline_at"])
+                    )
                     or state["elapsed_seconds"] >= plan["timeout_seconds"]
                     or state["consecutive_failures"] >= plan["max_consecutive_failures"]
                 ):
@@ -89,11 +124,26 @@ def run_campaign(plan_file: Path, state_root: Path, *, resume: bool = False) -> 
                     state["status"] = "stopped"
                     state["reason"] = "Insufficient remaining campaign budget for another whole Job"
                     break
+                if (
+                    state.get("deadline_at")
+                    and spec["contract"]["timeout_seconds"]
+                    > (datetime.fromisoformat(state["deadline_at"]) - datetime.now(UTC)).total_seconds()
+                ):
+                    state.update(
+                        status="stopped",
+                        reason="Insufficient remaining wall-clock budget for another whole Job",
+                    )
+                    break
                 job_file = submit(spec, state_root)
                 state["active_job"] = str(job_file)
                 save()
                 try:
-                    runner = FormalRunner(job_file)
+                    if spec["runtime"].get("backend", "owned_llama") != "owned_llama":
+                        from .strata_runtime import make_runner
+
+                        runner = make_runner(job_file)
+                    else:
+                        runner = FormalRunner(job_file)
                     runner.campaign_stop = state_root / "STOP"
                     runner.run()
                 except Exception:
@@ -102,15 +152,24 @@ def run_campaign(plan_file: Path, state_root: Path, *, resume: bool = False) -> 
                         raise
                 job = read_json(job_file)
                 state["results"].append({"job_file": str(job_file), "status": job["status"]})
-                state["consecutive_failures"] = (
-                    0 if job["status"] == "review_ready" else state["consecutive_failures"] + 1
-                )
+                valid = proposal_valid(job_file)
+                state["consecutive_failures"] = 0 if valid else state["consecutive_failures"] + 1
                 state["next_index"] += 1
                 state["active_job"] = None
                 save()
-                if state["next_index"] == 1 and job["status"] != "review_ready":
+                if (
+                    spec["runtime"].get("backend") == "external_strata"
+                    and job.get("outcome") == "infrastructure_failed"
+                ):
+                    state["status"] = "stopped"
+                    state["reason"] = "Strata boundary/resource/budget/infrastructure failure; no repair"
+                    break
+                if state["next_index"] == 1 and not valid:
                     state["status"] = "stopped"
                     state["reason"] = "First formal cycle did not validate; recursion not enabled"
+                    break
+                if state["consecutive_failures"] >= plan["max_consecutive_failures"]:
+                    state.update(status="stopped", reason="Consecutive candidate failure limit reached")
                     break
             else:
                 state["status"] = "completed"

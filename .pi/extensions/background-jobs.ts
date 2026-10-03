@@ -14,6 +14,7 @@ type JobStatus =
 	| "cancelling"
 	| "audit_pending"
 	| "review_ready"
+	| "external_review_pending"
 	| "verification_failed"
 	| "failed"
 	| "cancelled"
@@ -51,6 +52,7 @@ interface BackgroundJob {
 const ACTIVE = new Set<JobStatus>(["queued", "preparing", "running", "repairing", "verifying", "cancelling"]);
 function isActive(job: BackgroundJob): boolean { return ACTIVE.has(job.status) || (job.schemaVersion === 2 && job.status === "audit_pending"); }
 const TERMINAL = new Set<JobStatus>([
+	"external_review_pending",
 	"audit_pending",
 	"review_ready",
 	"verification_failed",
