@@ -59,6 +59,23 @@ arguments, invalid pins, concurrent file changes and diagnostic write failures.
 These observations do not recover an unrecorded measurement from a historical
 failed job or authorize its replay.
 
+For a background execution, construct a fresh submission draft without
+`verifier_identity`, then call `freeze_submission_identity(draft,
+observation=observation)` inside the actual controller process before submitting
+or executing any job. The returned spec copies the draft and freezes that
+controller's environment, executable resolution, checks and pinned artifacts.
+Keep the same controller environment for preflight, the bounded pilot and the
+campaign. Freezing in a tool parent and launching a different controller can
+produce a different inherited `PATH`.
+
+The freeze function refuses an already frozen spec, an existing job and unknown
+fields. It never runs from a verifier comparison and never updates a job's
+expected identity. Changes after freeze still reject before independent checks.
+An offline child-process regression freezes a distinct launch environment,
+confirms it matches, then proves changed `PATH` or check arguments reject while
+retaining the original expected identity. Historical failed jobs remain intact;
+new execution requires a new draft and job.
+
 ## Verify and stop
 
 The planner and implementer use distinct fresh Pi processes and sessions. The

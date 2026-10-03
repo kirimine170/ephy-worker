@@ -34,6 +34,7 @@ from ephy_worker.formal_runtime import (
     FormalRunner,
     command_environment,
     exclusive_lock,
+    freeze_submission_identity,
     injected_context_pins,
     observed_audit_artifacts,
     observed_verifier_identity,
@@ -784,6 +785,98 @@ def verifier_observations(runner):
     return [
         json.loads(line) for line in (runner.directory / "verifier-identity.jsonl").read_text().splitlines()
     ]
+
+
+def verifier_draft(runner):
+    return {
+        "repoRoot": str(runner.candidate),
+        "baseRevision": "d" * 40,
+        "contract": runner.contract,
+        "runtime": runner.runtime,
+        "controls": {},
+        "model_identities": {},
+    }
+
+
+def test_fresh_submission_freeze_copies_inputs_and_validates_pins(tmp_path):
+    runner = verifier_runner(tmp_path)
+    draft = verifier_draft(runner)
+    original = copy.deepcopy(draft)
+    observation = {}
+    frozen = freeze_submission_identity(draft, observation=observation)
+    assert draft == original and "verifier_identity" not in draft
+    assert frozen["verifier_identity"] == runner.job["verifier_identity"]
+    assert observation["phase"] == "complete"
+    draft["contract"]["task"] = "Changed outside the frozen copy"
+    assert frozen["contract"]["task"] == original["contract"]["task"]
+    draft["contract"]["runtime_hashes"][str(Path(sys.executable).resolve())] = "0" * 64
+    with pytest.raises(GateFailure, match="matching frozen pin"):
+        freeze_submission_identity(draft)
+
+
+@pytest.mark.parametrize("extra", ["verifier_identity", "id", "status"])
+def test_freeze_refuses_existing_specs_jobs_and_unknown_fields(tmp_path, extra):
+    draft = verifier_draft(verifier_runner(tmp_path))
+    draft[extra] = "existing"
+    with pytest.raises(GateFailure, match="unfrozen submission draft"):
+        freeze_submission_identity(draft)
+
+
+@pytest.mark.parametrize("mutation", ["none", "PATH", "checks"])
+def test_background_controller_freezes_its_launch_environment_then_rejects_drift(tmp_path, mutation):
+    runner = verifier_runner(tmp_path)
+    spec_file = tmp_path / "draft.json"
+    write_json(spec_file, {"draft": verifier_draft(runner), "directory": str(runner.directory)})
+    env = command_environment(REPOSITORY, tmp_path / "child-temp")
+    env["PATH"] += os.pathsep + str(tmp_path / "different-background-launch")
+    script = """
+import json,os,sys
+from pathlib import Path
+from ephy_worker.formal_runtime import FormalRunner,freeze_submission_identity
+from ephy_worker.formal_artifacts import GateFailure,write_json
+data=json.loads(Path(sys.argv[1]).read_text())
+observation={}
+spec=freeze_submission_identity(data['draft'],observation=observation)
+directory=Path(data['directory'])
+write_json(directory/'frozen-spec.json',spec)
+write_json(directory/'freeze-observation.json',observation)
+runner=FormalRunner.__new__(FormalRunner)
+runner.runtime,runner.contract,runner.job=spec['runtime'],spec['contract'],spec
+runner.directory=directory
+runner.verifier_identity()
+if sys.argv[2]=='PATH':
+    os.environ['PATH']+=os.pathsep+'changed-after-freeze'
+elif sys.argv[2]=='checks':
+    runner.contract['checks'][0]['argv'][1]='--version'
+try:
+    runner.verifier_identity()
+except GateFailure:
+    sys.exit(78)
+"""
+    result = subprocess.run(
+        [sys.executable, "-X", "utf8", "-c", script, str(spec_file), mutation],
+        env=env,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+    assert result.returncode == (0 if mutation == "none" else 78), result.stderr.decode()
+    frozen = read_json(runner.directory / "frozen-spec.json")["verifier_identity"]
+    assert frozen != runner.job["verifier_identity"]
+    observation = read_json(runner.directory / "freeze-observation.json")
+    assert observation["environment_value_sha256"]["PATH"] == digest(env["PATH"].encode())
+    before, after = verifier_observations(runner)
+    assert before["decision"] == "matched" and before["observed_identity"] == frozen
+    assert after["expected_identity"] == frozen
+    assert after["decision"] == ("matched" if mutation == "none" else "identity_mismatch")
+    assert (after["observed_identity"] == frozen) is (mutation == "none")
+    if mutation == "PATH":
+        assert after["environment_sha256"] != before["environment_sha256"]
+        assert after["checks_sha256"] == before["checks_sha256"]
+    if mutation == "checks":
+        assert after["checks_sha256"] != before["checks_sha256"]
+        assert after["environment_sha256"] == before["environment_sha256"]
+    assert before["files"] == after["files"]
 
 
 def test_verifier_diagnostic_is_retained_before_real_checks_and_redacts_values(tmp_path, monkeypatch):

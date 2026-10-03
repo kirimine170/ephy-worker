@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import copy
 import importlib.metadata
 import json
 import os
@@ -1380,6 +1381,29 @@ class FormalRunner:
             finally:
                 if self.server and self.server_owned:
                     stop_tree(self.server)
+
+
+def freeze_submission_identity(draft: dict, *, observation: dict | None = None) -> dict:
+    """Freeze a fresh draft inside the controller that will execute it.
+
+    This trusted submission step cannot accept an existing spec or job. Comparisons
+    never call it: a later environment, command or artifact change remains a failure.
+    """
+    if set(draft) != {
+        "repoRoot",
+        "baseRevision",
+        "contract",
+        "runtime",
+        "controls",
+        "model_identities",
+    }:
+        raise GateFailure("Verifier identity freeze requires an unfrozen submission draft")
+    spec = copy.deepcopy(draft)
+    validate_contract(spec["contract"])
+    spec["verifier_identity"] = observed_verifier_identity(
+        spec["runtime"], spec["contract"], observation=observation
+    )
+    return spec
 
 
 def submit(spec: dict, root: Path) -> Path:
