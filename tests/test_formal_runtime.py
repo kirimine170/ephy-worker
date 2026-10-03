@@ -507,10 +507,56 @@ def test_observed_verifier_matches_real_check_processes(tmp_path):
     assert result["passed"]
     assert result["verifier_identity"] == runner.job["verifier_identity"]
     assert all(check["pid"] > 0 and check["exit_code"] == 0 for check in result["checks"])
+    contract_checks = [check for check in result["checks"] if check["id"] != "diff"]
+    assert {check["id"] for check in contract_checks} == {
+        "target", "regression", "lint", "repository", "fixed"
+    }
     assert all(
-        check["executable"]["path"] == str(Path(sys.executable).resolve()) for check in result["checks"]
+        check["executable"]["path"] == str(Path(sys.executable).resolve()) for check in contract_checks
     )
     assert len({check["effective_environment_sha256"] for check in result["checks"]}) == 1
+
+
+@pytest.mark.parametrize("dirty", [False, True])
+def test_diff_check_retains_actual_command_on_success_and_failure(tmp_path, dirty):
+    runner = verifier_runner(tmp_path)
+    subprocess.run(
+        ["git", "-C", str(runner.candidate), "add", "doc.md"], check=True, capture_output=True
+    )
+    runner.contract["allowed_files"] = ["doc.md"]
+    runner.job["verifier_identity"] = observed_verifier_identity(runner.runtime, runner.contract)
+    if dirty:
+        (runner.candidate / "doc.md").write_text("trailing space \n", encoding="utf-8")
+    result = runner.run_checks("diff-evidence")
+    diff = next(check for check in result["checks"] if check["id"] == "diff")
+    assert diff["exit_code"] == (2 if dirty else 0)
+    assert diff["passed"] is (not dirty) and result["passed"] is (not dirty)
+    assert diff["argv"][1:] == ["-C", str(runner.candidate), "diff", "--check"]
+    assert diff["cwd"] == str(runner.candidate) and diff["pid"] > 0
+    assert diff["stdout_sha256"] == file_hash(runner.directory / diff["stdout"])
+    assert diff["stderr_sha256"] == file_hash(runner.directory / diff["stderr"])
+    assert diff["effective_environment_sha256"] == digest(
+        encode(command_environment(runner.candidate, runner.directory / "temp"))
+    )
+    transcript = next(record for record in runner.transcripts if record["pid"] == diff["pid"])
+    assert all(transcript[key] == value for key, value in diff.items() if key not in ("id", "passed"))
+    persisted = read_json(runner.directory / "diff-evidence-results.json")
+    assert next(check for check in persisted["checks"] if check["id"] == "diff") == diff
+
+
+def test_diff_check_candidate_mutation_is_rejected(tmp_path):
+    runner = verifier_runner(tmp_path)
+    original = runner.command
+
+    def command(argv, *args):
+        result = original(argv, *args)
+        if argv[-2:] == ["diff", "--check"]:
+            (runner.candidate / "doc.md").write_text("changed by verifier", encoding="utf-8")
+        return result
+
+    runner.command = command
+    with pytest.raises(GateFailure, match="Independent verification changed candidate"):
+        runner.run_checks("diff-mutation")
 
 
 def test_role_change_uses_same_verifier_environment_and_real_commands(tmp_path, monkeypatch):

@@ -905,16 +905,15 @@ class FormalRunner:
                     "passed": result["exit_code"] == (check["baseline_exit_code"] if baseline else 0),
                 }
             )
+        diff = self.command(
+            ["git", "-C", str(self.candidate), "diff", "--check"],
+            self.candidate,
+            label + "-diff",
+            600,
+        )
+        checks.append({"id": "diff", **diff, "passed": diff["exit_code"] == 0})
         if snapshot_hash(self.candidate) != before:
             raise GateFailure("Independent verification changed candidate")
-        diff = subprocess.run(
-            ["git", "-C", str(self.candidate), "diff", "--check"],
-            capture_output=True,
-            check=False,
-            env=command_environment(self.candidate),
-        )
-        if diff.returncode:
-            checks.append({"id": "diff", "passed": False, "exit_code": diff.returncode})
         after = snapshot(self.candidate)
         changed = sorted(
             name
