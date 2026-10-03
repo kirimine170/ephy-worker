@@ -241,19 +241,12 @@ def test_legacy_role_defaults_and_explicit_role_map():
 
 @pytest.mark.parametrize("failure", ["none", "candidate", "infrastructure"])
 def test_campaign_never_adopts_or_retries_infrastructure(tmp_path, monkeypatch, failure):
-    from test_formal_runtime import contract
+    from test_formal_runtime import verifier_draft, verifier_runner
 
     from ephy_worker.formal_campaign import run_campaign
 
-    spec = {
-        "repoRoot": "unused",
-        "baseRevision": "a" * 40,
-        "contract": contract(),
-        "runtime": {"backend": "external_strata", "resource_lock": str(tmp_path / "lock")},
-        "controls": {},
-        "model_identities": {},
-        "verifier_identity": {},
-    }
+    spec = verifier_draft(verifier_runner(tmp_path))
+    spec["runtime"].update(backend="external_strata", resource_lock=str(tmp_path / "lock"))
     spec["contract"]["max_repairs"] = 0
     plan = {
         "specs": [copy.deepcopy(spec) for _ in range(4)],

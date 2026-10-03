@@ -130,7 +130,7 @@ authorization transcripts and private evidence stay outside Git.
 
 ## Finite campaigns
 
-Reuse `formal_campaign` with immutable specs, the same kernel-held resource lock
+Reuse `formal_campaign` with immutable drafts, the same kernel-held resource lock
 and fresh worktrees. External Strata campaigns are capped at four wall-clock
 hours and twenty jobs. The first complete independently verified cycle must pass
 before further trials. Three consecutive failed candidates stop the campaign;
@@ -139,6 +139,18 @@ immediately without repair. A `STOP` file requests cancellation. Resume never
 replays an interrupted job and retains the original absolute deadline.
 An interrupted active Strata job is recorded as an infrastructure failure and
 stops a resumed campaign even when an earlier trial succeeded.
+
+Campaign plans contain fresh submission drafts without `verifier_identity`.
+The standard `run_campaign` path freezes them inside its executing controller,
+retains a separate immutable `verifier-freeze.json` bound to the plan and state,
+then calls the draft-freeze API immediately before each submission and compares
+the result with the original expectation. It rejects pre-frozen plan inputs and
+any later environment, executable, pin or command drift before creating another
+job. Private redacted `verifier-submission-<index>.json` records preserve these
+comparisons, including rejected submissions with no job. Resume retains the
+original expectations and absolute deadline; missing or changed freeze evidence
+cannot be recovered by remeasuring. Legacy interrupted jobs are still accounted
+without replay, but no new trial can proceed without the bound freeze record.
 
 Every successful trial remains an isolated external-review proposal. Repeated
 successful trials are reliability measurements; they do not establish an

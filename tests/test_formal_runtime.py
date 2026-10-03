@@ -798,6 +798,135 @@ def verifier_draft(runner):
     }
 
 
+def campaign_fixture(tmp_path):
+    runner = verifier_runner(tmp_path)
+    draft = verifier_draft(runner)
+    draft["runtime"]["resource_lock"] = str(tmp_path / "campaign.lock")
+    plan = {
+        "specs": [copy.deepcopy(draft), copy.deepcopy(draft)],
+        "max_consecutive_failures": 3,
+        "timeout_seconds": 1000,
+        "resource_lock": draft["runtime"]["resource_lock"],
+    }
+    path = tmp_path / "plan.json"
+    write_json(path, plan)
+    return path, tmp_path / "campaign", runner
+
+
+@pytest.mark.parametrize("mutation", ["none", "PATH", "LANG"])
+def test_standard_campaign_freezes_drafts_then_stops_drift_before_next_submission(
+    tmp_path, monkeypatch, mutation
+):
+    plan_file, root, _ = campaign_fixture(tmp_path)
+    calls = []
+
+    def run(runner):
+        runner.verifier_identity()
+        calls.append(runner.job["id"])
+        runner.state("review_ready", "Offline identity control only")
+        if len(calls) == 1 and mutation != "none":
+            monkeypatch.setenv(mutation, os.environ.get(mutation, "") + os.pathsep + "after-freeze")
+
+    monkeypatch.setattr(FormalRunner, "run", run)
+    if mutation == "none":
+        result = run_campaign(plan_file, root)
+        assert result["status"] == "completed" and len(calls) == 2
+    else:
+        with pytest.raises(GateFailure, match="changed after freeze"):
+            run_campaign(plan_file, root)
+        result = read_json(root / "campaign.json")
+        assert result["status"] == "failed" and len(calls) == 1
+        assert result["next_index"] == 1
+    freeze = read_json(root / "verifier-freeze.json")
+    assert result["verifier_freeze_sha256"] == digest(encode(freeze))
+    assert all("verifier_identity" not in draft for draft in read_json(plan_file)["specs"])
+    comparison = read_json(root / "verifier-submission-1.json")
+    assert comparison["expected_identity"] == freeze["verifier_identities"][1]
+    assert comparison["matches"] is (mutation == "none")
+    assert len(list((root / "jobs").iterdir())) == len(calls)
+
+
+def test_standard_campaign_refuses_pre_frozen_parent_spec(tmp_path, monkeypatch):
+    plan_file, root, parent = campaign_fixture(tmp_path)
+    plan = read_json(plan_file)
+    for spec in plan["specs"]:
+        spec["verifier_identity"] = parent.job["verifier_identity"]
+    write_json(plan_file, plan, exclusive=False)
+    monkeypatch.setattr(FormalRunner, "run", lambda *_: pytest.fail("Pre-frozen spec reached a job"))
+    with pytest.raises(GateFailure, match="unfrozen submission draft"):
+        run_campaign(plan_file, root)
+    assert not root.exists()
+
+
+def test_standard_campaign_uses_actual_child_launch_environment(tmp_path):
+    plan_file, root, parent = campaign_fixture(tmp_path)
+    env = command_environment(REPOSITORY, tmp_path / "child-temp")
+    env["PATH"] += os.pathsep + str(tmp_path / "different-campaign-controller")
+    script = """
+import sys
+from pathlib import Path
+from ephy_worker.formal_runtime import FormalRunner
+from ephy_worker.formal_campaign import run_campaign
+def run(runner):
+    runner.verifier_identity()
+    runner.state('review_ready','Offline identity control only')
+FormalRunner.run=run
+run_campaign(Path(sys.argv[1]),Path(sys.argv[2]))
+"""
+    result = subprocess.run(
+        [sys.executable, "-X", "utf8", "-c", script, str(plan_file), str(root)],
+        env=env, capture_output=True, timeout=20, check=False,
+    )
+    assert result.returncode == 0, result.stderr.decode()
+    freeze = read_json(root / "verifier-freeze.json")
+    assert freeze["verifier_identities"][0] != parent.job["verifier_identity"]
+    assert freeze["observations"][0]["environment_value_sha256"]["PATH"] == digest(env["PATH"].encode())
+    jobs = list((root / "jobs").glob("*/job.json"))
+    assert len(jobs) == 2
+    assert all(read_json(job)["verifier_identity"] == freeze["verifier_identities"][0] for job in jobs)
+
+
+@pytest.mark.parametrize("mutation", ["none", "PATH", "record", "missing"])
+def test_campaign_resume_preserves_original_expectations_and_deadline(tmp_path, monkeypatch, mutation):
+    plan_file, root, _ = campaign_fixture(tmp_path)
+    calls = []
+
+    def run(runner):
+        runner.verifier_identity()
+        calls.append(runner.job["id"])
+        runner.state("review_ready", "Offline identity control only")
+        if len(calls) == 1:
+            raise KeyboardInterrupt("Offline controller pause after completed job")
+
+    monkeypatch.setattr(FormalRunner, "run", run)
+    with pytest.raises(KeyboardInterrupt):
+        run_campaign(plan_file, root)
+    before = read_json(root / "campaign.json")
+    freeze_file = root / "verifier-freeze.json"
+    original = freeze_file.read_bytes()
+    if mutation == "PATH":
+        monkeypatch.setenv("PATH", os.environ["PATH"] + os.pathsep + "changed-on-resume")
+    elif mutation == "record":
+        record = read_json(freeze_file)
+        record["verifier_identities"][1]["invocation_config_sha256"] = "0" * 64
+        write_json(freeze_file, record, exclusive=False)
+    elif mutation == "missing":
+        freeze_file.unlink()
+    if mutation == "none":
+        after = run_campaign(plan_file, root, resume=True)
+        assert after["status"] == "completed" and len(calls) == 2
+    else:
+        with pytest.raises(GateFailure, match="cannot recapture"):
+            run_campaign(plan_file, root, resume=True)
+        after = read_json(root / "campaign.json")
+        assert after["status"] == "failed" and len(calls) == 1
+    assert after["deadline_at"] == before["deadline_at"]
+    assert after["verifier_freeze_sha256"] == before["verifier_freeze_sha256"]
+    if mutation in ("none", "PATH"):
+        assert freeze_file.read_bytes() == original
+    assert len(list((root / "jobs").iterdir())) == len(calls)
+
+
 def test_fresh_submission_freeze_copies_inputs_and_validates_pins(tmp_path):
     runner = verifier_runner(tmp_path)
     draft = verifier_draft(runner)

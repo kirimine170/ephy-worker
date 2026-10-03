@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from .formal_artifacts import GateFailure, digest, encode, now, read_json, write_json
-from .formal_runtime import FormalRunner, exclusive_lock, submit
+from .formal_runtime import FormalRunner, exclusive_lock, freeze_submission_identity, submit
 
 
 def proposal_valid(job_file: Path) -> bool:
@@ -76,10 +76,26 @@ def run_campaign(plan_file: Path, state_root: Path, *, resume: bool = False) -> 
                         status="stopped", reason="Interrupted Strata infrastructure failure; no replay"
                     )
         else:
+            # Freeze only fresh drafts in this executing controller. The immutable
+            # record remains the expectation across later jobs and resume.
+            observations = []
+            identities = []
+            for draft in plan["specs"]:
+                observation = {}
+                frozen = freeze_submission_identity(draft, observation=observation)
+                identities.append(frozen["verifier_identity"])
+                observations.append(observation)
+            freeze = {
+                "plan_sha256": identity,
+                "verifier_identities": identities,
+                "observations": observations,
+            }
             state_root.mkdir()  # never replace an old campaign
             write_json(state_root / "plan.json", plan)
+            write_json(state_root / "verifier-freeze.json", freeze)
             state = {
                 "plan_sha256": identity,
+                "verifier_freeze_sha256": digest(encode(freeze)),
                 "started_at": now(),
                 "deadline_at": (datetime.now(UTC) + timedelta(seconds=plan["timeout_seconds"])).isoformat(),
                 "status": "running",
@@ -101,7 +117,22 @@ def run_campaign(plan_file: Path, state_root: Path, *, resume: bool = False) -> 
         save()
         if state["status"] == "stopped":
             return state
+        if state["consecutive_failures"] >= plan["max_consecutive_failures"]:
+            state.update(status="stopped", reason="Consecutive candidate failure limit reached")
+            save()
+            return state
         try:
+            # Resume loads the original expectations, never today's environment.
+            try:
+                freeze = read_json(state_root / "verifier-freeze.json")
+            except FileNotFoundError as exc:
+                raise GateFailure("Campaign verifier freeze is missing; cannot recapture") from exc
+            if (
+                state.get("verifier_freeze_sha256") != digest(encode(freeze))
+                or freeze.get("plan_sha256") != identity
+                or len(freeze.get("verifier_identities", [])) != len(plan["specs"])
+            ):
+                raise GateFailure("Campaign verifier freeze is missing or changed; cannot recapture")
             while state["next_index"] < len(plan["specs"]):
                 if state["results"] and not proposal_valid(Path(state["results"][0]["job_file"])):
                     state["status"] = "stopped"
@@ -119,16 +150,17 @@ def run_campaign(plan_file: Path, state_root: Path, *, resume: bool = False) -> 
                     state["status"] = "stopped"
                     state["reason"] = "stop request, campaign deadline, or consecutive failure limit"
                     break
-                spec = plan["specs"][state["next_index"]]
-                if spec["runtime"]["resource_lock"] != plan["resource_lock"]:
+                index = state["next_index"]
+                draft = plan["specs"][index]
+                if draft["runtime"]["resource_lock"] != plan["resource_lock"]:
                     raise GateFailure("Campaign/job singleton locks disagree")
-                if spec["contract"]["timeout_seconds"] > plan["timeout_seconds"] - state["elapsed_seconds"]:
+                if draft["contract"]["timeout_seconds"] > plan["timeout_seconds"] - state["elapsed_seconds"]:
                     state["status"] = "stopped"
                     state["reason"] = "Insufficient remaining campaign budget for another whole Job"
                     break
                 if (
                     state.get("deadline_at")
-                    and spec["contract"]["timeout_seconds"]
+                    and draft["contract"]["timeout_seconds"]
                     > (datetime.fromisoformat(state["deadline_at"]) - datetime.now(UTC)).total_seconds()
                 ):
                     state.update(
@@ -136,6 +168,25 @@ def run_campaign(plan_file: Path, state_root: Path, *, resume: bool = False) -> 
                         reason="Insufficient remaining wall-clock budget for another whole Job",
                     )
                     break
+                observation = {}
+                expected = freeze["verifier_identities"][index]
+                spec = None
+                try:
+                    spec = freeze_submission_identity(draft, observation=observation)
+                    if spec["verifier_identity"] != expected:
+                        raise GateFailure("Campaign verifier changed after freeze; cannot recapture")
+                finally:
+                    # A rejected submission has no Job, so keep its redacted
+                    # comparison here before allowing submit or any model stage.
+                    write_json(
+                        state_root / ("verifier-submission-" + str(index) + ".json"),
+                        {
+                            "expected_identity": expected,
+                            "observed_identity": spec["verifier_identity"] if spec else None,
+                            "matches": spec is not None and spec["verifier_identity"] == expected,
+                            "observation": observation,
+                        },
+                    )
                 job_file = submit(spec, state_root)
                 state["active_job"] = str(job_file)
                 save()
