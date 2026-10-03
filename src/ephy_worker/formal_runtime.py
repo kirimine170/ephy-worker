@@ -297,22 +297,73 @@ def executable_identity(argument: str) -> dict[str, str]:
     return {"path": str(path), "sha256": file_hash(path)}
 
 
-def observed_verifier_identity(runtime: dict, contract: dict) -> dict[str, str]:
+def observed_verifier_identity(
+    runtime: dict, contract: dict, *, observation: dict | None = None
+) -> dict[str, str]:
     """Derive identity from the running controller and its actual command resolution."""
+    observation = observation if observation is not None else {}
+    environment = command_environment(Path("<measured-worktree>"), Path("<runner-temp>"))
+    observation.update(
+        phase="python_resolution",
+        environment_sha256=digest(encode(environment)),
+        environment_value_sha256={
+            key: digest(value.encode("utf-8")) for key, value in sorted(environment.items())
+        },
+        checks_sha256=digest(encode(contract["checks"])),
+        python_version_sha256=digest(sys.version.encode("utf-8")),
+        files={},
+    )
+
+    def measure(path: Path, label: str, requested: str) -> dict[str, str]:
+        observation["phase"] = label
+        entry = observation["files"][label] = {"requested_path_sha256": digest(requested.encode("utf-8"))}
+        path = path.resolve(strict=True)
+        entry["resolved_path_sha256"] = digest(str(path).encode("utf-8"))
+        before = path.stat()
+        sha = file_hash(path)
+        after = path.stat()
+        stamps = [
+            (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+            for stat in (before, after)
+        ]
+        entry.update(
+            sha256=sha,
+            expected_pin_sha256=contract["runtime_hashes"].get(str(path)),
+            stat_before_sha256=digest(encode(stamps[0])),
+            stat_after_sha256=digest(encode(stamps[1])),
+            stable=stamps[0] == stamps[1],
+        )
+        entry["pin_matches"] = entry["expected_pin_sha256"] == sha
+        if not entry["stable"]:
+            raise GateFailure("Verifier artifact changed during measurement")
+        return {"path": str(path), "sha256": sha}
+
+    def executable(argument: str, label: str) -> dict[str, str]:
+        observation["phase"] = label + "_resolution"
+        path = Path(argument) if Path(argument).is_absolute() else Path(shutil.which(argument) or "")
+        if not path.is_file():
+            raise GateFailure("Verifier executable unavailable: " + argument)
+        return measure(path, label, argument)
+
     python = Path(sys.executable).resolve(strict=True)
-    if Path(runtime["python"]).resolve(strict=True) != python:
+    observation["python_paths"] = {
+        "requested_sha256": digest(str(runtime["python"]).encode("utf-8")),
+        "running_resolved_sha256": digest(str(python).encode("utf-8")),
+    }
+    configured_python = Path(runtime["python"]).resolve(strict=True)
+    observation["python_paths"]["configured_resolved_sha256"] = digest(str(configured_python).encode("utf-8"))
+    if configured_python != python:
         raise GateFailure("Configured verifier Python differs from the running interpreter")
     modules = [Path(__file__), Path(__file__).with_name("formal_artifacts.py")]
-    executables = [executable_identity(str(python)), executable_identity("git")]
-    for check in contract["checks"]:
-        executable = check["argv"][0].format(python=str(python))
-        executables.append(executable_identity(executable))
+    executables = [executable(str(python), "python"), executable("git", "git")]
+    for index, check in enumerate(contract["checks"]):
+        argument = check["argv"][0].format(python=str(python))
+        executables.append(executable(argument, "check_" + str(index)))
     pins = {item["path"]: item["sha256"] for item in executables}
-    pins.update({str(path.resolve()): file_hash(path) for path in modules})
-    for path, sha in pins.items():
-        if contract["runtime_hashes"].get(path) != sha:
-            raise GateFailure("Actual verifier runtime lacks a matching frozen pin: " + path)
-    return {
+    for index, path in enumerate(modules):
+        item = measure(path, "module_" + str(index), str(path))
+        pins[item["path"]] = item["sha256"]
+    identity = {
         "executor_id": "ephy_worker.formal_runtime.independent-verifier.v1",
         "runtime_sha256": digest(encode({"files": pins, "python_version": sys.version})),
         "invocation_config_sha256": digest(
@@ -320,14 +371,18 @@ def observed_verifier_identity(runtime: dict, contract: dict) -> dict[str, str]:
                 {
                     "checks": contract["checks"],
                     "executables": executables,
-                    "environment_sha256": digest(
-                        encode(command_environment(Path("<measured-worktree>"), Path("<runner-temp>")))
-                    ),
+                    "environment_sha256": observation["environment_sha256"],
                     "command_timeout_seconds": 600,
                 }
             )
         ),
     }
+    observation.update(phase="pin_validation", observed_identity=identity)
+    for path, sha in pins.items():
+        if contract["runtime_hashes"].get(path) != sha:
+            raise GateFailure("Actual verifier runtime lacks a matching frozen pin: " + path)
+    observation["phase"] = "complete"
+    return identity
 
 
 def final_assistant_text(path: Path, *, session: bool = False) -> str:
@@ -783,10 +838,40 @@ class FormalRunner:
         return record
 
     def verifier_identity(self) -> dict:
-        observed = observed_verifier_identity(self.runtime, self.contract)
-        if observed != self.job["verifier_identity"]:
+        observation = {
+            "schema": "ephy.verifier-identity-observation.v1",
+            "at": now(),
+            "controller_pid": os.getpid(),
+            "expected_identity": self.job["verifier_identity"],
+            "observed_identity": None,
+        }
+        try:
+            observed = observed_verifier_identity(self.runtime, self.contract, observation=observation)
+        except Exception as exc:
+            observation.update(decision="observation_failed", failure_type=type(exc).__name__)
+            self.retain_verifier_observation(observation)
+            raise
+        matches = observed == self.job["verifier_identity"]
+        observation.update(decision="matched" if matches else "identity_mismatch", matches=matches)
+        self.retain_verifier_observation(observation)
+        if not matches:
             raise GateFailure("Observed independent verifier identity differs from frozen expectation")
         return observed
+
+    def retain_verifier_observation(self, observation: dict) -> None:
+        """Persist only digests before permitting checks; missing diagnostics fail closed."""
+        try:
+            path = safe_path(self.directory, "verifier-identity.jsonl", missing=True)
+            data = json.dumps(observation, sort_keys=True).encode("utf-8") + b"\n"
+            limit = min(self.contract["max_log_bytes"], 1024 * 1024)
+            if (path.stat().st_size if path.exists() else 0) + len(data) > limit:
+                raise GateFailure("Verifier identity diagnostic log limit exceeded")
+            with path.open("ab") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except OSError as exc:
+            raise GateFailure("Verifier identity diagnostic could not be retained") from exc
 
     def run_checks(self, label: str, baseline: bool = False) -> dict:
         verifier = self.verifier_identity()

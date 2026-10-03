@@ -2,6 +2,7 @@
 
 import copy
 import json
+import os
 import subprocess
 import sys
 import time
@@ -26,6 +27,7 @@ from ephy_worker.formal_artifacts import (
     safe_path,
     validate_audit_result,
     validate_schema,
+    write_json,
 )
 from ephy_worker.formal_campaign import run_campaign
 from ephy_worker.formal_runtime import (
@@ -776,6 +778,221 @@ def test_wrong_actual_verifier_python_is_rejected(tmp_path):
     runner.runtime["python"] = str(fake)
     with pytest.raises(GateFailure, match="running interpreter"):
         runner.verifier_identity()
+
+
+def verifier_observations(runner):
+    return [
+        json.loads(line) for line in (runner.directory / "verifier-identity.jsonl").read_text().splitlines()
+    ]
+
+
+def test_verifier_diagnostic_is_retained_before_real_checks_and_redacts_values(tmp_path, monkeypatch):
+    monkeypatch.setenv("TZ", "private-verifier-environment-value")
+    monkeypatch.setenv("API_KEY", "private-auth-value-never-an-input")
+    runner = verifier_runner(tmp_path)
+    original = runner.command
+
+    def command(*args):
+        recorded = verifier_observations(runner)[-1]
+        assert recorded["decision"] == "matched"
+        assert recorded["expected_identity"] == recorded["observed_identity"]
+        return original(*args)
+
+    runner.command = command
+    assert runner.run_checks("diagnostic")["passed"]
+    raw = (runner.directory / "verifier-identity.jsonl").read_text()
+    assert "private-verifier-environment-value" not in raw
+    assert "private-auth-value-never-an-input" not in raw
+    assert str(Path(sys.executable).resolve()) not in raw
+    assert str(REPOSITORY) not in raw
+    assert "API_KEY" not in verifier_observations(runner)[0]["environment_value_sha256"]
+
+
+@pytest.mark.parametrize("key", ["LANG", "PATH"])
+def test_launch_environment_difference_records_changed_component_before_rejection(tmp_path, monkeypatch, key):
+    runner = verifier_runner(tmp_path)
+    assert runner.verifier_identity() == runner.job["verifier_identity"]
+    before = verifier_observations(runner)[0]
+    suffix = os.pathsep + str(tmp_path / "unused-launch-path") if key == "PATH" else "-changed"
+    monkeypatch.setenv(key, os.environ.get(key, "") + suffix)
+    runner.command = lambda *_: pytest.fail("Environment mismatch reached a command")
+    with pytest.raises(GateFailure, match="Observed independent verifier"):
+        runner.run_checks("rejected")
+    records = verifier_observations(runner)
+    assert len(records) == 2 and records[0] == before
+    after = records[1]
+    assert after["decision"] == "identity_mismatch" and not after["matches"]
+    assert after["expected_identity"] != after["observed_identity"]
+    assert after["environment_value_sha256"][key] != before["environment_value_sha256"].get(key)
+    assert after["checks_sha256"] == before["checks_sha256"]
+    assert after["files"] == before["files"]
+
+
+def test_equivalent_python_path_normalizes_without_changing_identity(tmp_path):
+    runner = verifier_runner(tmp_path)
+    python = Path(sys.executable)
+    runner.runtime["python"] = os.path.join(str(python.parent), ".", python.name)
+    assert runner.verifier_identity() == runner.job["verifier_identity"]
+    record = verifier_observations(runner)[0]
+    assert record["decision"] == "matched"
+    assert (
+        record["python_paths"]["configured_resolved_sha256"]
+        == record["python_paths"]["running_resolved_sha256"]
+    )
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_canonical_check_hash_distinguishes_mapping_order_from_changed_arguments(tmp_path, changed):
+    runner = verifier_runner(tmp_path)
+    before = {}
+    observed_verifier_identity(runner.runtime, runner.contract, observation=before)
+    runner.contract["checks"] = [dict(reversed(list(check.items()))) for check in runner.contract["checks"]]
+    if changed:
+        runner.contract["checks"][0]["argv"][1] = "--version"
+        with pytest.raises(GateFailure, match="Observed independent verifier"):
+            runner.verifier_identity()
+    else:
+        assert runner.verifier_identity() == runner.job["verifier_identity"]
+    after = verifier_observations(runner)[0]
+    assert (before["checks_sha256"] == after["checks_sha256"]) is (not changed)
+    assert after["decision"] == ("identity_mismatch" if changed else "matched")
+
+
+def test_changed_frozen_pin_records_actual_hash_and_still_rejects(tmp_path):
+    runner = verifier_runner(tmp_path)
+    source = (REPOSITORY / "src/ephy_worker/formal_runtime.py").resolve()
+    runner.contract["runtime_hashes"][str(source)] = "0" * 64
+    runner.command = lambda *_: pytest.fail("Wrong pin reached a command")
+    with pytest.raises(GateFailure, match="matching frozen pin"):
+        runner.run_checks("rejected")
+    record = verifier_observations(runner)[0]
+    assert record["decision"] == "observation_failed"
+    assert record["observed_identity"] is not None
+    assert record["phase"] == "pin_validation"
+    module = record["files"]["module_0"]
+    assert module["sha256"] == file_hash(source)
+    assert module["expected_pin_sha256"] == "0" * 64 and not module["pin_matches"]
+
+
+def test_concurrent_artifact_change_is_recorded_and_rejected(tmp_path, monkeypatch):
+    from ephy_worker import formal_runtime as formal
+
+    runner = verifier_runner(tmp_path)
+    fake_git = tmp_path / "measured-git.exe"
+    fake_git.write_bytes(b"stable")
+    runner.contract["runtime_hashes"][str(fake_git.resolve())] = file_hash(fake_git)
+    monkeypatch.setattr(formal.shutil, "which", lambda _: str(fake_git))
+    runner.job["verifier_identity"] = observed_verifier_identity(runner.runtime, runner.contract)
+    original = formal.file_hash
+
+    def changing_hash(path):
+        sha = original(path)
+        if path == fake_git:
+            path.write_bytes(b"changed during measurement")
+        return sha
+
+    monkeypatch.setattr(formal, "file_hash", changing_hash)
+    runner.command = lambda *_: pytest.fail("Concurrent change reached a command")
+    with pytest.raises(GateFailure, match="changed during measurement"):
+        runner.run_checks("rejected")
+    record = verifier_observations(runner)[0]
+    assert record["decision"] == "observation_failed" and record["phase"] == "git"
+    assert record["files"]["git"]["stable"] is False
+    assert record["files"]["git"]["stat_before_sha256"] != record["files"]["git"]["stat_after_sha256"]
+
+
+def test_unavailable_verifier_records_partial_observation_without_raw_error(tmp_path, monkeypatch):
+    from ephy_worker import formal_runtime as formal
+
+    runner = verifier_runner(tmp_path)
+    monkeypatch.setattr(formal.shutil, "which", lambda _: None)
+    with pytest.raises(GateFailure, match="executable unavailable"):
+        runner.verifier_identity()
+    record = verifier_observations(runner)[0]
+    assert record["decision"] == "observation_failed" and record["phase"] == "git_resolution"
+    assert record["observed_identity"] is None and record["failure_type"] == "GateFailure"
+    assert record["files"]["python"]["pin_matches"]
+
+
+def test_wrong_python_diagnostic_records_resolutions_without_raw_paths(tmp_path):
+    runner = verifier_runner(tmp_path)
+    fake = tmp_path / "private-path-other-python.exe"
+    fake.write_bytes(b"other interpreter")
+    runner.runtime["python"] = str(fake)
+    with pytest.raises(GateFailure, match="running interpreter"):
+        runner.verifier_identity()
+    record = verifier_observations(runner)[0]
+    assert record["decision"] == "observation_failed"
+    assert (
+        record["python_paths"]["configured_resolved_sha256"]
+        != record["python_paths"]["running_resolved_sha256"]
+    )
+    assert str(fake) not in json.dumps(record)
+
+
+@pytest.mark.parametrize("failure", ["io", "limit"])
+def test_verifier_diagnostic_write_failure_stops_before_commands(tmp_path, failure):
+    runner = verifier_runner(tmp_path)
+    if failure == "io":
+        (runner.directory / "verifier-identity.jsonl").mkdir()
+        message = "could not be retained"
+    else:
+        runner.contract["max_log_bytes"] = 1
+        message = "log limit exceeded"
+    runner.command = lambda *_: pytest.fail("Missing diagnostic reached a command")
+    with pytest.raises(GateFailure, match=message):
+        runner.run_checks("rejected")
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_actual_offline_child_launch_records_matching_and_different_environment(
+    tmp_path, monkeypatch, changed
+):
+    monkeypatch.setenv("TZ", "frozen-offline-launch")
+    runner = verifier_runner(tmp_path)
+    spec = tmp_path / "observation-input.json"
+    write_json(
+        spec,
+        {
+            "runtime": runner.runtime,
+            "contract": runner.contract,
+            "expected": runner.job["verifier_identity"],
+            "directory": str(runner.directory),
+        },
+    )
+    env = command_environment(REPOSITORY, tmp_path / "child-temp")
+    if changed:
+        env["TZ"] = "changed-offline-launch"
+    script = """
+import json,sys
+from pathlib import Path
+from ephy_worker.formal_runtime import FormalRunner
+from ephy_worker.formal_artifacts import GateFailure
+spec=json.loads(Path(sys.argv[1]).read_text())
+runner=FormalRunner.__new__(FormalRunner)
+runner.runtime,runner.contract=spec['runtime'],spec['contract']
+runner.job={'verifier_identity':spec['expected']}
+runner.directory=Path(spec['directory'])
+try:
+    runner.verifier_identity()
+except GateFailure:
+    sys.exit(78)
+"""
+    result = subprocess.run(
+        [sys.executable, "-X", "utf8", "-c", script, str(spec)],
+        env=env,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+    assert result.returncode == (78 if changed else 0), result.stderr.decode()
+    observed = verifier_observations(runner)[0]
+    assert observed["decision"] == ("identity_mismatch" if changed else "matched")
+    assert (observed["observed_identity"] == runner.job["verifier_identity"]) is (not changed)
+    assert observed["observed_identity"]["runtime_sha256"] == runner.job["verifier_identity"][
+        "runtime_sha256"
+    ]
+    assert observed["environment_value_sha256"]["TZ"] == digest(env["TZ"].encode())
 
 
 def test_freeze_requires_observed_verifier(tmp_path):

@@ -40,6 +40,25 @@ schemas and fixed checker remain outside the writable candidate. Use the existin
 trusted submission API and `formal_runtime --job <job.json> --execute-authorized`.
 Invocation without explicit user authorization is prohibited.
 
+## Verifier identity diagnostics
+
+Each verifier identity comparison appends a private `verifier-identity.jsonl`
+record before any check can run. It retains the expected and observed identities,
+the decision, measurement phase, checks hash, per-variable environment hashes,
+normalized path hashes, file hashes and frozen-pin comparisons. Raw environment
+values, paths, command arguments and exception messages are omitted. Failed
+measurements retain their available components and exception type. A changed
+file during hashing, missing diagnostic output or exhausted diagnostic log
+budget stops the job. Identity mismatches remain failures.
+
+Capture the same optional `observation` dictionary when freezing the expected
+identity if component-level comparison is needed. Keep diagnostics outside
+candidates and Git. Offline controls cover matching and differing child-process
+environments, equivalent normalized paths, canonical mapping order, changed
+arguments, invalid pins, concurrent file changes and diagnostic write failures.
+These observations do not recover an unrecorded measurement from a historical
+failed job or authorize its replay.
+
 ## Verify and stop
 
 The planner and implementer use distinct fresh Pi processes and sessions. The
