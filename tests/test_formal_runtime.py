@@ -858,6 +858,40 @@ def test_terminal_campaign_resume_validates_freeze_before_return(tmp_path, monke
     assert len(list((root / "jobs").iterdir())) == 2
 
 
+@pytest.mark.parametrize("status", ["running", "review_ready"])
+@pytest.mark.parametrize("mutation", ["missing", "changed"])
+def test_resume_rejects_lost_freeze_before_mutating_active_job_or_history(
+    tmp_path, monkeypatch, status, mutation
+):
+    plan_file, root, _ = campaign_fixture(tmp_path)
+
+    def pause(runner):
+        runner.verifier_identity()
+        runner.state(status, "Offline interruption control only")
+        raise KeyboardInterrupt("Pause while campaign still records active_job")
+
+    monkeypatch.setattr(FormalRunner, "run", pause)
+    with pytest.raises(KeyboardInterrupt):
+        run_campaign(plan_file, root)
+    state_file = root / "campaign.json"
+    job_file = Path(read_json(state_file)["active_job"])
+    retained = job_file.parent / "retained-evidence.txt"
+    retained.write_bytes(b"original interrupted evidence")
+    before = {path: path.read_bytes() for path in (state_file, job_file, retained)}
+    freeze_file = root / "verifier-freeze.json"
+    if mutation == "missing":
+        freeze_file.unlink()
+    else:
+        freeze = read_json(freeze_file)
+        freeze["verifier_identities"][0]["runtime_sha256"] = "0" * 64
+        write_json(freeze_file, freeze, exclusive=False)
+    monkeypatch.setattr(FormalRunner, "run", lambda *_: pytest.fail("Resume restarted a job"))
+    with pytest.raises(GateFailure, match="cannot recapture"):
+        run_campaign(plan_file, root, resume=True)
+    assert all(path.read_bytes() == data for path, data in before.items())
+    assert len(list((root / "jobs").iterdir())) == 1
+
+
 @pytest.mark.parametrize("mutation", ["none", "PATH", "LANG"])
 def test_standard_campaign_freezes_drafts_then_stops_drift_before_next_submission(
     tmp_path, monkeypatch, mutation
@@ -992,7 +1026,11 @@ def test_campaign_resume_preserves_original_expectations_and_deadline(tmp_path, 
         with pytest.raises(GateFailure, match="cannot recapture"):
             run_campaign(plan_file, root, resume=True)
         after = read_json(root / "campaign.json")
-        assert after["status"] == "failed" and len(calls) == 1
+        if mutation in ("record", "missing"):
+            assert after == before  # Integrity rejection precedes all history mutation.
+        else:
+            assert after["status"] == "failed"
+        assert len(calls) == 1
     assert after["deadline_at"] == before["deadline_at"]
     assert after["verifier_freeze_sha256"] == before["verifier_freeze_sha256"]
     if mutation in ("none", "PATH"):

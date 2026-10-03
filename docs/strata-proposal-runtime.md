@@ -155,6 +155,8 @@ stopped or failed campaign, also validates the retained freeze record. Missing
 or modified evidence rejects rather than reporting the old terminal result;
 the historical state and jobs remain unchanged. No new trial can proceed without
 the bound freeze record.
+Resume validates that record immediately after the plan binding, before processing
+an active job, changing its status, appending results or saving campaign state.
 
 Every successful trial remains an isolated external-review proposal. Repeated
 successful trials are reliability measurements; they do not establish an

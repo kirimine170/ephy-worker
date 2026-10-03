@@ -56,8 +56,8 @@ def run_campaign(plan_file: Path, state_root: Path, *, resume: bool = False) -> 
             state = read_json(state_path)
             if state["plan_sha256"] != identity:
                 raise GateFailure("Cannot resume under a changed campaign plan")
+            retained_verifier_freeze(state_root, state, identity, len(plan["specs"]))
             if state["status"] in ("completed", "stopped", "failed"):
-                retained_verifier_freeze(state_root, state, identity, len(plan["specs"]))
                 return state
             # Interrupted candidate stays preserved. It counts as a failed attempt;
             # no unknown implementation/check/audit is replayed as completed.
