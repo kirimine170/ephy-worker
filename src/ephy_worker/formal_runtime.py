@@ -905,13 +905,7 @@ class FormalRunner:
                     "passed": result["exit_code"] == (check["baseline_exit_code"] if baseline else 0),
                 }
             )
-        diff = self.command(
-            ["git", "-C", str(self.candidate), "diff", "--check"],
-            self.candidate,
-            label + "-diff",
-            600,
-        )
-        checks.append({"id": "diff", **diff, "passed": diff["exit_code"] == 0})
+        checks.append(self.run_diff_check(label))
         if snapshot_hash(self.candidate) != before:
             raise GateFailure("Independent verification changed candidate")
         after = snapshot(self.candidate)
@@ -934,6 +928,67 @@ class FormalRunner:
         }
         write_json(self.directory / (label + "-results.json"), result)
         return result
+
+    def run_diff_check(self, label: str) -> dict:
+        index = safe_path(self.directory, label + "-diff.index", missing=True)
+        if index.exists():
+            raise GateFailure("Diff index already exists")
+        index_environment = {"GIT_INDEX_FILE": str(index)}
+        preparation = []
+        for suffix, arguments in (
+            ("base", ["read-tree", self.job["baseRevision"]]),
+            ("stage", ["add", "--all", "--"]),
+        ):
+            record = self.command(
+                ["git", "-C", str(self.candidate), *arguments],
+                self.candidate,
+                label + "-diff-" + suffix,
+                600,
+                stage_environment=index_environment,
+            )
+            if record["exit_code"] != 0:
+                raise GateFailure("Cannot prepare complete candidate diff")
+            preparation.append(record)
+        index_hash = file_hash(index)
+        diff = self.command(
+            ["git", "-C", str(self.candidate), "diff", "--cached", "--check", self.job["baseRevision"]],
+            self.candidate,
+            label + "-diff",
+            600,
+            stage_environment=index_environment,
+        )
+        if file_hash(index) != index_hash:
+            raise GateFailure("Diff command changed isolated index")
+        return {
+            "id": "diff", **diff, "passed": diff["exit_code"] == 0,
+            "isolated_index": {"path": str(index), "sha256": index_hash},
+            "preparation": preparation,
+        }
+
+    def freeze_patch(self, result: dict) -> bytes:
+        """Capture exactly the index that passed the complete candidate diff check."""
+        diff = next(check for check in result["checks"] if check["id"] == "diff")
+        index = safe_path(self.directory, Path(diff["isolated_index"]["path"]).name)
+        if (
+            result["passed"] is not True
+            or diff["passed"] is not True
+            or diff["exit_code"] != 0
+            or snapshot_hash(self.candidate) != result["snapshot_sha256"]
+            or file_hash(index) != diff["isolated_index"]["sha256"]
+        ):
+            raise GateFailure("Candidate or checked index changed before patch freeze")
+        record = self.command(
+            ["git", "-C", str(self.candidate), "diff", "--cached", "--binary", "--full-index", self.job["baseRevision"]],
+            self.candidate, "candidate-patch", 600,
+            stage_environment={"GIT_INDEX_FILE": str(index)},
+        )
+        if (
+            record["exit_code"] != 0
+            or file_hash(index) != diff["isolated_index"]["sha256"]
+            or snapshot_hash(self.candidate) != result["snapshot_sha256"]
+        ):
+            raise GateFailure("Candidate or checked index changed during patch freeze")
+        return safe_path(self.directory, record["stdout"]).read_bytes()
 
     def stage(self, role: str, prompt: str, label: str, root: Path, envelope: dict | None = None) -> str:
         self.intact()
@@ -1221,21 +1276,7 @@ class FormalRunner:
                 self.state("verification_failed", "No implementation change; never count this as improvement")
                 return
             final = snapshot(self.candidate)
-            patch = git(self.candidate, "diff", "--binary", "HEAD")
-            # Include new files without altering the candidate index.
-            for name in result["changed_files"]:
-                if name not in self.baseline_snapshot:
-                    safe_path(self.candidate, name)
-                    addition = subprocess.run(
-                        ["git", "diff", "--no-index", "--binary", "--", os.devnull, name],
-                        cwd=self.candidate,
-                        capture_output=True,
-                        check=False,
-                        env=command_environment(self.candidate),
-                    )
-                    if addition.returncode not in (0, 1):
-                        raise GateFailure("Cannot capture new-file patch")
-                    patch += addition.stdout
+            patch = self.freeze_patch(result)
             (self.directory / "candidate.patch").write_bytes(patch)
             self.event(
                 "freeze",

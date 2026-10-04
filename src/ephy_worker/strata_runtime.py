@@ -384,24 +384,32 @@ def verify_external_proposal(job_file: Path) -> Path:
     diff = next(check for check in results["checks"] if check["id"] == "diff")
     executable = executable_identity("git")
     transcripts = read_json(bundle / "command_transcripts.txt")
-    matching = [
-        entry
-        for entry in transcripts
-        if all(entry.get(key) == value for key, value in diff.items() if key not in ("id", "passed"))
+    index = safe_path(runner.directory, diff["stdout"].removesuffix(".stdout.log") + ".index")
+    environment = {**command_environment(runner.candidate, runner.directory / "temp"), "GIT_INDEX_FILE": str(index)}
+    preparation = diff.get("preparation", [])
+    expected_arguments = [
+        ["read-tree", runner.job["baseRevision"]],
+        ["add", "--all", "--"],
+        ["diff", "--cached", "--check", runner.job["baseRevision"]],
     ]
+    records = [*preparation, {key: value for key, value in diff.items() if key not in ("id", "passed", "isolated_index", "preparation")}]
     if (
-        diff.get("argv") != [executable["path"], "-C", str(runner.candidate), "diff", "--check"]
-        or diff.get("cwd") != str(runner.candidate)
-        or diff.get("executable") != executable
-        or diff.get("environment_sha256") != runner.job["environment_sha256"]
-        or diff.get("effective_environment_sha256")
-        != digest(encode(command_environment(runner.candidate, runner.directory / "temp")))
-        or diff.get("temp_root") != str(runner.directory / "temp")
-        or diff.get("temp_variables")
-        != {key: str(runner.directory / "temp") for key in ("TEMP", "TMP", "TMPDIR")}
-        or len(matching) != 1
-        or diff.get("stdout_sha256") != file_hash(safe_path(runner.directory, diff["stdout"]))
-        or diff.get("stderr_sha256") != file_hash(safe_path(runner.directory, diff["stderr"]))
+        len(preparation) != 2
+        or diff.get("isolated_index") != {"path": str(index), "sha256": file_hash(index)}
+        or any(
+            record.get("argv") != [executable["path"], "-C", str(runner.candidate), *arguments]
+            or record.get("exit_code") != 0
+            or record.get("cwd") != str(runner.candidate)
+            or record.get("executable") != executable
+            or record.get("environment_sha256") != runner.job["environment_sha256"]
+            or record.get("effective_environment_sha256") != digest(encode(environment))
+            or record.get("temp_root") != str(runner.directory / "temp")
+            or record.get("temp_variables") != {key: str(runner.directory / "temp") for key in ("TEMP", "TMP", "TMPDIR")}
+            or sum(all(entry.get(key) == value for key, value in record.items()) for entry in transcripts) != 1
+            or record.get("stdout_sha256") != file_hash(safe_path(runner.directory, record["stdout"]))
+            or record.get("stderr_sha256") != file_hash(safe_path(runner.directory, record["stderr"]))
+            for record, arguments in zip(records, expected_arguments, strict=True)
+        )
     ):
         raise GateFailure("External-review diff-check evidence is invalid")
     provenance = read_json(bundle / "model_provenance.txt")

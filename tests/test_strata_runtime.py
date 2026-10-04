@@ -429,6 +429,8 @@ def test_external_campaign_rejects_more_than_four_hours(tmp_path):
         "diff_environment",
         "diff_transcript",
         "diff_stdout",
+        "diff_index",
+        "diff_preparation",
     ],
 )
 def test_external_stop_requires_exact_frozen_candidate_and_evidence(tmp_path, monkeypatch, mutation):
@@ -439,12 +441,7 @@ def test_external_stop_requires_exact_frozen_candidate_and_evidence(tmp_path, mo
     # Only the diff command is real; model/audit provenance remains synthetic.
     command_runner = verifier_runner(tmp_path)
     directory = command_runner.directory
-    diff = command_runner.command(
-        ["git", "-C", str(command_runner.candidate), "diff", "--check"],
-        command_runner.candidate,
-        "external-diff",
-        30,
-    )
+    diff = command_runner.run_diff_check("external")
     transcripts = copy.deepcopy(command_runner.transcripts)
     configuration = contract()
     configuration["max_repairs"] = 0
@@ -461,7 +458,7 @@ def test_external_stop_requires_exact_frozen_candidate_and_evidence(tmp_path, mo
     }
     job = {
         "id": "test-job",
-        "baseRevision": "a" * 40,
+        "baseRevision": command_runner.job["baseRevision"],
         "contract": configuration,
         "model_identities": {r: model_identity for r in ("planner", "implementer", "auditor")},
         "verifier_identity": verifier,
@@ -497,11 +494,15 @@ def test_external_stop_requires_exact_frozen_candidate_and_evidence(tmp_path, mo
             "diff_environment": ("effective_environment_sha256", "0" * 64),
         }[mutation]
         results["checks"][-1][key] = value
-        transcripts[0][key] = value
+        transcripts[-1][key] = value
     elif mutation == "diff_transcript":
         transcripts = []
     elif mutation == "diff_stdout":
         (directory / diff["stdout"]).write_bytes(b"replaced diff output")
+    elif mutation == "diff_index":
+        Path(diff["isolated_index"]["path"]).write_bytes(b"changed index")
+    elif mutation == "diff_preparation":
+        results["checks"][-1]["preparation"] = []
     provenance = []
     workflow = [{"stage": "preflight", "at": "synthetic", "passed": True}]
     for index, (role, label) in enumerate((("planner", "planner"), ("implementer", "worker-1"))):

@@ -35,6 +35,7 @@ from ephy_worker.formal_runtime import (
     command_environment,
     exclusive_lock,
     freeze_submission_identity,
+    git,
     injected_context_pins,
     observed_audit_artifacts,
     observed_verifier_identity,
@@ -478,6 +479,12 @@ def verifier_runner(tmp_path):
     candidate = tmp_path / "candidate"
     subprocess.run(["git", "init", str(candidate)], check=True, capture_output=True)
     (candidate / "doc.md").write_text("unchanged", encoding="utf-8")
+    subprocess.run(["git", "-C", str(candidate), "add", "doc.md"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(candidate), "-c", "user.name=UnitTest", "-c", "user.email=unit@local.invalid", "commit", "-m", "baseline"],
+        check=True,
+        capture_output=True,
+    )
     runner = FormalRunner.__new__(FormalRunner)
     runner.runtime = {"python": sys.executable}
     runner.contract = contract()
@@ -490,6 +497,7 @@ def verifier_runner(tmp_path):
     pins[git_identity["path"]] = git_identity["sha256"]
     runner.contract["runtime_hashes"] = pins
     runner.job = {
+        "baseRevision": git(candidate, "rev-parse", "HEAD").decode().strip(),
         "verifier_identity": observed_verifier_identity(runner.runtime, runner.contract),
         "environment_sha256": "e" * 64,
     }
@@ -514,7 +522,12 @@ def test_observed_verifier_matches_real_check_processes(tmp_path):
     assert all(
         check["executable"]["path"] == str(Path(sys.executable).resolve()) for check in contract_checks
     )
-    assert len({check["effective_environment_sha256"] for check in result["checks"]}) == 1
+    assert len({check["effective_environment_sha256"] for check in contract_checks}) == 1
+    diff = next(check for check in result["checks"] if check["id"] == "diff")
+    assert diff["effective_environment_sha256"] == digest(encode({
+        **command_environment(runner.candidate, runner.directory / "temp"),
+        "GIT_INDEX_FILE": diff["isolated_index"]["path"],
+    }))
 
 
 @pytest.mark.parametrize("dirty", [False, True])
@@ -531,15 +544,21 @@ def test_diff_check_retains_actual_command_on_success_and_failure(tmp_path, dirt
     diff = next(check for check in result["checks"] if check["id"] == "diff")
     assert diff["exit_code"] == (2 if dirty else 0)
     assert diff["passed"] is (not dirty) and result["passed"] is (not dirty)
-    assert diff["argv"][1:] == ["-C", str(runner.candidate), "diff", "--check"]
+    assert diff["argv"][1:] == ["-C", str(runner.candidate), "diff", "--cached", "--check", runner.job["baseRevision"]]
     assert diff["cwd"] == str(runner.candidate) and diff["pid"] > 0
     assert diff["stdout_sha256"] == file_hash(runner.directory / diff["stdout"])
     assert diff["stderr_sha256"] == file_hash(runner.directory / diff["stderr"])
     assert diff["effective_environment_sha256"] == digest(
-        encode(command_environment(runner.candidate, runner.directory / "temp"))
+        encode({**command_environment(runner.candidate, runner.directory / "temp"), "GIT_INDEX_FILE": diff["isolated_index"]["path"]})
     )
     transcript = next(record for record in runner.transcripts if record["pid"] == diff["pid"])
-    assert all(transcript[key] == value for key, value in diff.items() if key not in ("id", "passed"))
+    assert all(transcript[key] == value for key, value in diff.items() if key not in ("id", "passed", "isolated_index", "preparation"))
+    assert diff["isolated_index"]["sha256"] == file_hash(Path(diff["isolated_index"]["path"]))
+    assert all(
+        record["exit_code"] == 0
+        and sum(all(transcript.get(key) == value for key, value in record.items()) for transcript in runner.transcripts) == 1
+        for record in diff["preparation"]
+    )
     persisted = read_json(runner.directory / "diff-evidence-results.json")
     assert next(check for check in persisted["checks"] if check["id"] == "diff") == diff
 
@@ -548,15 +567,68 @@ def test_diff_check_candidate_mutation_is_rejected(tmp_path):
     runner = verifier_runner(tmp_path)
     original = runner.command
 
-    def command(argv, *args):
-        result = original(argv, *args)
-        if argv[-2:] == ["diff", "--check"]:
+    def command(argv, *args, **kwargs):
+        result = original(argv, *args, **kwargs)
+        if "--check" in argv:
             (runner.candidate / "doc.md").write_text("changed by verifier", encoding="utf-8")
         return result
 
     runner.command = command
     with pytest.raises(GateFailure, match="Independent verification changed candidate"):
         runner.run_checks("diff-mutation")
+
+
+@pytest.mark.parametrize("kind", ["unstaged", "staged", "untracked", "staged-new"])
+@pytest.mark.parametrize("dirty", [False, True])
+def test_full_patch_diff_covers_index_and_new_files(tmp_path, kind, dirty):
+    runner = verifier_runner(tmp_path)
+    name = "new.md" if kind in ("untracked", "staged-new") else "doc.md"
+    runner.contract["allowed_files"] = [name]
+    runner.job["verifier_identity"] = observed_verifier_identity(runner.runtime, runner.contract)
+    (runner.candidate / name).write_text("trailing space \n" if dirty else "valid change\n", encoding="utf-8")
+    if kind in ("staged", "staged-new"):
+        subprocess.run(["git", "-C", str(runner.candidate), "add", name], check=True, capture_output=True)
+    original_index = (runner.candidate / ".git/index").read_bytes()
+    result = runner.run_checks("whole-patch")
+    diff = next(check for check in result["checks"] if check["id"] == "diff")
+    assert diff["exit_code"] == (2 if dirty else 0)
+    assert diff["passed"] is (not dirty) and result["passed"] is (not dirty)
+    assert result["changed_files"] == [name]
+    assert (runner.candidate / ".git/index").read_bytes() == original_index
+
+
+@pytest.mark.parametrize("kind", ["staged", "untracked", "staged-new"])
+def test_frozen_patch_replays_exact_checked_candidate(tmp_path, kind):
+    runner = verifier_runner(tmp_path)
+    name = "doc.md" if kind == "staged" else "new.md"
+    runner.contract["allowed_files"] = [name]
+    runner.job["verifier_identity"] = observed_verifier_identity(runner.runtime, runner.contract)
+    (runner.candidate / name).write_text("valid change\n", encoding="utf-8")
+    if kind != "untracked":
+        subprocess.run(["git", "-C", str(runner.candidate), "add", name], check=True, capture_output=True)
+    original_index = (runner.candidate / ".git/index").read_bytes()
+    result = runner.run_checks("patch-replay")
+    patch_file = runner.directory / "replay.patch"
+    patch_file.write_bytes(runner.freeze_patch(result))
+    replay = tmp_path / "replayed"
+    subprocess.run(["git", "-C", str(runner.candidate), "worktree", "add", "--detach", str(replay), runner.job["baseRevision"]], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(replay), "apply", "--check", "--whitespace=error-all", str(patch_file)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(replay), "apply", str(patch_file)], check=True, capture_output=True)
+    assert snapshot(replay) == snapshot(runner.candidate)
+    assert (runner.candidate / ".git/index").read_bytes() == original_index
+
+
+@pytest.mark.parametrize("mutation", ["candidate", "index"])
+def test_patch_freeze_rejects_changes_after_diff_check(tmp_path, mutation):
+    runner = verifier_runner(tmp_path)
+    result = runner.run_checks("patch-tamper")
+    diff = next(check for check in result["checks"] if check["id"] == "diff")
+    if mutation == "candidate":
+        (runner.candidate / "doc.md").write_text("changed after checks", encoding="utf-8")
+    else:
+        Path(diff["isolated_index"]["path"]).write_bytes(b"replaced index")
+    with pytest.raises(GateFailure, match="changed before patch freeze"):
+        runner.freeze_patch(result)
 
 
 def test_role_change_uses_same_verifier_environment_and_real_commands(tmp_path, monkeypatch):
@@ -571,7 +643,9 @@ def test_role_change_uses_same_verifier_environment_and_real_commands(tmp_path, 
     result = runner.run_checks("integration")
     assert result["passed"] and result["verifier_identity"] == runner.job["verifier_identity"]
     assert all(check["pid"] > 0 for check in result["checks"])
-    assert all(check["effective_environment_sha256"] == digest(encode(before)) for check in result["checks"])
+    assert all(check["effective_environment_sha256"] == digest(encode(before)) for check in result["checks"] if check["id"] != "diff")
+    diff = next(check for check in result["checks"] if check["id"] == "diff")
+    assert diff["effective_environment_sha256"] == digest(encode({**before, "GIT_INDEX_FILE": diff["isolated_index"]["path"]}))
 
 
 def test_changed_verifier_platform_environment_still_fails_closed(tmp_path, monkeypatch):
@@ -1273,11 +1347,11 @@ def test_verifier_diagnostic_is_retained_before_real_checks_and_redacts_values(t
     runner = verifier_runner(tmp_path)
     original = runner.command
 
-    def command(*args):
+    def command(*args, **kwargs):
         recorded = verifier_observations(runner)[-1]
         assert recorded["decision"] == "matched"
         assert recorded["expected_identity"] == recorded["observed_identity"]
-        return original(*args)
+        return original(*args, **kwargs)
 
     runner.command = command
     assert runner.run_checks("diagnostic")["passed"]
