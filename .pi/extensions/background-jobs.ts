@@ -134,6 +134,17 @@ export function selectAuditedPatch(job: BackgroundJob): string {
 	return patch;
 }
 
+function verifyFormalDetachedRunner(job: BackgroundJob, configuredRunner: string): string {
+	const formal = job as BackgroundJob & { runtime: { runner: string }; contract: { runtime_hashes: Record<string, string> } };
+	if (typeof formal.runtime.runner !== "string" || !path.isAbsolute(formal.runtime.runner)) throw new Error("Frozen detached runner path is missing");
+	const frozen = path.resolve(formal.runtime.runner);
+	if (path.resolve(configuredRunner) !== frozen) throw new Error("Detached runner differs from the frozen path");
+	const expected = formal.contract.runtime_hashes[frozen] ?? Object.entries(formal.contract.runtime_hashes).find(([key]) => path.resolve(key) === frozen)?.[1];
+	if (!expected || createHash("sha256").update(fs.readFileSync(frozen)).digest("hex") !== expected) throw new Error("Detached runner frozen pin mismatch");
+	return frozen;
+}
+
+
 function verifyFormalRuntimePins(job: BackgroundJob): void {
 	const formal = job as BackgroundJob & { runtime: { python: string; controller_source: string }; contract: { runtime_hashes: Record<string, string> } };
 	const files = [formal.runtime.python, ...["__init__.py", "formal_runtime.py", "formal_artifacts.py", "formal_campaign.py", "strata_runtime.py"].map(name => path.join(formal.runtime.controller_source, "ephy_worker", name))];
@@ -498,6 +509,7 @@ export default function (pi: ExtensionAPI): void {
 					job.task = formalSpec.contract.task;
 					job.timeoutMinutes = formalSpec.contract.timeout_seconds / 60;
 					job.maxRepairAttempts = formalSpec.contract.max_repairs;
+					verifyFormalDetachedRunner(job, runner);
 					job.submitting_process = await captureSubmittingProcess(pi, job);
 				}
 				fs.mkdirSync(jobDir, { recursive: true });
@@ -505,7 +517,19 @@ export default function (pi: ExtensionAPI): void {
 				const jobFile = path.join(jobDir, "job.json");
 				atomicWriteJson(jobFile, job);
 
-				const launch = await startDetachedRunner(pi, shell, runner, jobFile);
+				let verifiedRunner = runner;
+				if (job.schemaVersion === 2) {
+					try {
+						verifiedRunner = verifyFormalDetachedRunner(job, runner);
+					} catch (error) {
+						job.status = "failed";
+						job.updatedAt = now();
+						job.message = String(error);
+						atomicWriteJson(jobFile, job);
+						throw error;
+					}
+				}
+				const launch = await startDetachedRunner(pi, shell, verifiedRunner, jobFile);
 				if (launch.code !== 0 || !launch.pid) {
 					job.status = "failed";
 					job.updatedAt = now();

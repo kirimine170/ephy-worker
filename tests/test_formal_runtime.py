@@ -1603,7 +1603,10 @@ def test_documented_pi_submitter_is_allowed_offline(tmp_path, backend):
     shutil.copy2(node, caller)
     state = tmp_path / "state"
     # Keep the venv interpreter symlink and bind pins to the same absolute spelling.
+    runner_file = tmp_path / "runner.ps1"
+    runner_file.write_text("# offline fixture; never executed\n")
     runtime = {
+        "runner": str(runner_file),
         "python": str(Path(sys.executable).absolute()),
         "pi": str(caller),
         "controller_source": str(REPOSITORY / "src"),
@@ -1613,7 +1616,7 @@ def test_documented_pi_submitter_is_allowed_offline(tmp_path, backend):
     frozen_contract["runtime_hashes"] = {
         str(path.absolute()): file_hash(path)
         for path in [
-            Path(sys.executable), caller,
+            Path(sys.executable), caller, runner_file,
             *[REPOSITORY / "src/ephy_worker" / name
               for name in ("__init__.py", "formal_runtime.py", "formal_artifacts.py", "formal_campaign.py", "strata_runtime.py")],
         ]
@@ -1626,8 +1629,6 @@ def test_documented_pi_submitter_is_allowed_offline(tmp_path, backend):
     }
     spec_file = tmp_path / "spec.json"
     spec_file.write_bytes(encode(spec))
-    runner_file = tmp_path / "runner.ps1"
-    runner_file.write_text("# offline fixture; never executed\n")
     probe = r"""
 import json,sys
 from types import SimpleNamespace
@@ -1814,14 +1815,17 @@ def test_strata_module_pin_blocks_before_helper_or_launch(tmp_path, backend, mut
     )
     for name in module_names:
         shutil.copy2(REPOSITORY / "src/ephy_worker" / name, package / name)
+    runner_file = tmp_path / "runner.ps1"
+    runner_file.write_text("# offline mock; never executed\n")
     runtime = {
+        "runner": str(runner_file),
         "python": str(Path(sys.executable).absolute()), "pi": str(caller),
         "controller_source": str(package.parent), "backend": backend,
     }
     frozen_contract = contract()
     frozen_contract["runtime_hashes"] = {
         str(path.absolute()): file_hash(path)
-        for path in [Path(runtime["python"]), caller, *[package / name for name in module_names]]
+        for path in [Path(runtime["python"]), caller, runner_file, *[package / name for name in module_names]]
     }
     strata_module = package / module_name
     (tmp_path / "control-module.txt").write_text(module_name, encoding="utf-8")
@@ -1843,8 +1847,6 @@ def test_strata_module_pin_blocks_before_helper_or_launch(tmp_path, backend, mut
     }
     spec_file = tmp_path / "spec.json"
     spec_file.write_bytes(encode(spec))
-    runner_file = tmp_path / "runner.ps1"
-    runner_file.write_text("# offline mock; never executed\n")
     state = tmp_path / "state"
     script = r"""
 import {spawnSync} from "node:child_process";
@@ -2002,3 +2004,248 @@ def test_strata_dispatch_pin_precedes_actual_module_import(tmp_path, mutation):
     else:
         assert marker.exists() is False, result.stderr
         assert "Strata dispatch module lacks a matching frozen pin" in result.stderr
+
+
+@pytest.mark.parametrize("mutation", [
+    "none", "missing_runtime", "relative_path", "path_override",
+    "missing_pin", "changed_before", "changed_after_helper",
+])
+def test_formal_detached_runner_uses_frozen_path_and_bytes(tmp_path, mutation):
+    """Actual Pi-shaped helper and, on Windows, an inert detached PowerShell."""
+    import shutil
+
+    node = shutil.which("node")
+    assert node
+    shell = shutil.which("powershell.exe") if os.name == "nt" else None
+    if os.name == "nt":
+        assert shell, "Windows CI must exercise the actual detached launcher"
+    caller = tmp_path / "pi.exe"
+    shutil.copy2(node, caller)
+    marker = tmp_path / "runner-executed.json"
+    runner_file = tmp_path / "frozen-runner.ps1"
+    marker_literal = str(marker).replace("'", "''")
+    runner_file.write_text(
+        "param([string]$JobFile)\n"
+        "$ErrorActionPreference = 'Stop'\n"
+        "$fixtureSha = [Security.Cryptography.SHA256]::Create()\n"
+        "$fixtureHash = [BitConverter]::ToString($fixtureSha.ComputeHash([IO.File]::ReadAllBytes($PSCommandPath))).Replace('-', '').ToLowerInvariant()\n"
+        "$fixturePath = $PSCommandPath.Replace('\\', '\\\\')\n"
+        "$fixtureJson = '{\"path\":\"' + $fixturePath + '\",\"sha256\":\"' + $fixtureHash + '\"}'\n"
+        f"[IO.File]::WriteAllText('{marker_literal}.tmp', $fixtureJson)\n"
+        f"[IO.File]::Move('{marker_literal}.tmp', '{marker_literal}')\n",
+        encoding="utf-8",
+    )
+    runtime = {
+        "python": str(Path(sys.executable).absolute()), "pi": str(caller),
+        "controller_source": str(REPOSITORY / "src"), "runner": str(runner_file),
+    }
+    pins = {
+        str(file.absolute()): file_hash(file)
+        for file in [
+            Path(runtime["python"]), caller, runner_file,
+            *[REPOSITORY / "src/ephy_worker" / name for name in (
+                "__init__.py", "formal_runtime.py", "formal_artifacts.py",
+                "formal_campaign.py", "strata_runtime.py",
+            )],
+        ]
+    }
+    expected_runner_hash = file_hash(runner_file)
+    configured = runner_file
+    if mutation == "missing_runtime":
+        del runtime["runner"]
+    elif mutation == "relative_path":
+        runtime["runner"] = runner_file.name
+    elif mutation == "path_override":
+        configured = tmp_path / "different-runner.ps1"
+        shutil.copy2(runner_file, configured)  # Same bytes must not authorize a different path.
+    elif mutation == "missing_pin":
+        del pins[str(runner_file)]
+    elif mutation == "changed_before":
+        runner_file.write_text(runner_file.read_text(encoding="utf-8") + "\n# after freeze\n", encoding="utf-8")
+    frozen_contract = contract()
+    frozen_contract["runtime_hashes"] = pins
+    spec = {
+        "repoRoot": str(tmp_path), "baseRevision": "a" * 40,
+        "runtime": runtime, "contract": frozen_contract, "controls": {},
+        "model_identities": {role: {"model_id": "offline"} for role in ("planner", "implementer", "auditor")},
+        "verifier_identity": {},
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_bytes(encode(spec))
+    state = tmp_path / "state"
+    script = r"""
+import {spawnSync} from "node:child_process";
+import {readFileSync,writeFileSync,existsSync,readdirSync} from "node:fs";
+import {createHash} from "node:crypto";
+const [extension,specFile,state,configured,shell,marker,mutation]=process.argv.slice(2);
+process.env.DUAL_PI_STATE_DIR=state;
+process.env.DUAL_JOB_RUNNER=configured;
+process.env.DUAL_POWERSHELL_EXE=shell;
+const {default:setup}=await import(extension);
+const bytes=readFileSync(specFile),spec=JSON.parse(bytes),tools=new Map();
+let helpers=0,launches=0,blocked=false,error="",launchCommand=null,launchExit=null;
+setup({registerTool:t=>tools.set(t.name,t),registerCommand(){},on(){},
+ async exec(binary,args,options){
+  if(binary==="git") return {code:0,stdout:args.includes("--show-toplevel")?spec.repoRoot:args.includes("HEAD")?spec.baseRevision:"",stderr:""};
+  if(binary===spec.runtime.python){
+   helpers++;
+   const out=spawnSync(binary,args,{cwd:options.cwd,encoding:"utf8",timeout:10000});
+   if(mutation==="changed_after_helper") writeFileSync(configured,readFileSync(configured,"utf8")+"\n# helper-time mutation\n");
+   return {code:out.status,stdout:out.stdout,stderr:out.stderr};
+  }
+  if(binary!==shell) throw new Error("Unexpected command");
+  launches++;
+  launchCommand=Buffer.from(args[args.indexOf("-EncodedCommand")+1],"base64").toString("utf16le");
+  if(shell==="fixture-shell") return {code:0,stdout:String(process.pid),stderr:""};
+  const out=spawnSync(binary,args,{encoding:"utf8",timeout:10000});
+  launchExit=out.status;
+  return {code:out.status,stdout:out.stdout,stderr:out.stderr};
+ }});
+try {
+ await tools.get("background_job_submit").execute("id",
+  {title:"Frozen runner control",task:"Offline fixture",doneWhen:["No model"],formalSpecPath:specFile,
+   formalSpecSha256:createHash("sha256").update(bytes).digest("hex")},
+  undefined,undefined,{cwd:spec.repoRoot,hasUI:true,ui:{confirm(){return true;},notify(){}}});
+} catch(exc) {blocked=true;error=String(exc);}
+if(launches && shell!=="fixture-shell"){
+ const deadline=Date.now()+10000;
+ while(!existsSync(marker) && Date.now()<deadline) await new Promise(resolve=>setTimeout(resolve,20));
+}
+const jobDirs=existsSync(state+"/jobs")?readdirSync(state+"/jobs"):[];
+const records=jobDirs.map(name=>JSON.parse(readFileSync(state+"/jobs/"+name+"/job.json","utf8")));
+console.log(JSON.stringify({blocked,error,helpers,launches,launchCommand,launchExit,
+ records:records.map(job=>({status:job.status,message:job.message})),
+ marker:existsSync(marker)?JSON.parse(readFileSync(marker,"utf8")):null,
+ admissionClaim:existsSync(state+"/background-admission.lock")}));
+"""
+    script_file = tmp_path / "runner-control.mjs"
+    script_file.write_text(script, encoding="utf-8")
+    result = subprocess.run(
+        [
+            str(caller), "--experimental-strip-types", "--experimental-loader",
+            (REPOSITORY / "tests/formal-submit-loader.mjs").as_uri(), str(script_file),
+            (REPOSITORY / ".pi/extensions/background-jobs.ts").as_uri(),
+            str(spec_file), str(state), str(configured), shell or "fixture-shell", str(marker), mutation,
+        ],
+        capture_output=True, text=True, encoding="utf-8", timeout=30, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    observed = json.loads(result.stdout)
+    write_json(tmp_path / "runner-observation.json", observed)
+    assert observed["admissionClaim"] is False
+    if mutation == "none":
+        assert observed["blocked"] is False and observed["helpers"] == observed["launches"] == 1, observed
+        assert len(observed["records"]) == 1 and observed["records"][0]["status"] == "queued"
+        assert str(runner_file).replace("'", "''") in observed["launchCommand"]
+        if shell:
+            assert observed["launchExit"] == 0, observed
+            assert observed["marker"] == {"path": str(runner_file), "sha256": expected_runner_hash}
+            assert json.loads(marker.read_text(encoding="utf-8")) == observed["marker"]
+    else:
+        assert observed["blocked"] is True and observed["launches"] == 0, observed
+        assert observed["marker"] is None and not marker.exists(), observed
+        if mutation == "changed_after_helper":
+            assert observed["helpers"] == 1
+            assert len(observed["records"]) == 1 and observed["records"][0]["status"] == "failed", observed
+            assert "pin mismatch" in observed["records"][0]["message"]
+        else:
+            assert observed["helpers"] == 0 and observed["records"] == [], observed
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Actual Windows PowerShell schema-v2 dispatch")
+@pytest.mark.parametrize("mutation", [
+    "none", "cwd_shadow", "cached_shadow", "missing_initializer", "changed_initializer",
+    "missing_controller", "changed_controller", "missing_python",
+])
+def test_formal_powershell_dispatch_imports_only_verified_controller(tmp_path, mutation):
+    """Runs the real script; fixture controller writes identities and exits without models."""
+    import py_compile
+    import shutil
+
+    shell = shutil.which("powershell.exe")
+    assert shell
+    source = tmp_path / "pinned-source"
+    package = source / "ephy_worker"
+    package.mkdir(parents=True)
+    marker = tmp_path / "pinned-executed.json"
+    shadow_marker = tmp_path / "shadow-executed.txt"
+    modules = ("__init__.py", "formal_runtime.py", "formal_artifacts.py", "formal_campaign.py", "strata_runtime.py")
+    for name in modules:
+        (package / name).write_text("# inert frozen fixture\n", encoding="utf-8")
+    (package / "__init__.py").write_text("ORIGIN = 'frozen-initializer'\n", encoding="utf-8")
+    (package / "formal_runtime.py").write_text(
+        "import json, sys\nfrom pathlib import Path\nimport ephy_worker\n"
+        "from . import formal_artifacts, formal_campaign, strata_runtime\n"
+        "def main():\n"
+        "    evidence = {'interpreter': sys.executable, 'isolated': sys.flags.isolated,\n"
+        "                'initializer': ephy_worker.__file__, 'initializer_origin': ephy_worker.ORIGIN,\n"
+        "                'controller': __file__, 'argv': sys.argv[1:],\n"
+        "                'other_modules': [m.__file__ for m in (formal_artifacts, formal_campaign, strata_runtime)]}\n"
+        f"    Path({str(marker)!r}).write_text(json.dumps(evidence), encoding='utf-8')\n"
+        "if __name__ == '__main__': main()\n",
+        encoding="utf-8",
+    )
+    runtime = {"python": str(Path(sys.executable).absolute()), "controller_source": str(source)}
+    pins = {str(file): file_hash(file) for file in [Path(runtime["python"]), *[package / name for name in modules]]}
+    frozen_bytes = {name: (package / name).read_bytes() for name in modules}
+    shadow_code = "from pathlib import Path\n" + f"Path({str(shadow_marker)!r}).write_text('unverified import')\n"
+    cwd = tmp_path / "dirty-cwd"
+    cwd.mkdir()
+    if mutation == "cwd_shadow":
+        shadow = cwd / "ephy_worker"
+        shadow.mkdir()
+        (shadow / "__init__.py").write_text(shadow_code, encoding="utf-8")
+        (shadow / "formal_runtime.py").write_text(shadow_code, encoding="utf-8")
+    if mutation == "cached_shadow":
+        # Valid timestamp/size cache for the verified initializer must not substitute unchecked bytecode.
+        initializer = package / "__init__.py"
+        st = initializer.stat()
+        initializer.write_text(shadow_code, encoding="utf-8")
+        pyc = py_compile.compile(str(initializer), doraise=True)
+        initializer.write_bytes(frozen_bytes["__init__.py"])
+        os.utime(initializer, (st.st_atime, st.st_mtime))
+        # Timestamp pyc header: match frozen source's mtime and size after restoring its pinned bytes.
+        import struct
+        cache = Path(pyc)
+        data = cache.read_bytes()
+        cache.write_bytes(data[:8] + struct.pack("<II", int(st.st_mtime) & 0xFFFFFFFF, st.st_size) + data[16:])
+    elif mutation.startswith("missing_"):
+        target = Path(runtime["python"]) if mutation == "missing_python" else package / (
+            "__init__.py" if mutation == "missing_initializer" else "formal_runtime.py"
+        )
+        del pins[str(target)]
+    elif mutation.startswith("changed_"):
+        target = package / ("__init__.py" if mutation == "changed_initializer" else "formal_runtime.py")
+        target.write_text(shadow_code, encoding="utf-8")
+    runner_file = tmp_path / "run-background-job.ps1"
+    shutil.copy2(REPOSITORY / "tools/pi-local/windows/run-background-job.ps1", runner_file)
+    # The v2 branch checks this sibling's existence but does not execute it.
+    shutil.copy2(REPOSITORY / "tools/pi-local/windows/write-git-artifacts.ps1", tmp_path / "write-git-artifacts.ps1")
+    job_file = tmp_path / "job.json"
+    write_json(job_file, {"schemaVersion": 2, "runtime": runtime, "contract": {"runtime_hashes": pins}})
+    env = dict(os.environ, PYTHONPATH=str(cwd))
+    result = subprocess.run(
+        [shell, "-NoProfile", "-NonInteractive", "-File", str(runner_file), "-JobFile", str(job_file)],
+        cwd=cwd, env=env, capture_output=True, text=True, encoding="utf-8", timeout=20, check=False,
+    )
+    observed = {
+        "exit_code": result.returncode, "stderr": result.stderr,
+        "pinned_marker": json.loads(marker.read_text(encoding="utf-8")) if marker.exists() else None,
+        "shadow_marker": shadow_marker.exists(),
+        "frozen_hashes": pins,
+    }
+    write_json(tmp_path / "dispatch-observation.json", observed)
+    assert shadow_marker.exists() is False, observed
+    if mutation in ("none", "cwd_shadow", "cached_shadow"):
+        assert result.returncode == 0 and marker.exists(), observed
+        identity = observed["pinned_marker"]
+        assert Path(identity["interpreter"]).resolve() == Path(runtime["python"]).resolve()
+        assert identity["isolated"] == 1
+        assert identity["initializer"] == str(package / "__init__.py")
+        assert identity["initializer_origin"] == "frozen-initializer"
+        assert identity["controller"] == str(package / "formal_runtime.py")
+        assert identity["other_modules"] == [str(package / name) for name in modules[2:]]
+        assert identity["argv"] == ["--job", str(job_file)]
+    else:
+        assert result.returncode != 0 and marker.exists() is False, observed
+        assert "Frozen controller bootstrap pin mismatch" in result.stderr

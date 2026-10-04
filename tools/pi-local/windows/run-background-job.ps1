@@ -508,7 +508,63 @@ if ($job.schemaVersion -eq 2) {
     throw "Formal Python interpreter is unavailable"
   }
   $env:PYTHONPATH = [string]$job.runtime.controller_source
-  & $formalPython -m ephy_worker.formal_runtime --job $JobFile
+  $formalBootstrap = @'
+import hashlib, importlib.abc, importlib.util, json, sys
+from pathlib import Path
+
+job_file = Path(sys.argv[1]).resolve(strict=True)
+job = json.loads(job_file.read_text(encoding="utf-8"))
+runtime = job["runtime"]
+source = Path(runtime["controller_source"]).resolve(strict=True)
+pins = job["contract"]["runtime_hashes"]
+if Path(sys.executable).resolve(strict=True) != Path(runtime["python"]).resolve(strict=True):
+    raise SystemExit("Frozen controller bootstrap interpreter mismatch")
+modules = {}
+files = [Path(runtime["python"]), *[
+    source / "ephy_worker" / name for name in (
+        "__init__.py", "formal_runtime.py", "formal_artifacts.py",
+        "formal_campaign.py", "strata_runtime.py",
+    )
+]]
+for file in files:
+    expected = pins.get(str(file)) or pins.get(str(file.resolve(strict=True)))
+    data = file.read_bytes()
+    if not expected or hashlib.sha256(data).hexdigest() != expected:
+        raise SystemExit("Frozen controller bootstrap pin mismatch: " + str(file))
+    if file.suffix == ".py":
+        name = "ephy_worker" if file.name == "__init__.py" else "ephy_worker." + file.stem
+        modules[name] = (file, data)
+
+class FrozenController(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname in modules:
+            file, _ = modules[fullname]
+            return importlib.util.spec_from_loader(
+                fullname, self, origin=str(file), is_package=fullname == "ephy_worker",
+            )
+        if fullname.startswith("ephy_worker."):
+            raise ImportError("Controller module lacks a frozen bootstrap pin: " + fullname)
+        return None
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        file, data = modules[module.__name__]
+        module.__file__ = str(file)
+        if module.__name__ == "ephy_worker":
+            module.__path__ = [str(file.parent)]
+        exec(compile(data, str(file), "exec"), module.__dict__)
+
+sys.path.insert(0, str(source))
+sys.meta_path.insert(0, FrozenController())
+from ephy_worker.formal_runtime import main
+sys.argv = [sys.argv[0], "--job", str(job_file)]
+main()
+'@
+  # Base64 avoids Windows PowerShell 5 native-argument quote stripping.
+  $bootstrapBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($formalBootstrap))
+  & $formalPython -I -c "import base64; exec(compile(base64.b64decode('$bootstrapBase64'), '<frozen-controller-bootstrap>', 'exec'))" $JobFile
   exit $LASTEXITCODE
 }
 $cancelFile = Join-Path $job.jobDir "cancel.request"
