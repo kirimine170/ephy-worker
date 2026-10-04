@@ -5,14 +5,14 @@ formal audit, accepted proposal or adoption decision. Its baseline is main
 26ddbe65a9bd9fe530dca13238c2eb3838f3aee5. Public development fixtures contain no
 held-out data. Real model generation is a separately authorized operation.
 
-The fixed_trial path is currently blocked before consumer launch. Existing
-external-review bundles do not contain a pre-authoring held-out/gold freeze or
-closed capture of actual generation HTTP inputs. This version cannot prove that
-the candidate was authored without exposure to that data. No flag or supplied
-success statement enables live trials: the capture workflow must first be
-integrated, tested, bound to the generation job, and independently reviewed.
-The working native_controls path uses only public synthetic fixtures. Pure
-scoring does not attest generation isolation or a held-out effect.
+Legacy external-review bundles lack generation isolation evidence and remain
+blocked before fixed_trial launch. The additional isolation contract now freezes
+the evaluation plan, raw batch/gold, evaluator and controller source closure
+before candidate authoring, captures every final HTTP input and tool result, and
+binds the capture to the same external job and actual Pi processes. There is no
+enabling flag. Native controls use an owned fake provider; their capture cannot
+authorize a real trial. No real generation or held-out trial has been performed.
+Pure scoring does not attest generation isolation or a held-out effect.
 
 ## Frozen experiment
 
@@ -35,16 +35,17 @@ files stay outside model-visible input directories.
 build_contract in ephy_worker.verifier_triage_consumer takes repository, Pi,
 observed existing-service identity, batch, gold, generated skill, a fresh artifact
 directory, and tokenizer argv. Use purpose fixed_trial and supply
-generation_job. The existing identity must match the generation job. Canonical
+generation_job, isolation_freeze and its externally retained isolation_sha256.
+The existing identity must match the generation job. Canonical
 documents must match the job's frozen governance root byte for byte. Both
 generation and consumers use the same resource lock.
 Generation proposal caps must be at most 8 requests, 2200 output tokens, 1024
 response tokens, 300 stage seconds and 900 job seconds with repair 0; a larger
 existing proposal cannot be relabeled with smaller reservations. These checks
-do not replace the blocked pre-authoring isolation gate.
+do not replace the pre-authoring isolation gate.
 
-Once the blocked capture gate is implemented and independently reviewed, and
-explicit execution authorization is given, the intended command is:
+After exact-head CI and independent review of the isolation adapter, and explicit
+execution authorization, a fully bound contract uses this command:
 
 ~~~text
 python -m ephy_worker.verifier_triage_consumer --contract ABSOLUTE_CONTRACT_JSON --sha256 FROZEN_SHA256 --execute-authorized
@@ -146,3 +147,68 @@ requests, responses, process identities, traces and immutable receipts. The fake
 model name, synthetic counter and real_model_contacted: false distinguish these
 controls from a real experiment. Failed development artifacts remain separate;
 they are never relabeled as passed live evidence.
+
+## Generation isolation evidence
+
+freeze_generation must run before either authoring process or candidate creation.
+Its fresh private directory is outside the generation worktree. freeze.json
+contains the fixed 12-case/two-repeat plan, scope, repair 0, unchanged role/job
+caps, raw batch/gold hashes, evaluator hash, canonical documents, controller
+Python/dependencies and source/runtime pins. Retain the freeze hash outside the
+candidate. For a real job it also binds job ID, base, contract hash and worktree;
+the actual pinned Strata tokenizer/spec must match the existing deployment.
+
+IsolatedStrataRunner composes the existing external Strata proposal runner.
+The adapter, consumer controller and additional guard must already be included
+in the job's runtime_hashes before submission. It preserves the inherited
+preflight, baseline and independent checks, frozen proposal, stop and review
+requirements. It restricts generation reads to a closed snapshot of Markdown,
+JSON, TOML and YAML files, and writes to the one Markdown skill only.
+Planner and implementer remain separate fresh processes/sessions. The additional
+extension is loaded before the unchanged final governance gate.
+
+A Pi-owned preview records the complete input before the last governance hook.
+The HTTP gateway independently captures the actual final body and permits only
+the pinned governance transformation (first-request acknowledgement tool choice).
+Preview bytes are never reported as the transmitted body. Every model-visible
+tool call and full tool-result byte string must match the controller trace and
+pre-frozen read hash. Unknown user context, missing/duplicate IDs, changed
+source/config, another session/process, pending or substituted results, and
+held-out/gold exposure reject before upstream forwarding. This is a composed
+tool/runtime boundary, not an OS sandbox or a semantic declassification scheme.
+
+Before each POST, an exclusive admission artifact retains the actual raw body,
+preview hash, full trace prefix, freeze hash, role/session, governance nonce and
+observed process. Completed responses form a hash chain. Missing or changed
+earlier captures and identical replayed bodies latch failure. Receipts retain
+exit code, raw stdout/session/trace, input snapshots, actual HTTP request/response
+and counter records. The saved-evidence verifier checks every capture, full
+tool-result binding, strict request/response usage, source pins and two distinct
+processes, without making a model request.
+
+verify_live_binding additionally requires the same batch/gold/candidate,
+deployment and external job contract, and matches captured PID, trace and session
+hashes to that proposal's independently checked model provenance.
+verify_external_proposal must still pass. Native capture is rejected even if
+someone changes its synthetic_only label. Consumer contracts pin the complete
+capture tree and recheck it before and after execution.
+
+The read-only independent verification command is:
+
+~~~text
+python -m ephy_worker.verifier_triage_isolation --freeze ABSOLUTE_FREEZE_JSON --sha256 RETAINED_PRE_AUTHORING_SHA256
+~~~
+
+The separately named native control command is:
+
+~~~text
+python scripts/verify_triage_generation_boundary.py --pi EXISTING_PI_EXE --artifacts FRESH_PRIVATE_DIRECTORY --case all
+~~~
+
+It launches only an owned scripted fake model. The normal path uses two fresh
+Pi sessions and seven fake POSTs. Missing prior capture, batch/gold leakage,
+duplicate concurrent POST, changed session, changed raw hash, substituted tool
+result and changed frozen gold controls stop before the next upstream POST.
+Independent verification runs in another Python process. Failed development
+runs remain retained; synthetic tests do not establish a held-out effect,
+formal audit, real-model execution, or adoption.

@@ -98,14 +98,13 @@ def validate_generation_budget(job):
                 "Generation reservation exceeded: " + key)
 
 
-def live_generation_isolation_gate():
-    # Existing external-review bundles prove generation/verification provenance,
-    # but contain no pre-authoring held-out freeze or closed actual HTTP input
-    # capture. Do not substitute a final skill ID scan for that missing evidence.
-    raise InvalidEvaluation(
-        "Live trial blocked: pre-authoring held-out/gold freeze and actual generation input isolation "
-        "capture must be integrated and independently verified before enabling fixed_trial"
-    )
+def live_generation_isolation_gate(generation_job=None, isolation_freeze=None, isolation_sha256=None,
+                                   batch_sha256=None, gold_sha256=None, skill_sha256=None):
+    require(generation_job and isolation_freeze and isolation_sha256,
+            "Live trial blocked: pre-authoring held-out/gold freeze and actual generation input isolation capture required")
+    from .verifier_triage_isolation import verify_live_binding
+    return verify_live_binding(Path(generation_job), Path(isolation_freeze), isolation_sha256,
+                               batch_sha256, gold_sha256, skill_sha256)
 
 
 def snapshot(root):
@@ -166,7 +165,9 @@ def validate_contract(contract):
                 and contract["identity"]["listener"]["pid"]
                 == contract["identity"]["engine"]["pid"] == os.getpid(), "Not an owned fake provider")
     else:
-        live_generation_isolation_gate()
+        live_generation_isolation_gate(contract["generation_job"], contract.get("isolation_freeze"),
+                                       contract.get("isolation_sha256"), frozen.batch_sha256,
+                                       frozen.gold_sha256, frozen.skill_sha256)
         job = json.loads(Path(contract["generation_job"]).read_bytes())
         verify_external_proposal(Path(contract["generation_job"]))
         require(contract["resource_lock"] == job["runtime"]["resource_lock"], "Wrong shared resource lock")
@@ -197,6 +198,7 @@ def build_contract(
     repository: Path, pi: Path, identity: dict, batch: Path, gold: Path, skill: Path,
     directory: Path, token_argv: list[str], *, purpose="fixed_trial",
     generation_job: Path | None = None, stage_seconds=STAGE_SECONDS,
+    isolation_freeze: Path | None = None, isolation_sha256: str | None = None,
 ) -> Path:
     """Freeze an already generated candidate; never read gold into a model root."""
     require(purpose in {"fixed_trial", "native_controls"}, "Unknown purpose")
@@ -212,7 +214,8 @@ def build_contract(
         require(generation_job is not None, "Live trial requires bound external proposal")
         job = json.loads(generation_job.read_bytes())
         validate_generation_budget(job)
-        live_generation_isolation_gate()
+        live_generation_isolation_gate(generation_job, isolation_freeze, isolation_sha256,
+                                       sha256(batch.read_bytes()), sha256(gold.read_bytes()), sha256(skill.read_bytes()))
         require(skill.resolve() == (Path(job["worktreePath"]) / SKILL_PATH).resolve(),
                 "Skill is not the generated candidate")
         verify_external_proposal(generation_job)
@@ -264,6 +267,10 @@ def build_contract(
     if generation_job:
         paths.append(str(generation_job))
         paths += list(job["contract"]["runtime_hashes"])
+    if isolation_freeze:
+        require(purpose == "fixed_trial", "Native consumer must not claim generation isolation")
+        snapshot(isolation_freeze.parent)
+        paths += [str(p) for p in isolation_freeze.parent.rglob("*") if p.is_file()]
     pins = {name: sha256(Path(name).read_bytes()) for name in paths}
     frozen = FrozenTrial(
         BASE_REVISION, evaluator_sha256(), pins[str(private / "batch.json")],
@@ -282,6 +289,8 @@ def build_contract(
         "max_requests": 8, "max_log_bytes": 8388608, "max_process_rss_bytes": 4294967296,
         "minimum_free_ram_bytes": 4294967296, "minimum_free_disk_bytes": 2147483648,
         "budgets": budget_reservations(), "generation_job": str(generation_job) if generation_job else None,
+        "isolation_freeze": str(isolation_freeze) if isolation_freeze else None,
+        "isolation_sha256": isolation_sha256,
         "dependency_versions": {name: version(name) for name in ("httpx", "psutil", "jsonschema")},
         "controller": {"executable": str(Path(sys.executable).resolve()), "python_version": sys.version},
     }
@@ -306,7 +315,8 @@ def count_payload(contract, raw, directory, label):
     measured = json.loads(result.stdout)
     require(measured.get("payload_sha256") == sha256(raw), "Tokenizer measured different payload")
     require(measured.get("model_id") == contract["identity"]["model_id"], "Wrong tokenizer model")
-    if contract["purpose"] == "fixed_trial":
+    if (contract["purpose"] == "fixed_trial" or contract["purpose"] == "generation_capture"
+            and contract["identity"]["model_id"] != "synthetic-triage-generation-fixture"):
         require(measured.get("model_generation_requests") == 0
                 and measured.get("spec_sha256") == contract["pins"][contract["token_argv"][3]]
                 and isinstance(measured.get("rendered_sha256"), str)
@@ -336,14 +346,15 @@ def payload_strings(value, depth=0):
 
 class Gateway:
     """An owned loopback capture boundary; fixed upstream, no arbitrary routes."""
-    def __init__(self, contract, directory, arm):
+    def __init__(self, contract, directory, arm, *, generation_capture=None):
         self.contract, self.directory, self.arm = contract, directory, arm
         self.records = []
         self.failure = None
         self.closed = threading.Event()
         self.deadline = time.monotonic() + contract["stage_seconds"]
         self.lock = threading.Lock()
-        self.skill = (Path(contract["private_root"]) / "skill.md").read_bytes().decode("utf-8")
+        self.skill = ((Path(contract["private_root"]) / "skill.md").read_bytes().decode("utf-8")
+                      if generation_capture is None else "")
         gateway = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -403,10 +414,11 @@ class Gateway:
                             and "max_completion_tokens" not in payload, "Wrong response cap")
                     require(not payload.get("strata_mcp") and not payload.get("response_format"),
                             "Server augmentation prohibited")
-                    leak = any(gateway.skill.replace("\r\n", "\n") in s for s in payload_strings(payload))
+                    leak = generation_capture is None and any(
+                        gateway.skill.replace("\r\n", "\n") in s for s in payload_strings(payload))
                     record.update(payload_sha256=sha256(raw), baseline_skill_leak=leak if arm == "baseline" else False)
                     require(arm != "baseline" or not leak, "Baseline contains candidate skill bytes")
-                    if number == 1:
+                    if number == 1 and generation_capture is None:
                         preview = json.loads((directory / "previews/1.json").read_bytes())
                         projection = dict(payload)
                         projection["tools"] = preview.get("tools", payload.get("tools"))
@@ -430,6 +442,8 @@ class Gateway:
                     upstream = contract["identity"]["base_url"] + "/v1/chat/completions"
                     require(not gateway.closed.is_set() and time.monotonic() < gateway.deadline,
                             "Gateway deadline/closure before forwarding")
+                    if generation_capture is not None:
+                        record.update(generation_capture.admit(raw, number))
                     record["accepted"] = True
                     with httpx.Client(trust_env=False, follow_redirects=False,
                                       timeout=max(0.01, gateway.deadline - time.monotonic())) as client:
@@ -448,6 +462,8 @@ class Gateway:
                             write_new(directory / f"http-{number}.response", body)
                             answer = (response.status_code, body, response.headers.get(
                                 "Content-Type", "application/json"))
+                    if generation_capture is not None:
+                        generation_capture.complete(number)
                     intact(contract)
                 except (GateFailure, ValueError, OSError, KeyError, TypeError, httpx.HTTPError,
                         psutil.Error, subprocess.SubprocessError) as error:
@@ -674,7 +690,8 @@ def run_contract(path: Path, expected_sha256: str):
         result["synthetic_controls"] = contract["purpose"] == "native_controls"
         result["live_execution_attested"] = contract["purpose"] == "fixed_trial"
         result["adoption_authorized"] = False
-        result["live_trial_enabled"] = False
+        result["generation_isolation_attested"] = contract["purpose"] == "fixed_trial"
+        result["live_trial_enabled"] = contract["purpose"] == "fixed_trial"
         write_new(Path(contract["directory"]) / "result.json", json_bytes(result))
     return result
 
