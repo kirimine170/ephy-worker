@@ -49,8 +49,19 @@ interface BackgroundJob {
 	verificationHistory?: Array<{ attempt: number; verificationResults: Array<{ command: string; exitCode: number; log: string }>; patchSha256: string }>;
 }
 
+interface UnreadableJob {
+	id: string;
+	title: string;
+	status: "unreadable";
+	jobDir: string;
+	createdAt: "";
+	updatedAt: "";
+	message: string;
+}
+type LoadedJob = BackgroundJob | UnreadableJob;
+
 const ACTIVE = new Set<JobStatus>(["queued", "preparing", "running", "repairing", "verifying", "cancelling"]);
-function isActive(job: BackgroundJob): boolean { return ACTIVE.has(job.status) || (job.schemaVersion === 2 && job.status === "audit_pending"); }
+function isActive(job: LoadedJob): boolean { return job.status === "unreadable" || ACTIVE.has(job.status) || (job.schemaVersion === 2 && job.status === "audit_pending"); }
 const TERMINAL = new Set<JobStatus>([
 	"external_review_pending",
 	"audit_pending",
@@ -157,22 +168,33 @@ function atomicWriteJson(filePath: string, value: unknown): void {
 	}
 }
 
-function loadJobFile(filePath: string): BackgroundJob | undefined {
+function loadJobFile(filePath: string): LoadedJob {
+	const jobDir = path.dirname(filePath);
 	try {
-		return JSON.parse(fs.readFileSync(filePath, "utf8")) as BackgroundJob;
+		const job = JSON.parse(fs.readFileSync(filePath, "utf8")) as BackgroundJob;
+		if (!job || typeof job !== "object" || Array.isArray(job) ||
+			(job.schemaVersion !== 1 && job.schemaVersion !== 2) ||
+			job.id !== path.basename(jobDir) || typeof job.jobDir !== "string" || path.resolve(job.jobDir) !== path.resolve(jobDir) ||
+			(!ACTIVE.has(job.status) && !TERMINAL.has(job.status)) ||
+			typeof job.title !== "string" || typeof job.createdAt !== "string" || typeof job.updatedAt !== "string" ||
+			!Number.isFinite(Date.parse(job.createdAt)) || !Number.isFinite(Date.parse(job.updatedAt)) ||
+			(job.runnerPid !== undefined && (!Number.isSafeInteger(job.runnerPid) || job.runnerPid <= 0))) {
+			throw new Error("Invalid job record");
+		}
+		return job;
 	} catch {
-		return undefined;
+		return { id: path.basename(jobDir), title: "Unreadable job record", status: "unreadable", jobDir,
+			createdAt: "", updatedAt: "", message: "Job state cannot be read or validated; new submissions are blocked until it is restored." };
 	}
 }
 
-function loadJobs(): BackgroundJob[] {
+function loadJobs(): LoadedJob[] {
 	const jobsDir = getJobsDir();
 	if (!fs.existsSync(jobsDir)) return [];
 	return fs
 		.readdirSync(jobsDir, { withFileTypes: true })
 		.filter((entry) => entry.isDirectory())
 		.map((entry) => loadJobFile(path.join(jobsDir, entry.name, "job.json")))
-		.filter((job): job is BackgroundJob => Boolean(job))
 		.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
@@ -186,11 +208,11 @@ function isProcessAlive(processId: number | undefined): boolean {
 	}
 }
 
-function recoverStaleJobs(): BackgroundJob[] {
+function recoverStaleJobs(): LoadedJob[] {
 	const jobs = loadJobs();
 	const currentTime = Date.now();
 	for (const job of jobs) {
-		if (!isActive(job)) continue;
+		if (job.status === "unreadable" || !isActive(job)) continue;
 		const ageMs = currentTime - Date.parse(job.updatedAt);
 		const staleWithoutPid = !job.runnerPid && ageMs > 60_000;
 		const staleDeadRunner = Boolean(job.runnerPid) && !isProcessAlive(job.runnerPid) && ageMs > 15_000;
@@ -204,7 +226,7 @@ function recoverStaleJobs(): BackgroundJob[] {
 	return loadJobs();
 }
 
-function summarize(job: BackgroundJob): string {
+function summarize(job: LoadedJob): string {
 	const suffix = job.message ? ` — ${job.message}` : "";
 	return `${job.id} [${job.status}] ${job.title}${suffix}`;
 }
@@ -217,9 +239,10 @@ function ageLabel(milliseconds: number): string {
 	return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }
 
-function progressLines(jobs: BackgroundJob[]): string[] {
+function progressLines(jobs: LoadedJob[]): string[] {
 	const job = jobs.find((candidate) => isActive(candidate)) ?? jobs[0];
 	if (!job) return ["BG: no jobs. Use /bg to start one."];
+	if (job.status === "unreadable") return [summarize(job), job.message];
 	const currentTime = Date.now();
 	let lastActivity = Date.parse(job.updatedAt);
 	try {
@@ -455,7 +478,7 @@ export default function (pi: ExtensionAPI): void {
 					details: { job, launch },
 				};
 			}
-			const currentJob = loadJobFile(jobFile) ?? job;
+			const currentJob = loadJobFile(jobFile);
 			if (currentJob.status === "queued") {
 				currentJob.runnerPid = launch.pid;
 				currentJob.updatedAt = now();
@@ -471,7 +494,7 @@ export default function (pi: ExtensionAPI): void {
 						text: `Background job submitted: ${id}\nWorktree: ${worktreePath}\nUse background_job_status or /bg-status to inspect it.`,
 					},
 				],
-				details: loadJobFile(jobFile) ?? currentJob,
+				details: loadJobFile(jobFile),
 			};
 		},
 	});
@@ -499,6 +522,7 @@ export default function (pi: ExtensionAPI): void {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const job = loadJobs().find((candidate) => candidate.id === params.jobId);
 			if (!job) return { content: [{ type: "text", text: `Unknown job: ${params.jobId}` }], details: {} };
+			if (job.status === "unreadable") return { content: [{ type: "text", text: summarize(job) }], details: job };
 			if (!isActive(job)) {
 				return { content: [{ type: "text", text: `Job ${job.id} is already ${job.status}.` }], details: job };
 			}
@@ -700,7 +724,7 @@ export default function (pi: ExtensionAPI): void {
 			for (const job of jobs) {
 				const previous = seen.get(job.id);
 				seen.set(job.id, job.status);
-				if (uiMode !== "off" && previous && previous !== job.status && TERMINAL.has(job.status)) {
+				if (uiMode !== "off" && previous && previous !== job.status && job.status !== "unreadable" && TERMINAL.has(job.status)) {
 					ctx.ui.notify(summarize(job), job.status === "review_ready" ? "info" : "warning");
 					pi.sendMessage(
 						{
