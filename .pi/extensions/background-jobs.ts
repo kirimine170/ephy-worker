@@ -46,6 +46,7 @@ interface BackgroundJob {
 	appliedAt?: string;
 	message?: string;
 	verificationResults: Array<{ command: string; exitCode: number; log: string }>;
+	submitting_process?: Record<string, unknown>;
 	verificationHistory?: Array<{ attempt: number; verificationResults: Array<{ command: string; exitCode: number; log: string }>; patchSha256: string }>;
 }
 
@@ -133,18 +134,43 @@ export function selectAuditedPatch(job: BackgroundJob): string {
 	return patch;
 }
 
-async function verifyFormalIntegration(pi: ExtensionAPI, job: BackgroundJob): Promise<void> {
-	if (job.schemaVersion !== 2) return;
+function verifyFormalRuntimePins(job: BackgroundJob): void {
 	const formal = job as BackgroundJob & { runtime: { python: string; controller_source: string }; contract: { runtime_hashes: Record<string, string> } };
 	const files = [formal.runtime.python, ...["formal_runtime.py", "formal_artifacts.py", "formal_campaign.py"].map(name => path.join(formal.runtime.controller_source, "ephy_worker", name))];
 	for (const file of files) {
 		const expected = formal.contract.runtime_hashes[file] ?? Object.entries(formal.contract.runtime_hashes).find(([key]) => path.resolve(key) === path.resolve(file))?.[1];
 		if (!expected || createHash("sha256").update(fs.readFileSync(file)).digest("hex") !== expected) throw new Error("Integration verifier runtime pin mismatch");
 	}
+}
+
+async function verifyFormalIntegration(pi: ExtensionAPI, job: BackgroundJob): Promise<void> {
+	if (job.schemaVersion !== 2) return;
+	verifyFormalRuntimePins(job);
+	const formal = job as BackgroundJob & { runtime: { python: string; controller_source: string } };
 	const check = await pi.exec(formal.runtime.python, ["-c",
 		"import sys; sys.path.insert(0,sys.argv.pop(1)); from ephy_worker.formal_runtime import main; main()",
 		formal.runtime.controller_source, "--job", path.join(job.jobDir, "job.json"), "--verify-proposal-only"], { cwd: job.repoRoot, timeout: 30_000 });
 	if (check.code !== 0) throw new Error(`Formal integration verification failed: ${check.stderr || check.stdout}`);
+}
+
+
+async function captureSubmittingProcess(pi: ExtensionAPI, job: BackgroundJob): Promise<Record<string, unknown>> {
+	verifyFormalRuntimePins(job);
+	const formal = job as BackgroundJob & { runtime: { python: string; controller_source: string; pi: string }; contract: { runtime_hashes: Record<string, string> } };
+	const executable = path.resolve(formal.runtime.pi);
+	const expected = formal.contract.runtime_hashes[executable] ?? Object.entries(formal.contract.runtime_hashes).find(([file]) => path.resolve(file) === executable)?.[1];
+	if (!expected) throw new Error("Submitting Pi runtime pin missing");
+	const observed = await pi.exec(formal.runtime.python, ["-c",
+		"import json,sys; sys.path.insert(0,sys.argv.pop(1)); from ephy_worker.formal_runtime import observe_submitting_process; print(json.dumps(observe_submitting_process(int(sys.argv[1]),sys.argv[2],sys.argv[3])))",
+		formal.runtime.controller_source, String(process.pid), executable, expected], { cwd: job.repoRoot, timeout: 30_000 });
+	if (observed.code !== 0) throw new Error(`Submitting Pi observation failed: ${observed.stderr || observed.stdout}`);
+	const identity = JSON.parse(observed.stdout);
+	if (!identity || Object.keys(identity).sort().join() !== ["pid", "created_at", "executable", "executable_sha256"].sort().join() ||
+		identity.pid !== process.pid || !Number.isFinite(identity.created_at) || identity.created_at <= 0 ||
+		identity.executable !== executable || identity.executable_sha256 !== expected) {
+		throw new Error("Submitting Pi observation identity mismatch");
+	}
+	return identity;
 }
 
 function getStateDir(): string {
@@ -472,6 +498,7 @@ export default function (pi: ExtensionAPI): void {
 					job.task = formalSpec.contract.task;
 					job.timeoutMinutes = formalSpec.contract.timeout_seconds / 60;
 					job.maxRepairAttempts = formalSpec.contract.max_repairs;
+					job.submitting_process = await captureSubmittingProcess(pi, job);
 				}
 				fs.mkdirSync(jobDir, { recursive: true });
 				fs.writeFileSync(path.join(jobDir, "TASK.md"), renderTask(job), "utf8");

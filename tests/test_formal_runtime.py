@@ -1590,3 +1590,205 @@ def test_auditor_output_binding_rejects_forged_accept(tmp_path, mutation):
     else:
         with pytest.raises(GateFailure):
             validate_observed_audit_output(tmp_path, result)
+
+
+@pytest.mark.parametrize("backend", ["owned", "external"])
+def test_documented_pi_submitter_is_allowed_offline(tmp_path, backend):
+    """Actual Pi-shaped Node parent and helper; no model or live runner."""
+    import shutil
+
+    node = shutil.which("node")
+    assert node, "The repository CI and this integration control require Node"
+    caller = tmp_path / "pi.exe"
+    shutil.copy2(node, caller)
+    state = tmp_path / "state"
+    runtime = {
+        "python": sys.executable,
+        "pi": str(caller),
+        "controller_source": str(REPOSITORY / "src"),
+        "base_url": "http://127.0.0.1:59876",
+    }
+    frozen_contract = contract()
+    frozen_contract["runtime_hashes"] = {
+        str(path.resolve()): file_hash(path)
+        for path in [
+            Path(sys.executable), caller,
+            *[REPOSITORY / "src/ephy_worker" / name
+              for name in ("formal_runtime.py", "formal_artifacts.py", "formal_campaign.py")],
+        ]
+    }
+    spec = {
+        "repoRoot": str(tmp_path), "baseRevision": "a" * 40,
+        "runtime": runtime, "contract": frozen_contract, "controls": {},
+        "model_identities": {role: {"model_id": "offline"} for role in ("planner", "implementer", "auditor")},
+        "verifier_identity": {},
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_bytes(encode(spec))
+    runner_file = tmp_path / "runner.ps1"
+    runner_file.write_text("# offline fixture; never executed\n")
+    probe = r"""
+import json,sys
+from types import SimpleNamespace
+import psutil
+import ephy_worker.formal_runtime as formal
+from ephy_worker.strata_runtime import StrataRunner
+from pathlib import Path
+job_file=Path(sys.argv[1])
+caller_pid=int(sys.argv[2])
+backend=sys.argv[3]
+caller=psutil.Process(caller_pid)
+assert caller.name().lower() == 'pi.exe'
+# Scan only the actual fixture parent; do not inspect or modify user services.
+formal.psutil.process_iter=lambda attrs:[SimpleNamespace(pid=caller.pid,info={'name':caller.name()})]
+runner=formal.FormalRunner(job_file)
+class OfflineBoundary(Exception): pass
+def stop(*args,**kwargs): raise OfflineBoundary('no model lifecycle executed')
+if backend=='owned':
+    import socket
+    socket.socket=stop
+    action=runner.start_server
+else:
+    external=StrataRunner.__new__(StrataRunner)
+    external.__dict__.update(runner.__dict__)
+    formal.FormalRunner.preflight=stop
+    action=external.preflight
+try:
+    action()
+except OfflineBoundary:
+    identity=runner.job.get('submitting_process')
+    assert identity and identity['pid']==caller_pid
+    print(json.dumps({'passed':True,'caller_pid':caller_pid,'observer_bound_identity':identity,'backend':backend,'model_or_real_runner_started':False}))
+"""
+    script = r"""
+import {spawnSync} from "node:child_process";
+import {readFileSync} from "node:fs";
+const [extension,specFile,state,runnerFile,probe,backend] = process.argv.slice(2);
+process.env.DUAL_PI_STATE_DIR=state;
+process.env.DUAL_JOB_RUNNER=runnerFile;
+process.env.DUAL_POWERSHELL_EXE="fixture-shell";
+const {default:setup}=await import(extension);
+const bytes=readFileSync(specFile);
+const spec=JSON.parse(bytes);
+const {createHash}=await import("node:crypto");
+const tools=new Map();
+let launches=0,observations=0;
+setup({registerTool:t=>tools.set(t.name,t),registerCommand(){},on(){},
+  async exec(binary,args,options){
+    if(binary==="git") return {code:0,stdout:args.includes("--show-toplevel")?spec.repoRoot:args.includes("HEAD")?spec.baseRevision:"",stderr:""};
+    if(binary===spec.runtime.python){
+      observations++;
+      const out=spawnSync(binary,args,{cwd:options.cwd,encoding:"utf8",timeout:10000});
+      return {code:out.status,stdout:out.stdout,stderr:out.stderr};
+    }
+    if(binary!=="fixture-shell") throw new Error("Unexpected command");
+    launches++;
+    return {code:0,stdout:String(process.pid),stderr:""};
+  }});
+const result=await tools.get("background_job_submit").execute("id",
+  {title:"Offline formal",task:"Offline fixture",doneWhen:["No model"],formalSpecPath:specFile,
+   formalSpecSha256:createHash("sha256").update(bytes).digest("hex")},
+  undefined,undefined,{cwd:spec.repoRoot,hasUI:true,ui:{confirm(){return true;},notify(){}}});
+if(launches!==1) throw new Error("Expected one mocked runner launch");
+const out=spawnSync(spec.runtime.python,["-c",probe,result.details.jobDir+"/job.json",String(process.pid),backend],
+  {encoding:"utf8",env:{...process.env,PYTHONPATH:spec.runtime.controller_source},timeout:10000});
+process.stdout.write(out.stdout??"");
+process.stderr.write(out.stderr??"");
+if(out.status!==0) process.exit(out.status??1);
+if(observations!==1) throw new Error("Caller identity must be obtained by one actual helper child");
+"""
+    script_file = tmp_path / "submit.mjs"
+    script_file.write_text(script, encoding="utf-8")
+    command = [
+        str(caller), "--experimental-strip-types", "--experimental-loader",
+        (REPOSITORY / "tests/formal-submit-loader.mjs").as_uri(), str(script_file),
+        (REPOSITORY / ".pi/extensions/background-jobs.ts").as_uri(),
+        str(spec_file), str(state), str(runner_file), probe, backend,
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=25, check=False)
+    assert result.returncode == 0, result.stderr
+    evidence = json.loads(result.stdout)
+    assert evidence["passed"] and evidence["backend"] == backend
+    assert evidence["observer_bound_identity"]["executable"] == str(caller.resolve())
+    assert evidence["observer_bound_identity"]["executable_sha256"] == file_hash(caller)
+    assert evidence["model_or_real_runner_started"] is False
+    assert not (state / "background-admission.lock").exists()
+
+
+@pytest.mark.parametrize("backend", ["owned", "external"])
+@pytest.mark.parametrize("mutation", [
+    "none", "foreign_pi", "missing_owner", "pid_reuse", "executable", "binary_hash",
+    "unobservable", "llama", "bad_pin", "bad_shape",
+])
+def test_submitter_allowance_never_admits_other_processes(tmp_path, monkeypatch, backend, mutation):
+    import psutil
+
+    import ephy_worker.formal_runtime as formal
+
+    executable = tmp_path / "pi.exe"
+    executable.write_bytes(b"synthetic executable identity")
+    owner = {
+        "pid": 201, "created_at": 1000.25, "executable": str(executable.resolve()),
+        "executable_sha256": file_hash(executable),
+    }
+    runner = FormalRunner.__new__(FormalRunner)
+    runner.runtime = {"pi": str(executable)}
+    runner.contract = {"runtime_hashes": {str(executable.resolve()): owner["executable_sha256"]}}
+    runner.job = {"submitting_process": copy.deepcopy(owner)}
+    actual = copy.deepcopy(owner)
+    process = SimpleNamespace(pid=201, info={"name": "pi.exe"})
+    if mutation == "foreign_pi":
+        process.pid = 202
+    elif mutation == "missing_owner":
+        runner.job.pop("submitting_process")
+    elif mutation == "pid_reuse":
+        actual["created_at"] += 1
+    elif mutation == "executable":
+        actual["executable"] = str(tmp_path / "another.exe")
+    elif mutation == "binary_hash":
+        actual["executable_sha256"] = "0" * 64
+    elif mutation == "llama":
+        process.info["name"] = "llama-server.exe"
+    elif mutation == "bad_pin":
+        runner.contract["runtime_hashes"] = {}
+    elif mutation == "bad_shape":
+        runner.job["submitting_process"]["any_pi"] = True
+    observed = []
+
+    def identity(pid):
+        observed.append(pid)
+        if mutation == "unobservable":
+            raise psutil.AccessDenied(pid)
+        return actual
+
+    monkeypatch.setattr(formal, "observed_process_identity", identity)
+    monkeypatch.setattr(formal.psutil, "process_iter", lambda _: [process])
+    names = ("pi.exe", "llama-server.exe", "strata.exe") if backend == "owned" else ("pi.exe", "llama-server.exe")
+    if mutation == "none":
+        runner.reject_conflicting_processes(names)
+        assert observed == [201]
+    else:
+        with pytest.raises(GateFailure):
+            runner.reject_conflicting_processes(names)
+        if mutation in ("foreign_pi", "missing_owner", "llama", "bad_pin", "bad_shape"):
+            assert observed == [], "Never read an unrelated process executable or bypass missing pins"
+
+
+def test_submitter_identity_remains_frozen_between_stages(tmp_path):
+    runner = FormalRunner.__new__(FormalRunner)
+    runner.job_file = tmp_path / "job.json"
+    runner.job = {"submitting_process": {"pid": 201}}
+    write_json(runner.job_file, {"submitting_process": {"pid": 202}})
+    with pytest.raises(GateFailure, match="Frozen submitting process identity"):
+        runner.intact()
+
+
+def test_submitter_observer_refuses_unrelated_pid_before_executable_read(monkeypatch):
+    import ephy_worker.formal_runtime as formal
+
+    unrelated = SimpleNamespace(pid=201, create_time=lambda: 1000.0)
+    observer = SimpleNamespace(parents=list)
+    monkeypatch.setattr(formal.psutil, "Process", lambda pid=None: observer if pid is None else unrelated)
+    monkeypatch.setattr(formal, "observed_process_identity", lambda _: pytest.fail("Unrelated executable was read"))
+    with pytest.raises(GateFailure, match="not an ancestor"):
+        formal.observe_submitting_process(201, "/unrelated/private.exe", "a" * 64)

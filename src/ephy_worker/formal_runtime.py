@@ -11,6 +11,7 @@ import configparser
 import copy
 import importlib.metadata
 import json
+import math
 import os
 import re
 import shutil
@@ -69,6 +70,39 @@ def role_thinking(runtime: dict, role: str) -> str:
     if value not in ("off", "medium", "high"):
         raise GateFailure("Invalid frozen thinking level")
     return value
+
+
+def observed_process_identity(pid: int) -> dict:
+    process = psutil.Process(pid)
+    executable = Path(process.exe()).resolve(strict=True)
+    return {
+        "pid": pid,
+        "created_at": process.create_time(),
+        "executable": str(executable),
+        "executable_sha256": file_hash(executable),
+    }
+
+
+def observe_submitting_process(pid: int, executable: str, expected_sha256: str) -> dict:
+    """Observe the frozen Pi caller from its actual helper-child process."""
+    if type(pid) is not int or pid <= 0:
+        raise GateFailure("Invalid submitting process PID")
+    try:
+        caller = psutil.Process(pid)
+        if not any(
+            parent.pid == pid and parent.create_time() == caller.create_time()
+            for parent in psutil.Process().parents()
+        ):
+            raise GateFailure("Submitting process is not an ancestor of its observer")
+        identity = observed_process_identity(pid)
+        if (
+            identity["executable"] != str(Path(executable).resolve(strict=True))
+            or identity["executable_sha256"] != expected_sha256
+        ):
+            raise GateFailure("Submitting process differs from the frozen Pi executable")
+        return identity
+    except (psutil.Error, OSError) as exc:
+        raise GateFailure("Submitting process identity cannot be observed") from exc
 
 
 def injected_context_pins(runtime: dict, controls: dict) -> dict[str, str]:
@@ -585,6 +619,38 @@ class FormalRunner:
         self.loaded_model: str | None = None
         self.campaign_stop: Path | None = None
 
+    def reject_conflicting_processes(self, names: tuple[str, ...]) -> None:
+        owner = self.job.get("submitting_process")
+        if owner is not None:
+            if (
+                not isinstance(owner, dict)
+                or set(owner) != {"pid", "created_at", "executable", "executable_sha256"}
+                or type(owner["pid"]) is not int
+                or owner["pid"] <= 0
+                or type(owner["created_at"]) not in (int, float)
+                or not math.isfinite(owner["created_at"])
+                or owner["created_at"] <= 0
+            ):
+                raise GateFailure("Invalid submitting process identity")
+            frozen_pi = str(Path(self.runtime["pi"]).resolve(strict=True))
+            if (
+                owner["executable"] != frozen_pi
+                or owner["executable_sha256"] != self.contract["runtime_hashes"].get(frozen_pi)
+                or not re.fullmatch("[a-f0-9]{64}", str(owner["executable_sha256"]))
+            ):
+                raise GateFailure("Submitting process lacks the frozen Pi executable pin")
+        for process in psutil.process_iter(["name"]):
+            name = (process.info["name"] or "").lower()
+            if name not in names:
+                continue
+            if name == "pi.exe" and owner is not None and process.pid == owner["pid"]:
+                try:
+                    if observed_process_identity(process.pid) == owner:
+                        continue
+                except (psutil.Error, OSError) as exc:
+                    raise GateFailure("Submitting Pi identity cannot be revalidated") from exc
+            raise GateFailure("Another Pi/model process is active; do not duplicate or stop it")
+
     def router_request(self, route: str, body: dict | None = None) -> dict:
         with httpx.Client(trust_env=False, timeout=15) as client:
             url = self.runtime["base_url"] + route
@@ -599,9 +665,7 @@ class FormalRunner:
         url = urlparse(self.runtime["base_url"])
         if url.scheme != "http" or url.hostname != "127.0.0.1" or not url.port or url.path:
             raise GateFailure("Only an owned loopback model router is supported")
-        for process in psutil.process_iter(["name"]):
-            if (process.info["name"] or "").lower() in ("pi.exe", "llama-server.exe", "strata.exe"):
-                raise GateFailure("Another Pi/model process is active; do not duplicate or stop it")
+        self.reject_conflicting_processes(("pi.exe", "llama-server.exe", "strata.exe"))
         with socket.socket() as sock:
             if sock.connect_ex(("127.0.0.1", url.port)) == 0:
                 raise GateFailure("Frozen model router port is occupied")
@@ -744,6 +808,8 @@ class FormalRunner:
 
     def intact(self) -> None:
         current = read_json(self.job_file)
+        if current.get("submitting_process") != self.job.get("submitting_process"):
+            raise GateFailure("Frozen submitting process identity changed")
         if digest(encode(current["contract"])) != self.contract_sha:
             raise GateFailure("Frozen contract changed")
         for field in (

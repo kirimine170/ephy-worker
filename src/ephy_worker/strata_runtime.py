@@ -226,9 +226,7 @@ class StrataRunner(FormalRunner):
         verify_identity(self.identity)
 
     def preflight(self) -> None:
-        for process in psutil.process_iter(["name"]):
-            if (process.info["name"] or "").lower() in ("pi.exe", "llama-server.exe"):
-                raise GateFailure("Another Pi/model runner is active; do not duplicate or stop it")
+        self.reject_conflicting_processes(("pi.exe", "llama-server.exe"))
         super().preflight()
 
     def verify_model_artifacts(self, model: str) -> None:
