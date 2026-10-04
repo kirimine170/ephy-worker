@@ -1603,7 +1603,7 @@ def test_documented_pi_submitter_is_allowed_offline(tmp_path, backend):
     shutil.copy2(node, caller)
     state = tmp_path / "state"
     runtime = {
-        "python": sys.executable,
+        "python": str(Path(sys.executable).resolve(strict=True)),
         "pi": str(caller),
         "controller_source": str(REPOSITORY / "src"),
         "base_url": "http://127.0.0.1:59876",
