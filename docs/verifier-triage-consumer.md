@@ -5,6 +5,15 @@ formal audit, accepted proposal or adoption decision. Its baseline is main
 26ddbe65a9bd9fe530dca13238c2eb3838f3aee5. Public development fixtures contain no
 held-out data. Real model generation is a separately authorized operation.
 
+The fixed_trial path is currently blocked before consumer launch. Existing
+external-review bundles do not contain a pre-authoring held-out/gold freeze or
+closed capture of actual generation HTTP inputs. This version cannot prove that
+the candidate was authored without exposure to that data. No flag or supplied
+success statement enables live trials: the capture workflow must first be
+integrated, tested, bound to the generation job, and independently reviewed.
+The working native_controls path uses only public synthetic fixtures. Pure
+scoring does not attest generation isolation or a held-out effect.
+
 ## Frozen experiment
 
 Generate one Markdown candidate at
@@ -29,8 +38,13 @@ directory, and tokenizer argv. Use purpose fixed_trial and supply
 generation_job. The existing identity must match the generation job. Canonical
 documents must match the job's frozen governance root byte for byte. Both
 generation and consumers use the same resource lock.
+Generation proposal caps must be at most 8 requests, 2200 output tokens, 1024
+response tokens, 300 stage seconds and 900 job seconds with repair 0; a larger
+existing proposal cannot be relabeled with smaller reservations. These checks
+do not replace the blocked pre-authoring isolation gate.
 
-After explicit execution authorization, run:
+Once the blocked capture gate is implemented and independently reviewed, and
+explicit execution authorization is given, the intended command is:
 
 ~~~text
 python -m ephy_worker.verifier_triage_consumer --contract ABSOLUTE_CONTRACT_JSON --sha256 FROZEN_SHA256 --execute-authorized
@@ -39,7 +53,9 @@ python -m ephy_worker.verifier_triage_consumer --contract ABSOLUTE_CONTRACT_JSON
 The driver runs exactly baseline 2 + treatment 2, each in a fresh process/session
 with an identical batch and canonical context. Pi uses --no-skills:
 treatment explicitly reads the candidate and proves full-byte delivery with
-evidence_read and raw SHA256. This is not automatic skill discovery. Baseline
+evidence_read plus an additional byte-exact triage_exact_read event comparing
+raw and delivered byte counts and SHA256. Batch and skill inputs must be UTF-8/LF,
+without CR bytes or BOM; no silent normalization is allowed. This is not automatic skill discovery. Baseline
 has no candidate file and every actual transmitted request is checked for its
 body, including JSON-encoded tool content. Canonical policy and required context
 delivery are checked in the saved governance result. Only governance acknowledgement
@@ -107,6 +123,11 @@ a baseline already at ceiling cannot demonstrate improvement. Gold-copy,
 invented evidence IDs, stale bindings and incomplete delivery are refused.
 Correlated observations support no statistical significance claim.
 descriptive_improvement authorizes no adoption, merge or formal audit completion.
+Strict success additionally requires 12/12 safety judgments in both treatment
+repeats, at least three cases incorrect in both baselines and correct in both
+treatments, and no diagnosis regression in either paired repeat. Mean diagnosis
+gain is reported separately; a positive mean alone cannot pass. Completed-session
+receipts retain the actual process exit_code alongside stdout/session/trace hashes.
 
 CI executes pure scoring and actual HTTP boundary tests without Pi or models.
 To exercise a separately installed, already pinned native Pi against a scripted
@@ -118,7 +139,9 @@ python scripts/verify_triage_consumer_boundary.py --pi EXISTING_PI_EXECUTABLE --
 
 The native controls cover four-session completion, forbidden tool, ninth request,
 fifth session, truncated result, baseline body leakage, partial skill read, false
-skill hash, context overflow, and mismatched tokenizer evidence. They save raw
+skill hash, context overflow, and mismatched tokenizer evidence.
+CRLF batch, BOM skill, and invalid-UTF8 skill controls also refuse before any
+upstream generation. The controls save raw
 requests, responses, process identities, traces and immutable receipts. The fake
 model name, synthetic counter and real_model_contacted: false distinguish these
 controls from a real experiment. Failed development artifacts remain separate;

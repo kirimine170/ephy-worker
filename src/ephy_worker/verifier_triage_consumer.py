@@ -41,6 +41,7 @@ from .verifier_triage_evaluation import (
     FrozenTrial,
     InvalidEvaluation,
     SuppliedSession,
+    canonical_consumer_input,
     check_context_fit,
     evaluate,
     evaluator_sha256,
@@ -84,6 +85,27 @@ def write_new(path: Path, data: bytes):
 
 def json_bytes(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def validate_generation_budget(job):
+    require(job["baseRevision"] == BASE_REVISION, "Wrong generated candidate base")
+    contract = job["contract"]
+    require(contract["allowed_files"] == [SKILL_PATH] and contract["max_repairs"] == 0,
+            "Wrong generation scope/repair budget")
+    for key, cap in (("max_requests", 8), ("output_token_budget", 2200),
+                     ("max_response_tokens", 1024), ("stage_seconds", 300), ("timeout_seconds", 900)):
+        require(type(contract.get(key)) is int and 0 < contract[key] <= cap,
+                "Generation reservation exceeded: " + key)
+
+
+def live_generation_isolation_gate():
+    # Existing external-review bundles prove generation/verification provenance,
+    # but contain no pre-authoring held-out freeze or closed actual HTTP input
+    # capture. Do not substitute a final skill ID scan for that missing evidence.
+    raise InvalidEvaluation(
+        "Live trial blocked: pre-authoring held-out/gold freeze and actual generation input isolation "
+        "capture must be integrated and independently verified before enabling fixed_trial"
+    )
 
 
 def snapshot(root):
@@ -133,6 +155,8 @@ def validate_contract(contract):
     require(frozen.base_revision == BASE_REVISION and frozen.evaluator_sha256 == evaluator_sha256()
             and frozen.prompt_sha256 == sha256(PROMPT.encode()), "Stale source/prompt")
     private = Path(contract["private_root"])
+    canonical_consumer_input((private / "batch.json").read_bytes())
+    canonical_consumer_input((private / "skill.md").read_bytes())
     require((sha256((private / "batch.json").read_bytes()),
              sha256((private / "gold.json").read_bytes()),
              sha256((private / "skill.md").read_bytes()))
@@ -142,6 +166,7 @@ def validate_contract(contract):
                 and contract["identity"]["listener"]["pid"]
                 == contract["identity"]["engine"]["pid"] == os.getpid(), "Not an owned fake provider")
     else:
+        live_generation_isolation_gate()
         job = json.loads(Path(contract["generation_job"]).read_bytes())
         verify_external_proposal(Path(contract["generation_job"]))
         require(contract["resource_lock"] == job["runtime"]["resource_lock"], "Wrong shared resource lock")
@@ -186,9 +211,8 @@ def build_contract(
     else:
         require(generation_job is not None, "Live trial requires bound external proposal")
         job = json.loads(generation_job.read_bytes())
-        require(job["baseRevision"] == BASE_REVISION, "Wrong generated candidate base")
-        require(job["contract"]["allowed_files"] == [SKILL_PATH]
-                and job["contract"]["max_repairs"] == 0, "Wrong generation scope/budget")
+        validate_generation_budget(job)
+        live_generation_isolation_gate()
         require(skill.resolve() == (Path(job["worktreePath"]) / SKILL_PATH).resolve(),
                 "Skill is not the generated candidate")
         verify_external_proposal(generation_job)
@@ -208,6 +232,8 @@ def build_contract(
                 and token_spec["pins"][token_spec["configuration"]]
                 == identity["configuration"]["sha256"], "Tokenizer deployment mismatch")
     verify_identity(identity)
+    canonical_consumer_input(batch.read_bytes())
+    canonical_consumer_input(skill.read_bytes())
     directory.mkdir(parents=True)
     canonical = directory / "canonical"
     canonical_manifest = {}
@@ -469,6 +495,33 @@ def canonical_delivery(contract, events):
                 "Canonical context was truncated or omitted")
 
 
+def wire_read_delivery(directory, records, events):
+    """Bind exact tool-result bytes to the actual transmitted request body."""
+    expected = {e["toolCallId"]: e for e in events if e.get("kind") == "triage_exact_read"}
+    delivered = {}
+    for number, record in enumerate(records, 1):
+        raw = (directory / f"http-{number}.json").read_bytes()
+        require(sha256(raw) == record["payload_sha256"], "Captured HTTP payload changed")
+        for message in json.loads(raw)["messages"]:
+            call = message.get("tool_call_id")
+            if message.get("role") != "tool" or call not in expected:
+                continue
+            content = message.get("content")
+            if isinstance(content, list):
+                content = "".join(c["text"] for c in content if c.get("type") == "text")
+            require(isinstance(content, str), "Missing transmitted read text")
+            body = content.encode("utf-8")
+            event = expected[call]
+            require(event["full_content_delivered"] is True
+                    and len(body) == event["raw_bytes"]
+                    and sha256(body) == event["raw_sha256"] == event["delivered_sha256"],
+                    "Transmitted read bytes differ from raw artifact")
+            delivered[call] = {"toolCallId": call, "path": event["path"],
+                               "bytes": len(body), "sha256": sha256(body)}
+    require(expected and delivered.keys() == expected.keys(), "Exact read never reached provider payload")
+    return list(delivered.values())
+
+
 def run_session(contract, index):
     require(type(index) is int and 0 <= index < 4, "Session5 refused before launch")
     intact(contract)
@@ -579,6 +632,7 @@ def run_session(contract, index):
             and all(r["accepted"] and r["forwarded"] and not r.get("error")
                     for r in gateway.records), "HTTP/managed-stage request evidence mismatch")
     canonical_delivery(contract, events)
+    delivered_reads = wire_read_delivery(directory, gateway.records, events)
     output = final_assistant_text(directory / "stdout.jsonl")
     require(output == final_assistant_text(directory / "session.jsonl", session=True),
             "Final stdout/session output mismatch")
@@ -590,6 +644,8 @@ def run_session(contract, index):
     validate_session(supplied, frozen, (private / "batch.json").read_bytes())
     write_new(directory / "receipt.json", json_bytes({
         "arm": arm, "observed": observed, "process": identity,
+        "exit_code": process.returncode,
+        "wire_read_delivery": delivered_reads,
         "elapsed_seconds": time.monotonic() - start, "input_before": before,
         "input_after": snapshot(guest), "canonical_manifest": contract["canonical_manifest"],
         "wire_records": gateway.records, "output_sha256": sha256(output.encode()),
@@ -618,6 +674,7 @@ def run_contract(path: Path, expected_sha256: str):
         result["synthetic_controls"] = contract["purpose"] == "native_controls"
         result["live_execution_attested"] = contract["purpose"] == "fixed_trial"
         result["adoption_authorized"] = False
+        result["live_trial_enabled"] = False
         write_new(Path(contract["directory"]) / "result.json", json_bytes(result))
     return result
 

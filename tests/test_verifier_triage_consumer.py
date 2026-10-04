@@ -215,3 +215,52 @@ def test_final_pin_recheck_blocks_result_publication(contract, monkeypatch):
     with pytest.raises(InvalidEvaluation, match="changed"):
         consumer.run_contract(path, sha256(path.read_bytes()))
     assert not (Path(contract["directory"]) / "result.json").exists()
+
+
+@pytest.mark.parametrize("body", [b"file\r\n", b"\xef\xbb\xbffile\n", b"\xfffile\n", b""])
+def test_crlf_bom_invalid_utf8_are_rejected_without_normalization(body):
+    with pytest.raises(InvalidEvaluation):
+        consumer.canonical_consumer_input(body)
+    consumer.canonical_consumer_input(b"valid UTF-8\n")
+
+
+@pytest.mark.parametrize("key,cap", [("max_requests", 8), ("output_token_budget", 2200),
+                                    ("max_response_tokens", 1024), ("stage_seconds", 300),
+                                    ("timeout_seconds", 900)])
+def test_oversize_generation_proposal_cannot_use_smaller_reservation(key, cap):
+    from ephy_worker.verifier_triage_evaluation import BASE_REVISION, SKILL_PATH
+    job = {"baseRevision": BASE_REVISION, "contract": {
+        "allowed_files": [SKILL_PATH], "max_repairs": 0, "max_requests": 8,
+        "output_token_budget": 2200, "max_response_tokens": 1024,
+        "stage_seconds": 300, "timeout_seconds": 900,
+    }}
+    consumer.validate_generation_budget(job)
+    job["contract"][key] = cap + 1
+    with pytest.raises(InvalidEvaluation, match="reservation exceeded"):
+        consumer.validate_generation_budget(job)
+
+
+def test_live_contract_cannot_launch_without_pre_authoring_isolation_capture(contract, monkeypatch):
+    contract["purpose"] = "fixed_trial"
+    monkeypatch.setattr(consumer.subprocess, "Popen", lambda *a, **k: pytest.fail("Pi launched"))
+    monkeypatch.setattr(consumer, "verify_external_proposal", lambda *_: pytest.fail("Incomplete proof used"))
+    with pytest.raises(InvalidEvaluation, match="pre-authoring held-out/gold freeze"):
+        consumer.validate_contract(contract)
+
+
+@pytest.mark.parametrize("delivery", ["exact", "crlf_to_lf", "omitted"])
+def test_actual_provider_payload_proves_exact_read_bytes(tmp_path, delivery):
+    raw = b"first\r\nsecond\r\n" if delivery == "crlf_to_lf" else b"first\nsecond\n"
+    event = {"kind": "triage_exact_read", "toolCallId": "read-1", "path": "inputs/triage-batch.json",
+             "raw_sha256": sha256(raw), "delivered_sha256": sha256(raw), "raw_bytes": len(raw),
+             "full_content_delivered": True}
+    messages = [] if delivery == "omitted" else [{"role": "tool", "tool_call_id": "read-1",
+                                                   "content": raw.decode().replace("\r\n", "\n")}]
+    body = consumer.json_bytes({"messages": messages})
+    (tmp_path / "http-1.json").write_bytes(body)
+    records = [{"payload_sha256": sha256(body)}]
+    if delivery == "exact":
+        assert consumer.wire_read_delivery(tmp_path, records, [event])[0]["sha256"] == sha256(raw)
+    else:
+        with pytest.raises(InvalidEvaluation):
+            consumer.wire_read_delivery(tmp_path, records, [event])

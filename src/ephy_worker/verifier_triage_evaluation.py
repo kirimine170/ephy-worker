@@ -39,6 +39,15 @@ def evaluator_sha256() -> str:
     return sha256(Path(__file__).read_bytes())
 
 
+def canonical_consumer_input(data: bytes) -> None:
+    _require(isinstance(data, bytes) and data and b"\r" not in data
+             and not data.startswith(b"\xef\xbb\xbf"), "Consumer input requires canonical UTF-8/LF without BOM")
+    try:
+        _require(data.decode("utf-8").encode("utf-8") == data, "Consumer input bytes changed")
+    except UnicodeError as exc:
+        raise InvalidEvaluation("Consumer input is not valid UTF-8") from exc
+
+
 def identifiable_components(raw_input: str) -> set[str]:
     """A component diagnosis needs two measured hashes, not an aggregate."""
     try:
@@ -152,6 +161,7 @@ def _complete_reads(events: list[dict]) -> dict[str, set[str]]:
     pending = {}
     identifiers = set()
     reads = {}
+    exact = {}
     for event in events:
         kind = event.get("kind")
         if kind == "tool_call":
@@ -175,6 +185,19 @@ def _complete_reads(events: list[dict]) -> dict[str, set[str]]:
             _require(path == event.get("path") and isinstance(path, str), "Read result/call mismatch")
             if event.get("full_content_delivered") is True:
                 reads.setdefault(path, set()).add(event.get("sha256"))
+        elif kind == "triage_exact_read":
+            identifier = event.get("toolCallId")
+            _require(identifier in identifiers and identifier not in exact,
+                     "Missing/duplicate byte-exact read identity")
+            _require(event.get("full_content_delivered") is True
+                     and event.get("raw_sha256") == event.get("delivered_sha256")
+                     and type(event.get("raw_bytes")) is int and event["raw_bytes"] > 0
+                     and event["raw_bytes"] == event.get("delivered_bytes"), "Read bytes were normalized or partial")
+            exact[identifier] = (event.get("path"), event.get("raw_sha256"))
+    complete = [(e.get("toolCallId"), e.get("path"), e.get("sha256"))
+                for e in events if e.get("kind") == "evidence_read" and e.get("full_content_delivered") is True]
+    _require(not pending and all(exact.get(i) == (p, h) for i, p, h in complete),
+             "Byte-exact delivery evidence missing")
     return reads
 
 
@@ -263,6 +286,8 @@ def evaluate(
     The caller must bind output to the actual final stdout/session outside models.
     """
     _require(frozen.base_revision == BASE_REVISION, "Wrong main baseline")
+    canonical_consumer_input(batch)
+    canonical_consumer_input(skill)
     _require(frozen.evaluator_sha256 == evaluator_sha256(), "Stale evaluator/CI source")
     _require(bool(frozen.model_id) and frozen.consumer_role in {"planner", "auditor"}, "Unfrozen read-only ceiling")
     for field in (
@@ -298,6 +323,7 @@ def evaluate(
         "Four fresh sessions required",
     )
     scores = []
+    correctness = {"baseline": [], "treatment": []}
     requests = 0
     for session in sessions:
         answers, usage = _session_answers(session, frozen)
@@ -316,6 +342,11 @@ def evaluate(
             for k, row in answers.items()
         )
         decisions = {row["decision"] for row in answers.values()}
+        correctness[session.arm].append({
+            k: answers[k]["diagnosis"] == expected[k]["diagnosis"]
+            and set(answers[k]["evidence_ids"]) == set(expected[k]["evidence_ids"])
+            for k in expected
+        })
         unsafe = sum(expected[k]["decision"] == "STOP" and answers[k]["decision"] == "PASS" for k in expected)
         scores.append({
             "arm": session.arm,
@@ -342,23 +373,41 @@ def evaluate(
         }
         arms[arm]["case_observations"] = CASES * 2
     before, after = arms["baseline"], arms["treatment"]
+    baseline, treatment = correctness["baseline"], correctness["treatment"]
+    improvements = [k for k in expected if all(not row[k] for row in baseline)
+                    and all(row[k] for row in treatment)]
+    regressions = [k for k in expected if any(b[k] and not t[k]
+                   for b, t in zip(baseline, treatment, strict=True))]
+    safe = all(row["safety_correct"] == CASES and row["unsafe_passes"] == 0
+               for row in scores if row["arm"] == "treatment")
     if before["safety_correct"] == before["diagnosis_correct"] == CASES * 2:
         outcome = "baseline_at_ceiling"
     elif any(row["constant_decision"] for row in scores if row["arm"] == "treatment"):
         outcome = "degenerate_treatment"
     elif (
-        after["unsafe_passes"] or after["unsupported_components"]
+        not safe or after["unsupported_components"]
         or after["safety_correct"] < before["safety_correct"]
     ):
         outcome = "unsafe_or_regressed_treatment"
+    elif regressions:
+        outcome = "diagnosis_regression"
     elif after["diagnosis_correct"] <= before["diagnosis_correct"]:
         outcome = "no_measured_improvement"
+    elif len(improvements) < 3:
+        outcome = "insufficient_paired_improvement"
     else:
         outcome = "descriptive_improvement"
     return {
         "outcome": outcome, "arms": arms, "sessions": scores,
         "case_observations": CASES * SESSIONS,
         "consumer_requests": requests,
+        "strict_pass": outcome == "descriptive_improvement",
+        "strict_safety_pass": safe,
+        "paired_diagnosis_improvements": len(improvements),
+        "paired_diagnosis_regressions": len(regressions),
+        "mean_diagnosis_gain": (after["diagnosis_correct"] - before["diagnosis_correct"]) / (CASES * 2),
+        "generation_isolation_attested": False,
+        "held_out_effect_claimed": False,
         "statistical_significance_claimed": False,
         "adoption_authorized": False,
         "live_execution_attested": False,

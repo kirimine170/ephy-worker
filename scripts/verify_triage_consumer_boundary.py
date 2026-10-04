@@ -24,17 +24,21 @@ from ephy_worker.verifier_triage_fixtures import development_fixture, developmen
 MODEL = "synthetic-triage-consumer-fixture"
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("good", "forbidden_tool", "request9", "session5", "truncated",
-         "baseline_leak", "partial_skill", "false_hash", "context_oversize", "wrong_counter")
+         "baseline_leak", "partial_skill", "false_hash", "context_oversize", "wrong_counter",
+         "crlf_batch", "bom_skill", "invalid_utf8_skill")
 EXPECTED = {
     "forbidden_tool": ("Consumer exited 78", 2, 1),
     "request9": ("Consumer exited 78", 8, 1),
     "session5": ("Session5 refused", 0, 0),
     "truncated": ("Consumer exited 78", 3, 1),
     "baseline_leak": ("Consumer exited", 2, 1),
-    "partial_skill": ("Complete exact skill read missing", 9, 3),
+    "partial_skill": ("Consumer exited 78", 8, 3),
     "false_hash": ("False skill identity", 9, 3),
     "context_oversize": ("Consumer exited", 0, 0),
     "wrong_counter": ("Consumer exited", 0, 0),
+    "crlf_batch": ("canonical UTF-8/LF", 0, 0),
+    "bom_skill": ("canonical UTF-8/LF", 0, 0),
+    "invalid_utf8_skill": ("not valid UTF-8", 0, 0),
 }
 
 
@@ -45,6 +49,12 @@ def run_case(pi: Path, directory: Path, case: str) -> dict:
     batch, gold = development_fixture()
     expected = json.loads(gold)
     skill = development_skill()
+    if case == "crlf_batch":
+        batch += b"\r\n"
+    elif case == "bom_skill":
+        skill = b"\xef\xbb\xbf" + skill
+    elif case == "invalid_utf8_skill":
+        skill = b"\xff" + skill
     if case == "baseline_leak":
         exposed = json.loads(batch)
         exposed[0]["input"] += "\n" + skill.decode()
@@ -112,8 +122,8 @@ def run_case(pi: Path, directory: Path, case: str) -> dict:
             else:
                 answers = [dict(row) for row in expected]
                 if not treatment:
-                    for row in answers[:2]:
-                        row["diagnosis"] = "UNATTRIBUTED"
+                    for index in (0, 2, 4):
+                        answers[index]["diagnosis"] = "UNATTRIBUTED"
                 text = json.dumps({
                     "skill_sha256": (
                         "0" * 64 if case == "false_hash" else sha256(skill)
@@ -160,12 +170,12 @@ def run_case(pi: Path, directory: Path, case: str) -> dict:
     }
     result, error = None, None
     try:
-        contract = build_contract(
-            ROOT, pi, identity, directory / "batch.json", directory / "gold.json",
-            directory / "skill.md", directory / "run", [sys.executable, str(counter)],
-            purpose="native_controls",
-        )
         try:
+            contract = build_contract(
+                ROOT, pi, identity, directory / "batch.json", directory / "gold.json",
+                directory / "skill.md", directory / "run", [sys.executable, str(counter)],
+                purpose="native_controls",
+            )
             if case == "session5":
                 run_session(json.loads(contract.read_bytes()), 4)
             else:
@@ -187,11 +197,14 @@ def run_case(pi: Path, directory: Path, case: str) -> dict:
     full_batch = [e for e in full_reads if e.get("path") == BATCH_PATH and e.get("sha256") == sha256(batch)]
     full_skill = [e for e in full_reads if e.get("path") == SKILL_PATH and e.get("sha256") == sha256(skill)]
     if case == "good":
+        receipts = [json.loads(p.read_bytes()) for p in (directory / "run").glob("consumer-*/receipt.json")]
         passed = (
             error is None and result["outcome"] == "descriptive_improvement"
+            and result["strict_pass"] and result["paired_diagnosis_improvements"] >= 3
             and len(state["posts"]) == 12 and len(state["sessions"]) == 4
             and len(full_batch) == 4 and len(full_skill) == 2
             and len(wire) == 12 and all(r.get("forwarded") and not r["baseline_skill_leak"] for r in wire)
+            and len(receipts) == 4 and all(r["exit_code"] == 0 for r in receipts)
         )
     else:
         reason, posts, sessions = EXPECTED[case]

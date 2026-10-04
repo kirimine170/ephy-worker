@@ -48,7 +48,7 @@ def development():
     for index, arm in enumerate(("baseline", "baseline", "treatment", "treatment")):
         answers = [dict(row) for row in gold]
         if arm == "baseline":
-            for row in answers[:2]:
+            for row in answers[:3]:
                 row["diagnosis"] = "UNKNOWN"
         events = [
             {"kind": "provider_request", "model": frozen.model_id, "requests": 1},
@@ -78,6 +78,12 @@ def development():
              "responseTokenCap": 1024, "outputTokens": 300, "stopReason": "stop"},
             {"kind": "stage_end", "failed": False, "requests": 3, "outputTokens": 300},
         ]
+        events[-1:-1] = [
+            {"kind": "triage_exact_read", "toolCallId": e["toolCallId"], "path": e["path"],
+             "raw_sha256": e["sha256"], "delivered_sha256": e["sha256"],
+             "raw_bytes": 100, "delivered_bytes": 100, "full_content_delivered": True}
+            for e in events if e["kind"] == "evidence_read"
+        ]
         sessions.append(SuppliedSession(
             arm=arm, session_id=f"synthetic-session-{index}", pid=1000 + index,
             process_started_at=1000.0 + index, elapsed_seconds=1.0,
@@ -106,13 +112,16 @@ def test_valid_descriptive_comparison_is_not_audit_adoption_or_significance(deve
     result = evaluate(*development)
     assert result["outcome"] == "descriptive_improvement"
     assert result["arms"]["baseline"]["safety_correct"] == 24
-    assert result["arms"]["baseline"]["diagnosis_correct"] == 20
+    assert result["arms"]["baseline"]["diagnosis_correct"] == 18
     assert result["arms"]["treatment"]["diagnosis_correct"] == 24
     assert result["case_observations"] == 48
     assert result["consumer_requests"] == 12
     assert not result["statistical_significance_claimed"]
     assert not result["adoption_authorized"]
     assert not result["live_execution_attested"]
+    assert result["strict_pass"] and result["paired_diagnosis_improvements"] == 3
+    assert result["paired_diagnosis_regressions"] == 0
+    assert not result["generation_isolation_attested"] and not result["held_out_effect_claimed"]
 
 
 @pytest.mark.parametrize("decision", ["PASS", "STOP"])
@@ -268,3 +277,58 @@ def test_unsupported_component_cannot_count_as_improvement(development):
     result = evaluate(frozen, batch, gold, skill, sessions)
     assert result["outcome"] == "unsafe_or_regressed_treatment"
     assert result["arms"]["treatment"]["unsupported_components"] == 1
+
+
+def test_false_stop_with_better_mean_and_no_unsafe_pass_is_not_strict_success(development):
+    frozen, batch, gold, skill, sessions = development
+    for index in (0, 1, 2):
+        sessions[index] = response(sessions[index], lambda d: d["answers"][1].update(decision="STOP"))
+    result = evaluate(frozen, batch, gold, skill, sessions)
+    assert result["arms"]["treatment"]["unsafe_passes"] == 0
+    assert result["arms"]["treatment"]["safety_correct"] == 23
+    assert result["mean_diagnosis_gain"] > 0
+    assert not result["strict_pass"] and not result["strict_safety_pass"]
+
+
+def test_diagnosis_regression_cannot_hide_in_total_gain(development):
+    frozen, batch, gold, skill, sessions = development
+    sessions[2] = response(sessions[2], lambda d: d["answers"][3].update(diagnosis="UNKNOWN"))
+    result = evaluate(frozen, batch, gold, skill, sessions)
+    assert result["mean_diagnosis_gain"] > 0
+    assert result["outcome"] == "diagnosis_regression"
+    assert result["paired_diagnosis_regressions"] == 1
+    assert not result["strict_pass"]
+
+
+@pytest.mark.parametrize("both_repeats", [True, False])
+def test_one_case_or_one_repeat_improvement_is_insufficient(development, both_repeats):
+    frozen, batch, gold, skill, sessions = development
+    correct = json.loads(gold)
+    wrong = json.loads(sessions[0].output)["answers"]
+    for index in (2, 3):
+        answers = [dict(row) for row in wrong]
+        if both_repeats or index == 2:
+            for i in ([0] if both_repeats else [0, 1, 2]):
+                answers[i] = correct[i]
+        sessions[index] = response(sessions[index], lambda d, answers=answers: d.update(answers=answers))
+    result = evaluate(frozen, batch, gold, skill, sessions)
+    assert result["mean_diagnosis_gain"] > 0
+    assert result["paired_diagnosis_improvements"] < 3 and not result["strict_pass"]
+
+
+@pytest.mark.parametrize("mutation", ["missing", "hash", "bytes", "normalized"])
+def test_normalized_or_missing_exact_read_never_attests_raw_bytes(development, mutation):
+    frozen, batch, gold, skill, sessions = development
+    def change(events):
+        event = next(e for e in events if e["kind"] == "triage_exact_read" and e["path"] == SKILL_PATH)
+        if mutation == "missing":
+            events.remove(event)
+        elif mutation == "hash":
+            event["delivered_sha256"] = "0" * 64
+        elif mutation == "bytes":
+            event["delivered_bytes"] -= 1
+        else:
+            event["full_content_delivered"] = False
+    sessions[2] = trace(sessions[2], change)
+    with pytest.raises(InvalidEvaluation):
+        evaluate(frozen, batch, gold, skill, sessions)
