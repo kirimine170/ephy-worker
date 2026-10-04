@@ -420,15 +420,32 @@ def test_external_campaign_rejects_more_than_four_hours(tmp_path):
         "session",
         "tokens",
         "checks",
+        "diff_missing",
+        "diff_duplicate",
+        "diff_exit",
+        "diff_passed",
+        "diff_argv",
+        "diff_cwd",
+        "diff_environment",
+        "diff_transcript",
+        "diff_stdout",
     ],
 )
 def test_external_stop_requires_exact_frozen_candidate_and_evidence(tmp_path, monkeypatch, mutation):
-    from test_formal_runtime import REPOSITORY, contract, trace
+    from test_formal_runtime import REPOSITORY, contract, trace, verifier_runner
 
     from ephy_worker.formal_artifacts import ARTIFACTS, CONTROL_PATHS, digest, encode, freeze_bundle
 
-    directory = tmp_path / "job"
-    directory.mkdir()
+    # Only the diff command is real; model/audit provenance remains synthetic.
+    command_runner = verifier_runner(tmp_path)
+    directory = command_runner.directory
+    diff = command_runner.command(
+        ["git", "-C", str(command_runner.candidate), "diff", "--check"],
+        command_runner.candidate,
+        "external-diff",
+        30,
+    )
+    transcripts = copy.deepcopy(command_runner.transcripts)
     configuration = contract()
     configuration["max_repairs"] = 0
     model_identity = {
@@ -451,6 +468,7 @@ def test_external_stop_requires_exact_frozen_candidate_and_evidence(tmp_path, mo
         "status": "external_review_pending",
         "outcome": "external_review_pending",
         "controls": {"system_development_policy": "9" * 64},
+        "environment_sha256": command_runner.job["environment_sha256"],
     }
     patch = directory / "candidate.patch"
     patch.write_bytes(b"frozen markdown patch\n")
@@ -463,8 +481,27 @@ def test_external_stop_requires_exact_frozen_candidate_and_evidence(tmp_path, mo
         "changed_files": ["docs/example.md"],
         "checks": [{"id": c["id"], "exit_code": 0, "passed": True} for c in configuration["checks"]],
     }
+    results["checks"].append({"id": "diff", **diff, "passed": True})
     if mutation == "checks":
         results["checks"][0]["exit_code"] = 1
+    elif mutation == "diff_missing":
+        results["checks"].pop()
+    elif mutation == "diff_duplicate":
+        results["checks"].append(copy.deepcopy(results["checks"][-1]))
+    elif mutation in ("diff_exit", "diff_passed", "diff_argv", "diff_cwd", "diff_environment"):
+        key, value = {
+            "diff_exit": ("exit_code", 2),
+            "diff_passed": ("passed", False),
+            "diff_argv": ("argv", [diff["argv"][0], "--version"]),
+            "diff_cwd": ("cwd", str(tmp_path)),
+            "diff_environment": ("effective_environment_sha256", "0" * 64),
+        }[mutation]
+        results["checks"][-1][key] = value
+        transcripts[0][key] = value
+    elif mutation == "diff_transcript":
+        transcripts = []
+    elif mutation == "diff_stdout":
+        (directory / diff["stdout"]).write_bytes(b"replaced diff output")
     provenance = []
     workflow = [{"stage": "preflight", "at": "synthetic", "passed": True}]
     for index, (role, label) in enumerate((("planner", "planner"), ("implementer", "worker-1"))):
@@ -514,6 +551,7 @@ def test_external_stop_requires_exact_frozen_candidate_and_evidence(tmp_path, mo
         candidate_patch=patch.read_bytes(),
         candidate_changed_files=encode(["docs/example.md"]),
         candidate_snapshot_manifest=encode(final),
+        command_transcripts=encode(transcripts),
     )
     bundle = directory / "audit-bundle"
     audit_input = freeze_bundle(bundle, job, artifacts)

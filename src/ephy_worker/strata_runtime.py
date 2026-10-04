@@ -32,7 +32,14 @@ from .formal_artifacts import (
     validate_schema,
     write_json,
 )
-from .formal_runtime import FormalRunner, role_model, snapshot, stage_evidence
+from .formal_runtime import (
+    FormalRunner,
+    command_environment,
+    executable_identity,
+    role_model,
+    snapshot,
+    stage_evidence,
+)
 
 
 def validate_origin(value: str) -> int:
@@ -363,8 +370,8 @@ def verify_external_proposal(job_file: Path) -> Path:
         or results["baseline"] is not False
         or results["verifier_identity"] != runner.verifier_identity()
         or {check["id"] for check in results["checks"]}
-        != {"target", "regression", "lint", "repository", "fixed"}
-        or len(results["checks"]) != 5
+        != {"target", "regression", "lint", "repository", "fixed", "diff"}
+        or len(results["checks"]) != 6
         or any(check["passed"] is not True or check["exit_code"] != 0 for check in results["checks"])
         or changed != results["changed_files"]
         or changed != runner.contract["allowed_files"]
@@ -374,6 +381,29 @@ def verify_external_proposal(job_file: Path) -> Path:
         or prefix[-1].get("patch_sha256") != audit_input["final_bindings"]["candidate_patch_sha256"]
     ):
         raise GateFailure("External-review independent verification is invalid")
+    diff = next(check for check in results["checks"] if check["id"] == "diff")
+    executable = executable_identity("git")
+    transcripts = read_json(bundle / "command_transcripts.txt")
+    matching = [
+        entry
+        for entry in transcripts
+        if all(entry.get(key) == value for key, value in diff.items() if key not in ("id", "passed"))
+    ]
+    if (
+        diff.get("argv") != [executable["path"], "-C", str(runner.candidate), "diff", "--check"]
+        or diff.get("cwd") != str(runner.candidate)
+        or diff.get("executable") != executable
+        or diff.get("environment_sha256") != runner.job["environment_sha256"]
+        or diff.get("effective_environment_sha256")
+        != digest(encode(command_environment(runner.candidate, runner.directory / "temp")))
+        or diff.get("temp_root") != str(runner.directory / "temp")
+        or diff.get("temp_variables")
+        != {key: str(runner.directory / "temp") for key in ("TEMP", "TMP", "TMPDIR")}
+        or len(matching) != 1
+        or diff.get("stdout_sha256") != file_hash(safe_path(runner.directory, diff["stdout"]))
+        or diff.get("stderr_sha256") != file_hash(safe_path(runner.directory, diff["stderr"]))
+    ):
+        raise GateFailure("External-review diff-check evidence is invalid")
     provenance = read_json(bundle / "model_provenance.txt")
     if [entry["role"] for entry in provenance] != ["planner", "implementer"]:
         raise GateFailure("External review requires one plan and one implementation")
