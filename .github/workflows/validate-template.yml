@@ -72,6 +72,13 @@ jobs:
           tests/test_coding_executor.py
           src/ephy_worker/strata_runtime.py tests/test_strata_runtime.py
           scripts/verify_pi_request_boundary.py
+          src/ephy_worker/verifier_triage_evaluation.py
+          src/ephy_worker/verifier_triage_consumer.py
+          src/ephy_worker/verifier_triage_fixtures.py
+          scripts/count_strata_consumer_tokens.py
+          scripts/verify_triage_consumer_boundary.py
+          tests/test_verifier_triage_evaluation.py
+          tests/test_verifier_triage_consumer.py
 
       - name: Validate repository and scan template text
         run: python scripts/validate_repository.py --check-sensitive-patterns
