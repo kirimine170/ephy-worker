@@ -1,9 +1,161 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync, readFileSync, existsSync, utimesSync, statSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync, readFileSync, existsSync, utimesSync, statSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import setup, { selectAuditedPatch } from "../.pi/extensions/background-jobs.ts";
+
+async function waitForFile(file) {
+  const deadline = Date.now() + 15000;
+  while (!existsSync(file)) {
+    if (Date.now() > deadline) throw new Error("Admission fixture barrier timeout");
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+}
+
+async function runAdmissionChild() {
+  const [directory, actor, phase] = process.argv.slice(3);
+  process.env.DUAL_PI_STATE_DIR = join(directory, "state");
+  process.env.DUAL_JOB_RUNNER = join(directory, "runner.ps1");
+  process.env.DUAL_POWERSHELL_EXE = "fixture-shell";
+  const tools = new Map(), calls = [];
+  let confirmations = 0, launches = 0;
+  const pause = async () => {
+    writeFileSync(join(directory, "first-at-barrier"), actor);
+    await waitForFile(join(directory, "release-first"));
+  };
+  setup({ registerTool: t => tools.set(t.name, t), registerCommand() {}, on() {},
+    async exec(binary, args) {
+      calls.push([binary, args]);
+      if (binary === "git") {
+        if (actor === "first" && phase === "git" && args.includes("--show-toplevel")) await pause();
+        const stdout = args.includes("--show-toplevel") ? directory : args.includes("HEAD") ? "a".repeat(40) : "";
+        return { code: 0, stdout, stderr: "" };
+      }
+      assert.equal(binary, "fixture-shell");
+      launches++;
+      // Actual current fixture PID; the shell/runner itself is never executed.
+      return { code: 0, stdout: String(process.pid), stderr: "" };
+    },
+  });
+  const result = await tools.get("background_job_submit").execute("id",
+    { title: "Synthetic admission", task: "Offline fixture", doneWhen: ["No real runner"] }, undefined, undefined,
+    { cwd: directory, hasUI: true, ui: { async confirm() {
+      confirmations++;
+      if (actor === "first" && phase === "confirmation") await pause();
+      return true;
+    }, notify() {} } });
+  writeFileSync(join(directory, actor + "-result.json"), JSON.stringify({
+    pid: process.pid, calls: calls.length, confirmations, launches,
+    blocked: result.details.admissionBlocked === true, status: result.details.status,
+  }));
+}
+
+function spawnAdmissionChild(directory, actor, phase) {
+  const child = spawn(process.execPath, [...process.execArgv, fileURLToPath(import.meta.url),
+    "--admission-child", directory, actor, phase], { timeout: 20000 });
+  let output = "";
+  child.stdout.on("data", chunk => { output += chunk; });
+  child.stderr.on("data", chunk => { output += chunk; });
+  const done = new Promise((resolve, reject) => {
+    child.on("error", reject);
+    child.on("exit", (code, signal) => code === 0 ? resolve() : reject(new Error(
+      "Admission child failed: " + code + "/" + signal + " " + output)));
+  });
+  return { done };
+}
+
+async function runAdmissionControls(root) {
+  const failures = [];
+  for (const phase of ["git", "confirmation"]) {
+    const directory = join(root, "admission-" + phase);
+    mkdirSync(directory);
+    writeFileSync(join(directory, "runner.ps1"), "# offline fixture only\n");
+    const first = spawnAdmissionChild(directory, "first", phase);
+    try {
+      await waitForFile(join(directory, "first-at-barrier"));
+      const second = spawnAdmissionChild(directory, "second", phase);
+      await second.done;
+    } finally {
+      writeFileSync(join(directory, "release-first"), "release");
+      await first.done;
+    }
+    const a = JSON.parse(readFileSync(join(directory, "first-result.json"), "utf8"));
+    const b = JSON.parse(readFileSync(join(directory, "second-result.json"), "utf8"));
+    const jobs = readdirSync(join(directory, "state", "jobs"));
+    console.log("OBSERVE: cross-process admission " + phase + " " + JSON.stringify({ first: a, second: b, jobs: jobs.length }));
+    try {
+      assert.notEqual(a.pid, b.pid, "Separate OS processes are required");
+      assert.equal(a.launches, 1);
+      assert.equal(b.launches, 0);
+      assert.equal(b.calls, 0);
+      assert.equal(b.confirmations, 0);
+      assert.equal(b.blocked, true);
+      assert.equal(jobs.length, 1);
+      assert.equal(existsSync(join(directory, "state", "background-admission.lock")), false);
+      console.log("PASS: cross-process admission " + phase + " permits one queued job and one mocked launch");
+    } catch (error) { failures.push(phase + ": " + error.message); }
+  }
+
+  const previousState = process.env.DUAL_PI_STATE_DIR;
+  const directory = join(root, "admission-recovery");
+  process.env.DUAL_PI_STATE_DIR = directory;
+  mkdirSync(directory);
+  const claim = join(directory, "background-admission.lock");
+  const params = { title: "Offline recovery", task: "Synthetic", doneWhen: ["No runner"] };
+  const toolsFor = exec => {
+    const tools = new Map();
+    setup({ registerTool: t => tools.set(t.name, t), registerCommand() {}, on() {}, exec });
+    return tools;
+  };
+  const git = async (binary, args) => {
+    assert.equal(existsSync(claim), true, "Admission must remain held through Git and confirmation");
+    assert.equal(binary, "git");
+    return { code: 0, stdout: args.includes("--show-toplevel") ? root : args.includes("HEAD") ? "a".repeat(40) : "", stderr: "" };
+  };
+  try {
+    let confirmations = 0;
+    const tools = toolsFor(git);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const cancelled = await tools.get("background_job_submit").execute("id", params, undefined, undefined,
+          { cwd: root, hasUI: true, ui: { confirm() { confirmations++; return false; } } });
+        assert.ok(cancelled.content[0].text.includes("cancelled"));
+        assert.equal(existsSync(claim), false);
+      } catch (error) { failures.push("cancel-release: " + error.message); }
+    }
+    if (confirmations === 2) console.log("PASS: cancelled admission releases its claim and allows a new attempt");
+    try {
+      const throwing = toolsFor(async () => {
+        assert.equal(existsSync(claim), true);
+        throw new Error("controlled command failure");
+      });
+      await assert.rejects(throwing.get("background_job_submit").execute("id", params, undefined, undefined,
+        { cwd: root, hasUI: true, ui: { confirm() { assert.fail("Failure reached confirmation"); } } }), /controlled command failure/);
+      assert.equal(existsSync(claim), false);
+      const retry = await tools.get("background_job_submit").execute("id", params, undefined, undefined,
+        { cwd: root, hasUI: true, ui: { confirm() { return false; } } });
+      assert.ok(retry.content[0].text.includes("cancelled"));
+      console.log("PASS: throwing admission releases its claim and permits a later attempt");
+    } catch (error) { failures.push("exception-release: " + error.message); }
+    const abandoned = JSON.stringify({ pid: 999999999, createdAt: "2000-01-01T00:00:00Z" });
+    writeFileSync(claim, abandoned);
+    try {
+      const blocked = await tools.get("background_job_submit").execute("id", params, undefined, undefined,
+        { cwd: root, hasUI: true, ui: { confirm() { assert.fail("Abandoned claim reached confirmation"); } } });
+      assert.equal(blocked.details.admissionBlocked, true);
+      assert.equal(readFileSync(claim, "utf8"), abandoned);
+      console.log("PASS: abandoned admission claim is preserved and blocks automatic recovery");
+    } catch (error) { failures.push("abandoned-claim: " + error.message); }
+  } finally { process.env.DUAL_PI_STATE_DIR = previousState; }
+  assert.deepEqual(failures, [], "Cross-process admission and claim recovery controls must all pass");
+}
+
+if (process.argv[2] === "--admission-child") {
+  await runAdmissionChild();
+} else {
 
 const root = mkdtempSync(join(tmpdir(), "ephy-formal-submit-"));
 try {
@@ -128,7 +280,9 @@ try {
   assert.ok(terminal.content[0].text.includes("cancelled"));
   assert.equal(execCalls.every(([binary]) => binary === "git"), true);
   console.log("PASS: readable terminal job permits normal confirmation; no runner is started");
+  await runAdmissionControls(root);
   console.log("PASS: formal approval binds actual task, scope, checks, model and caps; hash mismatch stops");
 } finally {
   rmSync(root, { recursive: true, force: true });
+}
 }

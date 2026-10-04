@@ -355,147 +355,162 @@ export default function (pi: ExtensionAPI): void {
 				return { content: [{ type: "text", text: "Background runner is not configured." }], details: {} };
 			}
 
-			const active = recoverStaleJobs().filter((job) => isActive(job));
-			if (active.length > 0) {
-				return {
-					content: [{ type: "text", text: `A background job is already active:\n${active.map(summarize).join("\n")}` }],
-					details: { active },
-				};
+			fs.mkdirSync(getStateDir(), { recursive: true });
+			const admissionFile = path.join(getStateDir(), "background-admission.lock");
+			let admissionFd: number;
+			try {
+				admissionFd = fs.openSync(admissionFile, "wx");
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+				return { content: [{ type: "text", text: "Background admission is already in progress; retry when it completes. An abandoned claim requires explicit recovery." }], details: { admissionBlocked: true } };
 			}
+			try {
+				fs.writeFileSync(admissionFd, JSON.stringify({ pid: process.pid, createdAt: now() }));
+				const active = recoverStaleJobs().filter((job) => isActive(job));
+				if (active.length > 0) {
+					return {
+						content: [{ type: "text", text: `A background job is already active:\n${active.map(summarize).join("\n")}` }],
+						details: { active },
+					};
+				}
 
-			const repoResult = await pi.exec("git", ["rev-parse", "--show-toplevel"], { cwd: ctx.cwd, timeout: 10_000 });
-			if (repoResult.code !== 0) {
-				return {
-					content: [{ type: "text", text: "Background jobs require a Git repository so work can be isolated in a worktree." }],
-					details: { stderr: repoResult.stderr },
-				};
-			}
-			const rawRepoRoot = repoResult.stdout.trim();
-			const repoRoot = normalizeGitRoot(rawRepoRoot);
-			if (!repoRoot || !path.isAbsolute(repoRoot)) {
-				return {
-					content: [{ type: "text", text: "Git returned a repository root that is not an absolute native path." }],
-					details: { rawRepoRoot, repoRoot },
-				};
-			}
-			const headResult = await pi.exec("git", ["rev-parse", "HEAD"], { cwd: repoRoot, timeout: 10_000 });
-			if (headResult.code !== 0) {
-				return {
-					content: [{ type: "text", text: "The repository has no resolvable HEAD commit." }],
-					details: { rawRepoRoot, repoRoot, stderr: headResult.stderr, stdout: headResult.stdout },
-				};
-			}
-			const statusResult = await pi.exec("git", ["status", "--porcelain"], { cwd: repoRoot, timeout: 10_000 });
-			const dirty = statusResult.stdout.trim().length > 0;
-			const timeoutMinutes = params.timeoutMinutes ?? 60;
-			const maxRepairAttempts = params.maxRepairAttempts ?? 2;
-			const commands = (params.verificationCommands ?? []).map((command) => command.trim()).filter(Boolean);
-			if (formalSpec && (formalSpec.repoRoot !== repoRoot || formalSpec.baseRevision !== headResult.stdout.trim())) {
-				throw new Error("Formal spec repository/base differs from submission context");
-			}
-			const confirmation = formalSpec ? [
-				`Formal spec SHA-256: ${params.formalSpecSha256}`,
-				`Repository: ${repoRoot}`,
-				`Base: ${formalSpec.baseRevision}`,
-				`Task: ${formalSpec.contract.task}`,
-				`Semantic scope: ${formalSpec.contract.semantic_scope}`,
-				`Allowed files: ${JSON.stringify(formalSpec.contract.allowed_files)}`,
-				`Whole-job timeout: ${formalSpec.contract.timeout_seconds} seconds`,
-				`Stage timeout: ${formalSpec.contract.stage_seconds} seconds`,
-				`Repair limit: ${formalSpec.contract.max_repairs}`,
-				`Output tokens per stage: ${formalSpec.contract.output_token_budget}`,
-				`Models: ${JSON.stringify(formalSpec.model_identities)}`,
-				`Frozen checks: ${JSON.stringify(formalSpec.contract.checks)}`,
-				"Fresh isolated proposal only. No automatic apply, commit, push or merge.",
-			].join("\n") : [
-				`Title: ${params.title}`,
-				`Repository: ${repoRoot}`,
-				`Base: ${headResult.stdout.trim().slice(0, 12)}`,
-				`Timeout: ${timeoutMinutes} minutes`,
-				`Automatic repair attempts: ${maxRepairAttempts} (bounded, same isolated worktree)`,
-				commands.length > 0 ? `Verification: ${commands.join(" ; ")}` : "Verification: agent checks + git diff --check",
-				dirty ? "WARNING: uncommitted changes in the current checkout are NOT included." : "Current checkout is clean.",
-				"The job will use an isolated worktree and will not merge or push automatically.",
-			].join("\n");
+				const repoResult = await pi.exec("git", ["rev-parse", "--show-toplevel"], { cwd: ctx.cwd, timeout: 10_000 });
+				if (repoResult.code !== 0) {
+					return {
+						content: [{ type: "text", text: "Background jobs require a Git repository so work can be isolated in a worktree." }],
+						details: { stderr: repoResult.stderr },
+					};
+				}
+				const rawRepoRoot = repoResult.stdout.trim();
+				const repoRoot = normalizeGitRoot(rawRepoRoot);
+				if (!repoRoot || !path.isAbsolute(repoRoot)) {
+					return {
+						content: [{ type: "text", text: "Git returned a repository root that is not an absolute native path." }],
+						details: { rawRepoRoot, repoRoot },
+					};
+				}
+				const headResult = await pi.exec("git", ["rev-parse", "HEAD"], { cwd: repoRoot, timeout: 10_000 });
+				if (headResult.code !== 0) {
+					return {
+						content: [{ type: "text", text: "The repository has no resolvable HEAD commit." }],
+						details: { rawRepoRoot, repoRoot, stderr: headResult.stderr, stdout: headResult.stdout },
+					};
+				}
+				const statusResult = await pi.exec("git", ["status", "--porcelain"], { cwd: repoRoot, timeout: 10_000 });
+				const dirty = statusResult.stdout.trim().length > 0;
+				const timeoutMinutes = params.timeoutMinutes ?? 60;
+				const maxRepairAttempts = params.maxRepairAttempts ?? 2;
+				const commands = (params.verificationCommands ?? []).map((command) => command.trim()).filter(Boolean);
+				if (formalSpec && (formalSpec.repoRoot !== repoRoot || formalSpec.baseRevision !== headResult.stdout.trim())) {
+					throw new Error("Formal spec repository/base differs from submission context");
+				}
+				const confirmation = formalSpec ? [
+					`Formal spec SHA-256: ${params.formalSpecSha256}`,
+					`Repository: ${repoRoot}`,
+					`Base: ${formalSpec.baseRevision}`,
+					`Task: ${formalSpec.contract.task}`,
+					`Semantic scope: ${formalSpec.contract.semantic_scope}`,
+					`Allowed files: ${JSON.stringify(formalSpec.contract.allowed_files)}`,
+					`Whole-job timeout: ${formalSpec.contract.timeout_seconds} seconds`,
+					`Stage timeout: ${formalSpec.contract.stage_seconds} seconds`,
+					`Repair limit: ${formalSpec.contract.max_repairs}`,
+					`Output tokens per stage: ${formalSpec.contract.output_token_budget}`,
+					`Models: ${JSON.stringify(formalSpec.model_identities)}`,
+					`Frozen checks: ${JSON.stringify(formalSpec.contract.checks)}`,
+					"Fresh isolated proposal only. No automatic apply, commit, push or merge.",
+				].join("\n") : [
+					`Title: ${params.title}`,
+					`Repository: ${repoRoot}`,
+					`Base: ${headResult.stdout.trim().slice(0, 12)}`,
+					`Timeout: ${timeoutMinutes} minutes`,
+					`Automatic repair attempts: ${maxRepairAttempts} (bounded, same isolated worktree)`,
+					commands.length > 0 ? `Verification: ${commands.join(" ; ")}` : "Verification: agent checks + git diff --check",
+					dirty ? "WARNING: uncommitted changes in the current checkout are NOT included." : "Current checkout is clean.",
+					"The job will use an isolated worktree and will not merge or push automatically.",
+				].join("\n");
 
-			if (!ctx.hasUI) {
-				return {
-					content: [{ type: "text", text: "Background submission requires an interactive confirmation." }],
-					details: {},
+				if (!ctx.hasUI) {
+					return {
+						content: [{ type: "text", text: "Background submission requires an interactive confirmation." }],
+						details: {},
+					};
+				}
+				const confirmed = await ctx.ui.confirm("Start background implementation?", confirmation);
+				if (!confirmed) {
+					return { content: [{ type: "text", text: "Background job submission cancelled by the user." }], details: {} };
+				}
+
+				const id = makeJobId();
+				if (formalSpec && (formalSpec.repoRoot !== repoRoot || formalSpec.baseRevision !== headResult.stdout.trim())) {
+					throw new Error("Formal spec repository/base differs from submission context");
+				}
+				const jobDir = path.join(getJobsDir(), id);
+				const worktreePath = path.join(getStateDir(), "worktrees", id);
+				const job: BackgroundJob = {
+					schemaVersion: 1,
+					id,
+					title: params.title.trim(),
+					status: "queued",
+					createdAt: now(),
+					updatedAt: now(),
+					sourceCwd: ctx.cwd,
+					repoRoot,
+					baseRevision: headResult.stdout.trim(),
+					dirtyAtSubmit: dirty,
+					task: params.task.trim(),
+					doneWhen: params.doneWhen.map((item) => item.trim()).filter(Boolean),
+					verificationCommands: commands,
+					timeoutMinutes,
+					maxRepairAttempts,
+					executionProfile: "dual-local-coding",
+					worktreePath,
+					jobDir,
+					verificationResults: [],
 				};
-			}
-			const confirmed = await ctx.ui.confirm("Start background implementation?", confirmation);
-			if (!confirmed) {
-				return { content: [{ type: "text", text: "Background job submission cancelled by the user." }], details: {} };
-			}
-
-			const id = makeJobId();
-			if (formalSpec && (formalSpec.repoRoot !== repoRoot || formalSpec.baseRevision !== headResult.stdout.trim())) {
-				throw new Error("Formal spec repository/base differs from submission context");
-			}
-			const jobDir = path.join(getJobsDir(), id);
-			const worktreePath = path.join(getStateDir(), "worktrees", id);
-			const job: BackgroundJob = {
-				schemaVersion: 1,
-				id,
-				title: params.title.trim(),
-				status: "queued",
-				createdAt: now(),
-				updatedAt: now(),
-				sourceCwd: ctx.cwd,
-				repoRoot,
-				baseRevision: headResult.stdout.trim(),
-				dirtyAtSubmit: dirty,
-				task: params.task.trim(),
-				doneWhen: params.doneWhen.map((item) => item.trim()).filter(Boolean),
-				verificationCommands: commands,
-				timeoutMinutes,
-				maxRepairAttempts,
-				executionProfile: "dual-local-coding",
-				worktreePath,
-				jobDir,
-				verificationResults: [],
-			};
-			if (formalSpec) {
-				Object.assign(job, formalSpec, { schemaVersion: 2, humanAuthorization: "explicit-execute-proposal-only" });
-				job.task = formalSpec.contract.task;
-				job.timeoutMinutes = formalSpec.contract.timeout_seconds / 60;
-				job.maxRepairAttempts = formalSpec.contract.max_repairs;
-			}
-			fs.mkdirSync(jobDir, { recursive: true });
-			fs.writeFileSync(path.join(jobDir, "TASK.md"), renderTask(job), "utf8");
-			const jobFile = path.join(jobDir, "job.json");
-			atomicWriteJson(jobFile, job);
-
-			const launch = await startDetachedRunner(pi, shell, runner, jobFile);
-			if (launch.code !== 0 || !launch.pid) {
-				job.status = "failed";
-				job.updatedAt = now();
-				job.message = `Background runner failed to launch: ${launch.stderr || launch.stdout || `exit ${launch.code}`}`;
+				if (formalSpec) {
+					Object.assign(job, formalSpec, { schemaVersion: 2, humanAuthorization: "explicit-execute-proposal-only" });
+					job.task = formalSpec.contract.task;
+					job.timeoutMinutes = formalSpec.contract.timeout_seconds / 60;
+					job.maxRepairAttempts = formalSpec.contract.max_repairs;
+				}
+				fs.mkdirSync(jobDir, { recursive: true });
+				fs.writeFileSync(path.join(jobDir, "TASK.md"), renderTask(job), "utf8");
+				const jobFile = path.join(jobDir, "job.json");
 				atomicWriteJson(jobFile, job);
-				return {
-					content: [{ type: "text", text: job.message }],
-					details: { job, launch },
-				};
-			}
-			const currentJob = loadJobFile(jobFile);
-			if (currentJob.status === "queued") {
-				currentJob.runnerPid = launch.pid;
-				currentJob.updatedAt = now();
-				currentJob.message = "Background runner process launched";
-				atomicWriteJson(jobFile, currentJob);
-			}
-			if (uiMode !== "off") ctx.ui.notify(`Background job ${id} started`, "info");
 
-			return {
-				content: [
-					{
-						type: "text",
-						text: `Background job submitted: ${id}\nWorktree: ${worktreePath}\nUse background_job_status or /bg-status to inspect it.`,
-					},
-				],
-				details: loadJobFile(jobFile),
-			};
+				const launch = await startDetachedRunner(pi, shell, runner, jobFile);
+				if (launch.code !== 0 || !launch.pid) {
+					job.status = "failed";
+					job.updatedAt = now();
+					job.message = `Background runner failed to launch: ${launch.stderr || launch.stdout || `exit ${launch.code}`}`;
+					atomicWriteJson(jobFile, job);
+					return {
+						content: [{ type: "text", text: job.message }],
+						details: { job, launch },
+					};
+				}
+				const currentJob = loadJobFile(jobFile);
+				if (currentJob.status === "queued") {
+					currentJob.runnerPid = launch.pid;
+					currentJob.updatedAt = now();
+					currentJob.message = "Background runner process launched";
+					atomicWriteJson(jobFile, currentJob);
+				}
+				if (uiMode !== "off") ctx.ui.notify(`Background job ${id} started`, "info");
+
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Background job submitted: ${id}\nWorktree: ${worktreePath}\nUse background_job_status or /bg-status to inspect it.`,
+						},
+					],
+					details: loadJobFile(jobFile),
+				};
+			} finally {
+				fs.closeSync(admissionFd);
+				fs.unlinkSync(admissionFile);
+			}
 		},
 	});
 
