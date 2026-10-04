@@ -332,8 +332,23 @@ def executable_identity(argument: str) -> dict[str, str]:
     return {"path": str(path), "sha256": file_hash(path)}
 
 
+def observed_dependency_versions() -> dict[str, str]:
+    """Measure required installed versions without installing or importing their code."""
+    versions = {}
+    for name in ("pytest", "ruff", "jsonschema", "psutil"):
+        try:
+            version = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError as exc:
+            raise GateFailure("Required verifier dependency unavailable: " + name) from exc
+        if not isinstance(version, str) or not version.strip():
+            raise GateFailure("Required verifier dependency version missing: " + name)
+        versions[name] = version
+    return versions
+
+
 def observed_verifier_identity(
-    runtime: dict, contract: dict, *, observation: dict | None = None
+    runtime: dict, contract: dict, *, observation: dict | None = None,
+    dependency_versions: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Derive identity from the running controller and its actual command resolution."""
     observation = observation if observation is not None else {}
@@ -398,9 +413,19 @@ def observed_verifier_identity(
     for index, path in enumerate(modules):
         item = measure(path, "module_" + str(index), str(path))
         pins[item["path"]] = item["sha256"]
+    observation["phase"] = "dependency_resolution"
+    dependencies = observed_dependency_versions()
+    if dependency_versions is not None:
+        dependency_versions.update(dependencies)
+    observation["dependency_versions_sha256"] = digest(encode(dependencies))
+    observation["dependency_version_sha256"] = {
+        name: digest(version.encode("utf-8")) for name, version in dependencies.items()
+    }
     identity = {
         "executor_id": "ephy_worker.formal_runtime.independent-verifier.v1",
-        "runtime_sha256": digest(encode({"files": pins, "python_version": sys.version})),
+        "runtime_sha256": digest(encode({
+            "files": pins, "python_version": sys.version, "dependencies": dependencies,
+        })),
         "invocation_config_sha256": digest(
             encode(
                 {
@@ -912,8 +937,12 @@ class FormalRunner:
             "expected_identity": self.job["verifier_identity"],
             "observed_identity": None,
         }
+        dependencies = {}
         try:
-            observed = observed_verifier_identity(self.runtime, self.contract, observation=observation)
+            observed = observed_verifier_identity(
+                self.runtime, self.contract, observation=observation,
+                dependency_versions=dependencies,
+            )
         except Exception as exc:
             observation.update(decision="observation_failed", failure_type=type(exc).__name__)
             self.retain_verifier_observation(observation)
@@ -923,6 +952,7 @@ class FormalRunner:
         self.retain_verifier_observation(observation)
         if not matches:
             raise GateFailure("Observed independent verifier identity differs from frozen expectation")
+        self._verified_dependency_versions = dependencies
         return observed
 
     def retain_verifier_observation(self, observation: dict) -> None:
@@ -942,9 +972,17 @@ class FormalRunner:
 
     def run_checks(self, label: str, baseline: bool = False) -> dict:
         verifier = self.verifier_identity()
+        dependencies = dict(self._verified_dependency_versions)
+
+        def dependencies_intact() -> None:
+            if observed_dependency_versions() != dependencies:
+                self.verifier_identity()  # Retain the changed measurement before refusing it.
+                raise GateFailure("Independent verifier dependency versions changed during checks")
+
         before = snapshot_hash(self.candidate)
         checks = []
         for check in self.contract["checks"]:
+            dependencies_intact()
             temp = self.directory / (label + "-temp")
             temp.mkdir(exist_ok=True)
             substitutions = {
@@ -955,6 +993,7 @@ class FormalRunner:
             }
             argv = [arg.format(**substitutions) for arg in check["argv"]]
             result = self.command(argv, self.candidate, label + "-" + check["id"], 600)
+            dependencies_intact()
             if (
                 result["argv"] != [executable_identity(argv[0])["path"], *argv[1:]]
                 or result["cwd"] != str(self.candidate)
@@ -971,7 +1010,9 @@ class FormalRunner:
                     "passed": result["exit_code"] == (check["baseline_exit_code"] if baseline else 0),
                 }
             )
+        dependencies_intact()
         checks.append(self.run_diff_check(label))
+        dependencies_intact()
         if snapshot_hash(self.candidate) != before:
             raise GateFailure("Independent verification changed candidate")
         after = snapshot(self.candidate)
@@ -1254,12 +1295,11 @@ class FormalRunner:
             "scope_escape",
         } or any(c["actual"] != c["expected"] for c in controls):
             raise GateFailure("Fixed checker control evidence invalid")
+        self.verifier_identity()
         env = {
             "python": self.runtime["python"],
             "python_version": sys.version,
-            "dependencies": {
-                name: importlib.metadata.version(name) for name in ("pytest", "ruff", "jsonschema", "psutil")
-            },
+            "dependencies": dict(self._verified_dependency_versions),
             "offline": True,
             "locale": "UTF-8",
             "pythonpath": "<measured-worktree>/src",
@@ -1268,7 +1308,6 @@ class FormalRunner:
         }
         self.job["environment_sha256"] = digest(encode(env))
         self.environment = encode(env)
-        self.verifier_identity()
         self.state("preparing", "Checking frozen baseline before any model invocation")
         self.baseline_result = self.run_checks("baseline", baseline=True)
         if not self.baseline_result["passed"]:

@@ -65,7 +65,7 @@ bootstrap_review_ready =
 
 承認時点のPR17 headは`2d4c175d82e116ef340b6565f0e71f02601c70ff`，treeは`66a61407fd92a4dff66e5769a0ee7653afd85507`，main向け完全patch SHA-256は`e114fcecfb40f710705f755d56fcc79c14bc9cd182c14da5ebc29401da7ee32e`である．[CI37181656928](https://github.com/kirimine170/ephy-worker/actions/runs/37181656928)はWindows691／Linux675件と各22 subtestsを通過し，[独立Codex Review5977255916](https://github.com/kirimine170/ephy-worker/pull/17#issuecomment-5977255916)は同headで重大な問題なしと記録した．PR17の15件のP1は個別修正と検証後に解決済みであり，許容されたP2文書指摘は残る．これは正式pre-audit監査を実施した記録ではない．
 
-今回の採用確定は，この参照点から6文書だけを変更し，code，tests，checker，schema，依存関係，CIと元Pi guideのbytesを維持する．変更後の完全head／tree／patchと新しいpolicy／skill hashをPRの検証記録へ結び付ける．上記のCI／reviewは参照点の証拠であり，最終headのCI／reviewは別に必要である．将来の変更は通常の記録，監査，予算，CI／reviewと人間の対象指定承認へ戻す．
+採用文書の確定headは`6745fba850b7d657ae07a1a67c7a22fabab2f049`，treeは`bce034ff71b695a65f1987885ab13ae6ddbd4147`であり，この段階では参照点から6文書だけを変更してcode，tests，checker，schema，依存関係，CIと元Pi guideのbytesを維持した．その後の全範囲レビューで確認されたP0／P1は，承認済みの修正条件に従い，同じ全42ファイル内の必要な実装修正と拒否controlで解消する．依存パッケージの提出後のversion driftと，非同期integration検証後のcheckout／patch driftはこの後続修正の対象である．元のassertion，scope，role，監査，予算，停止条件，通常の完了式を維持し，修正後の完全head／tree／patchとCI／独立reviewを新しく結び付ける．上記のCI／reviewや文書段階の結果を，修正後headの合格へ流用しない．将来の変更は通常の記録，監査，予算，CI／reviewと人間の対象指定承認へ戻す．CLI文書のP2は未修正のまま許容事項として記録し，repositoryの会話解決条件のためのresolveを修正済みとは扱わない．
 
 ### 必要な整合変更
 

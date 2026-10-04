@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync, readFileSync, existsSync, utimesSync, statSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import setup, { selectAuditedPatch } from "../.pi/extensions/background-jobs.ts";
 
@@ -153,6 +153,132 @@ async function runAdmissionControls(root) {
   assert.deepEqual(failures, [], "Cross-process admission and claim recovery controls must all pass");
 }
 
+
+async function runPostVerifierApplyControls(root) {
+  const previousState = process.env.DUAL_PI_STATE_DIR;
+  const failures = [];
+  const sha = value => createHash("sha256").update(value).digest("hex");
+  const cases = [["none", "final-verifier"], ...["dirty", "head", "patch"].flatMap(
+    mutation => [["" + mutation, "confirmation"], ["" + mutation, "final-verifier"]])];
+  try {
+    for (const [mutation, phase] of cases) {
+      const directory = join(root, "apply-" + mutation + "-" + phase);
+      const checkout = join(directory, "checkout");
+      mkdirSync(checkout, { recursive: true });
+      const emptyConfig = join(directory, "empty-gitconfig");
+      writeFileSync(emptyConfig, "");
+      const git = args => {
+        const result = spawnSync("git", args, { cwd: checkout, encoding: "utf8",
+          env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: emptyConfig } });
+        if (result.error) throw result.error;
+        return { code: result.status, stdout: result.stdout, stderr: result.stderr };
+      };
+      const checkedGit = args => {
+        const result = git(args);
+        assert.equal(result.code, 0, result.stderr);
+        return result.stdout;
+      };
+      checkedGit(["init"]);
+      writeFileSync(join(checkout, "doc.md"), "before\n");
+      checkedGit(["add", "doc.md"]);
+      checkedGit(["-c", "user.name=OfflineControl", "-c", "user.email=offline@local.invalid",
+        "-c", "commit.gpgsign=false", "commit", "-m", "Fixture baseline"]);
+      const base = checkedGit(["rev-parse", "HEAD"]).trim();
+      writeFileSync(join(checkout, "doc.md"), "approved\n");
+      const patch = checkedGit(["diff", "--binary", "--full-index"]);
+      checkedGit(["checkout", "--", "doc.md"]);
+      const state = join(directory, "state");
+      process.env.DUAL_PI_STATE_DIR = state;
+      const jobDir = join(state, "jobs", "bg-apply-control");
+      const bundle = join(jobDir, "audit-bundle");
+      mkdirSync(bundle, { recursive: true });
+      const controller = join(directory, "controller");
+      mkdirSync(join(controller, "ephy_worker"), { recursive: true });
+      const pins = { [process.execPath]: sha(readFileSync(process.execPath)) };
+      for (const name of ["__init__.py", "formal_runtime.py", "formal_artifacts.py", "formal_campaign.py", "strata_runtime.py"]) {
+        const file = join(controller, "ephy_worker", name);
+        writeFileSync(file, "# inert controller fixture; integration verifier is mocked\n");
+        pins[file] = sha(readFileSync(file));
+      }
+      writeFileSync(join(jobDir, "candidate.patch"), patch);
+      writeFileSync(join(bundle, "candidate_patch.txt"), patch);
+      const input = JSON.stringify({ job_id: "bg-apply-control", audit_id: "offline-audit",
+        baseline_commit: base, final_bindings: { candidate_patch_sha256: sha(patch) } });
+      const result = JSON.stringify({ job_id: "bg-apply-control", audit_id: "offline-audit",
+        decision: "ACCEPT_PROPOSAL", bound_inputs: {
+          candidate_patch_sha256: sha(patch), audit_input_sha256: sha(input) } });
+      writeFileSync(join(bundle, "audit-input.json"), input);
+      writeFileSync(join(jobDir, "audit-result.json"), result);
+      writeFileSync(join(jobDir, "audit-execution-attestation.json"), JSON.stringify({
+        passed: true, schema_valid: true, candidate_unchanged: true, bundle_unchanged: true,
+        audit_result_sha256: sha(result), audit_input_sha256: sha(input) }));
+      const at = new Date().toISOString();
+      const job = { id: "bg-apply-control", schemaVersion: 2, status: "review_ready", title: "Offline apply",
+        createdAt: at, updatedAt: at, jobDir, repoRoot: checkout, baseRevision: base,
+        runtime: { python: process.execPath, controller_source: controller }, contract: { runtime_hashes: pins } };
+      const jobFile = join(jobDir, "job.json");
+      const originalJob = JSON.stringify(job);
+      writeFileSync(jobFile, originalJob);
+      const mutate = () => {
+        if (mutation === "dirty") writeFileSync(join(checkout, "caller.txt"), "caller change must be preserved\n");
+        if (mutation === "head") checkedGit(["-c", "user.name=OfflineControl",
+          "-c", "user.email=offline@local.invalid", "-c", "commit.gpgsign=false",
+          "commit", "--allow-empty", "-m", "Concurrent HEAD move"]);
+        if (mutation === "patch") writeFileSync(join(jobDir, "candidate.patch"),
+          patch.replace("+approved\n", "+unapproved\n"));
+      };
+      let verifierCalls = 0, applyCalls = 0, error, outcome;
+      const tools = new Map();
+      setup({ registerTool: tool => tools.set(tool.name, tool), registerCommand() {}, on() {},
+        async exec(binary, args) {
+          if (binary === "git") {
+            if (args[0] === "apply" && !args.includes("--check")) applyCalls++;
+            return git(args);
+          }
+          assert.equal(binary, process.execPath, "Only the integration verifier is mocked");
+          assert.ok(args.includes("--verify-proposal-only"));
+          verifierCalls++;
+          if (phase === "final-verifier" && verifierCalls === 2) {
+            await new Promise(resolve => setTimeout(resolve, 0));
+            mutate();
+          }
+          return { code: 0, stdout: "", stderr: "" };
+        },
+      });
+      try {
+        outcome = await tools.get("background_job_apply").execute("id", { jobId: job.id },
+          undefined, undefined, { cwd: checkout, hasUI: true, ui: {
+            async confirm() { if (phase === "confirmation") mutate(); return true; }, notify() {} } });
+      } catch (caught) { error = caught; }
+      const observed = { mutation, phase, verifierCalls, applyCalls,
+        checkout_head: checkedGit(["rev-parse", "HEAD"]).trim(),
+        doc: readFileSync(join(checkout, "doc.md"), "utf8"),
+        retained_job_status: JSON.parse(readFileSync(jobFile, "utf8")).status,
+        error: error?.message, message: outcome?.content?.[0]?.text };
+      console.log("OBSERVE: native Git apply window " + JSON.stringify(observed));
+      try {
+        if (mutation === "none") {
+          assert.equal(error, undefined);
+          assert.equal(applyCalls, 1);
+          assert.equal(verifierCalls, 2);
+          assert.equal(observed.doc, "approved\n");
+          assert.equal(observed.retained_job_status, "applied");
+          assert.equal(checkedGit(["diff", "--cached"]).trim(), "", "Application remains unstaged");
+        } else {
+          assert.equal(applyCalls, 0, "Drift must stop before any native application");
+          assert.equal(observed.doc, "before\n");
+          assert.equal(readFileSync(jobFile, "utf8"), originalJob, "Rejected integration must preserve the Job");
+          if (mutation === "dirty") assert.equal(readFileSync(join(checkout, "caller.txt"), "utf8"), "caller change must be preserved\n");
+          if (mutation === "head") assert.notEqual(observed.checkout_head, base);
+          if (mutation === "patch") assert.equal(readFileSync(join(jobDir, "candidate.patch"), "utf8"), patch.replace("+approved\n", "+unapproved\n"));
+        }
+        console.log("PASS: native Git integration " + mutation + " during " + phase);
+      } catch (caught) { failures.push(mutation + "/" + phase + ": " + caught.message); }
+    }
+  } finally { process.env.DUAL_PI_STATE_DIR = previousState; }
+  assert.deepEqual(failures, [], "Native Git apply must reject drift after confirmation or final verifier");
+}
+
 if (process.argv[2] === "--admission-child") {
   await runAdmissionChild();
 } else {
@@ -281,6 +407,7 @@ try {
   assert.equal(execCalls.every(([binary]) => binary === "git"), true);
   console.log("PASS: readable terminal job permits normal confirmation; no runner is started");
   await runAdmissionControls(root);
+  await runPostVerifierApplyControls(root);
   console.log("PASS: formal approval binds actual task, scope, checks, model and caps; hash mismatch stops");
 } finally {
   rmSync(root, { recursive: true, force: true });

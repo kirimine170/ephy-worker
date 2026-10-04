@@ -2532,3 +2532,76 @@ def test_controller_records_owner_before_preflight(tmp_path, monkeypatch):
     assert len(observed) == 1
     assert read_json(job_file)["status"] == "failed"
     assert read_json(tmp_path / "runner-error.json")["type"] == "GateFailure"
+
+
+def dependency_metadata_fixture(tmp_path, monkeypatch, package):
+    """Owned distribution metadata; installed packages and model processes are untouched."""
+    import importlib.metadata
+
+    root = tmp_path / "dependency-metadata"
+    dist = root / (package + "-fixture.dist-info")
+    dist.mkdir(parents=True)
+    metadata = dist / "METADATA"
+    version = importlib.metadata.version(package)
+
+    def write_version(value):
+        metadata.write_text(
+            "Metadata-Version: 2.1\nName: " + package + "\nVersion: " + value + "\n",
+            encoding="utf-8",
+        )
+
+    write_version(version)
+    monkeypatch.syspath_prepend(str(root))
+    assert importlib.metadata.version(package) == version
+    return metadata, version, write_version
+
+
+@pytest.mark.parametrize("package", ["pytest", "ruff", "jsonschema", "psutil"])
+@pytest.mark.parametrize("when", ["none", "before", "during", "after", "missing"])
+@pytest.mark.parametrize("stage", ["baseline", "verification"])
+def test_frozen_dependency_versions_reject_drift_before_or_during_checks(
+    tmp_path, monkeypatch, package, when, stage
+):
+    import importlib.metadata
+
+    _metadata, version, write_version = dependency_metadata_fixture(tmp_path, monkeypatch, package)
+    runner = verifier_runner(tmp_path)
+    frozen = copy.deepcopy(runner.job["verifier_identity"])
+    command = runner.command
+    check_calls = []
+
+    def mutate():
+        # Actual importlib.metadata reads an owned changed record, not a mocked version() call.
+        write_version(version + ".changed" if when != "missing" else "")
+        assert importlib.metadata.version(package) != version
+
+    if when in ("before", "missing"):
+        mutate()
+
+    def observed_command(argv, cwd, label, *args, **kwargs):
+        result = command(argv, cwd, label, *args, **kwargs)
+        if label in {stage + "-" + check["id"] for check in runner.contract["checks"]}:
+            check_calls.append(label)
+            if (when == "during" and len(check_calls) == 1) or (
+                when == "after" and len(check_calls) == len(runner.contract["checks"])
+            ):
+                mutate()
+        return result
+
+    runner.command = observed_command
+    before = snapshot(runner.candidate)
+    if when == "none":
+        assert runner.run_checks(stage, baseline=stage == "baseline")["passed"]
+        assert len(check_calls) == 5
+    else:
+        with pytest.raises(GateFailure, match="verifier|Verifier|dependency|Dependency"):
+            runner.run_checks(stage, baseline=stage == "baseline")
+        assert len(check_calls) == {"before": 0, "missing": 0, "during": 1, "after": 5}[when]
+    assert runner.job["verifier_identity"] == frozen
+    assert snapshot(runner.candidate) == before
+    print(json.dumps({
+        "control": "dependency-version-drift", "package": package, "when": when,
+        "stage": stage, "actual_metadata_version": importlib.metadata.version(package),
+        "frozen_identity_unchanged": runner.job["verifier_identity"] == frozen,
+        "native_fixed_commands_completed": len(check_calls),
+    }))

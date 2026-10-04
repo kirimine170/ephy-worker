@@ -688,8 +688,9 @@ export default function (pi: ExtensionAPI): void {
 			if (!ctx.hasUI || !(await ctx.ui.confirm("Apply background changes?", `${summarize(job)}\n\nTarget: ${job.repoRoot}\nNo commit, merge, push, or deploy will be performed.`))) {
 				return { content: [{ type: "text", text: "Patch application was not confirmed." }], details: job };
 			}
-			// The checkout may have changed while the confirmation dialog was open.
-			// Revalidate the base, cleanliness, and patch immediately before applying.
+			// Complete the slow verifier before the final checkout and patch checks.
+			await verifyFormalIntegration(pi, job);
+			// Revalidate any changes during confirmation or integration verification.
 			const finalHead = await pi.exec("git", ["rev-parse", "HEAD"], { cwd: job.repoRoot, timeout: 10_000 });
 			const finalStatus = await pi.exec(
 				"git",
@@ -714,8 +715,7 @@ export default function (pi: ExtensionAPI): void {
 					details: job,
 				};
 			}
-			selectAuditedPatch(job); // Recheck bound bytes after the confirmation and final git check.
-			await verifyFormalIntegration(pi, job);
+			selectAuditedPatch(job); // Recheck bound bytes after the verifier and final git check.
 			const applied = await pi.exec("git", ["apply", patchFile], { cwd: job.repoRoot, timeout: 30_000 });
 			if (applied.code !== 0) {
 				return { content: [{ type: "text", text: `Patch application failed:\n${applied.stderr || applied.stdout}` }], details: job };
