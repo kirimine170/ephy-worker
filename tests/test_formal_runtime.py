@@ -1602,15 +1602,16 @@ def test_documented_pi_submitter_is_allowed_offline(tmp_path, backend):
     caller = tmp_path / "pi.exe"
     shutil.copy2(node, caller)
     state = tmp_path / "state"
+    # Keep the venv interpreter symlink and bind pins to the same absolute spelling.
     runtime = {
-        "python": str(Path(sys.executable).resolve(strict=True)),
+        "python": str(Path(sys.executable).absolute()),
         "pi": str(caller),
         "controller_source": str(REPOSITORY / "src"),
         "base_url": "http://127.0.0.1:59876",
     }
     frozen_contract = contract()
     frozen_contract["runtime_hashes"] = {
-        str(path.resolve()): file_hash(path)
+        str(path.absolute()): file_hash(path)
         for path in [
             Path(sys.executable), caller,
             *[REPOSITORY / "src/ephy_worker" / name
