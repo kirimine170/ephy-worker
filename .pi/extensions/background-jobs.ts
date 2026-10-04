@@ -136,7 +136,7 @@ export function selectAuditedPatch(job: BackgroundJob): string {
 
 function verifyFormalRuntimePins(job: BackgroundJob): void {
 	const formal = job as BackgroundJob & { runtime: { python: string; controller_source: string }; contract: { runtime_hashes: Record<string, string> } };
-	const files = [formal.runtime.python, ...["formal_runtime.py", "formal_artifacts.py", "formal_campaign.py", "strata_runtime.py"].map(name => path.join(formal.runtime.controller_source, "ephy_worker", name))];
+	const files = [formal.runtime.python, ...["__init__.py", "formal_runtime.py", "formal_artifacts.py", "formal_campaign.py", "strata_runtime.py"].map(name => path.join(formal.runtime.controller_source, "ephy_worker", name))];
 	for (const file of files) {
 		const expected = formal.contract.runtime_hashes[file] ?? Object.entries(formal.contract.runtime_hashes).find(([key]) => path.resolve(key) === path.resolve(file))?.[1];
 		if (!expected || createHash("sha256").update(fs.readFileSync(file)).digest("hex") !== expected) throw new Error("Integration verifier runtime pin mismatch");

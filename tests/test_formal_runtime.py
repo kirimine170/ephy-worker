@@ -1615,7 +1615,7 @@ def test_documented_pi_submitter_is_allowed_offline(tmp_path, backend):
         for path in [
             Path(sys.executable), caller,
             *[REPOSITORY / "src/ephy_worker" / name
-              for name in ("formal_runtime.py", "formal_artifacts.py", "formal_campaign.py", "strata_runtime.py")],
+              for name in ("__init__.py", "formal_runtime.py", "formal_artifacts.py", "formal_campaign.py", "strata_runtime.py")],
         ]
     }
     spec = {
@@ -1797,7 +1797,8 @@ def test_submitter_observer_refuses_unrelated_pid_before_executable_read(monkeyp
 
 @pytest.mark.parametrize("backend", ["owned", "external_strata"])
 @pytest.mark.parametrize("mutation", ["none", "missing", "changed"])
-def test_strata_module_pin_blocks_before_helper_or_launch(tmp_path, backend, mutation):
+@pytest.mark.parametrize("module_name", ["strata_runtime.py", "__init__.py"])
+def test_strata_module_pin_blocks_before_helper_or_launch(tmp_path, backend, mutation, module_name):
     """Actual submit process and isolated entrypoint; never starts a model."""
     import shutil
 
@@ -1820,9 +1821,10 @@ def test_strata_module_pin_blocks_before_helper_or_launch(tmp_path, backend, mut
     frozen_contract = contract()
     frozen_contract["runtime_hashes"] = {
         str(path.absolute()): file_hash(path)
-        for path in [Path(runtime["python"]), caller, *[package / name for name in module_names[1:]]]
+        for path in [Path(runtime["python"]), caller, *[package / name for name in module_names]]
     }
-    strata_module = package / "strata_runtime.py"
+    strata_module = package / module_name
+    (tmp_path / "control-module.txt").write_text(module_name, encoding="utf-8")
     marker = tmp_path / "unverified-module-executed.txt"
     if mutation == "missing":
         del frozen_contract["runtime_hashes"][str(strata_module)]
@@ -1908,7 +1910,8 @@ console.log(JSON.stringify({blocked,error,helpers,launches,jobs,entryExit,marker
 
 
 @pytest.mark.parametrize("missing", [False, True])
-def test_strata_module_is_mandatory_for_owned_preflight(tmp_path, monkeypatch, missing):
+@pytest.mark.parametrize("module_name", ["strata_runtime.py", "__init__.py"])
+def test_strata_module_is_mandatory_for_owned_preflight(tmp_path, monkeypatch, missing, module_name):
     from ephy_worker import formal_runtime as formal
 
     class OfflineBoundary(Exception):
@@ -1931,7 +1934,7 @@ def test_strata_module_is_mandatory_for_owned_preflight(tmp_path, monkeypatch, m
     runner.runtime["governance_root"] = str(governance)
     runner.contract = contract()
     modules = [Path(formal.__file__).with_name(name) for name in (
-        "formal_runtime.py", "formal_artifacts.py", "formal_campaign.py", "strata_runtime.py",
+        "__init__.py", "formal_runtime.py", "formal_artifacts.py", "formal_campaign.py", "strata_runtime.py",
     )]
     stop = tmp_path / "formal-stage-stop.ts"
     stop.write_text("offline")
@@ -1939,7 +1942,7 @@ def test_strata_module_is_mandatory_for_owned_preflight(tmp_path, monkeypatch, m
         str(path): file_hash(path) for path in [executable, doc, stop, *modules]
     }
     if missing:
-        del runner.contract["runtime_hashes"][str(modules[-1])]
+        del runner.contract["runtime_hashes"][str(Path(formal.__file__).with_name(module_name))]
     runner.job = {
         "schemaVersion": 2, "humanAuthorization": "explicit-execute-proposal-only",
         "controls": {"system_development_policy": file_hash(executable)},

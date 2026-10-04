@@ -1191,7 +1191,7 @@ class FormalRunner:
         }
         required_runtime.update(
             str(Path(__file__).with_name(name))
-            for name in ("formal_runtime.py", "formal_artifacts.py", "formal_campaign.py", "strata_runtime.py")
+            for name in ("__init__.py", "formal_runtime.py", "formal_artifacts.py", "formal_campaign.py", "strata_runtime.py")
         )
         required_runtime.add(str(Path(self.runtime["stage_guard"]).with_name("formal-stage-stop.ts").resolve()))
         context_pins = injected_context_pins(self.runtime, self.job["controls"])
