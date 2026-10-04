@@ -1615,7 +1615,7 @@ def test_documented_pi_submitter_is_allowed_offline(tmp_path, backend):
         for path in [
             Path(sys.executable), caller,
             *[REPOSITORY / "src/ephy_worker" / name
-              for name in ("formal_runtime.py", "formal_artifacts.py", "formal_campaign.py")],
+              for name in ("formal_runtime.py", "formal_artifacts.py", "formal_campaign.py", "strata_runtime.py")],
         ]
     }
     spec = {
@@ -1793,3 +1793,209 @@ def test_submitter_observer_refuses_unrelated_pid_before_executable_read(monkeyp
     monkeypatch.setattr(formal, "observed_process_identity", lambda _: pytest.fail("Unrelated executable was read"))
     with pytest.raises(GateFailure, match="not an ancestor"):
         formal.observe_submitting_process(201, "/unrelated/private.exe", "a" * 64)
+
+
+@pytest.mark.parametrize("backend", ["owned", "external_strata"])
+@pytest.mark.parametrize("mutation", ["none", "missing", "changed"])
+def test_strata_module_pin_blocks_before_helper_or_launch(tmp_path, backend, mutation):
+    """Actual submit process and isolated entrypoint; never starts a model."""
+    import shutil
+
+    node = shutil.which("node")
+    assert node
+    caller = tmp_path / "pi.exe"
+    shutil.copy2(node, caller)
+    package = tmp_path / "controller" / "ephy_worker"
+    package.mkdir(parents=True)
+    module_names = (
+        "__init__.py", "formal_runtime.py", "formal_artifacts.py",
+        "formal_campaign.py", "strata_runtime.py",
+    )
+    for name in module_names:
+        shutil.copy2(REPOSITORY / "src/ephy_worker" / name, package / name)
+    runtime = {
+        "python": str(Path(sys.executable).absolute()), "pi": str(caller),
+        "controller_source": str(package.parent), "backend": backend,
+    }
+    frozen_contract = contract()
+    frozen_contract["runtime_hashes"] = {
+        str(path.absolute()): file_hash(path)
+        for path in [Path(runtime["python"]), caller, *[package / name for name in module_names[1:]]]
+    }
+    strata_module = package / "strata_runtime.py"
+    marker = tmp_path / "unverified-module-executed.txt"
+    if mutation == "missing":
+        del frozen_contract["runtime_hashes"][str(strata_module)]
+    if mutation != "none":
+        strata_module.write_text(
+            "from pathlib import Path\n"
+            f"Path({str(marker)!r}).write_text('offline unverified import')\n"
+            "raise RuntimeError('Offline module-import sentinel; no model starts')\n",
+            encoding="utf-8",
+        )
+    spec = {
+        "repoRoot": str(tmp_path), "baseRevision": "a" * 40, "runtime": runtime,
+        "contract": frozen_contract, "controls": {},
+        "model_identities": {role: {"model_id": "offline"} for role in ("planner", "implementer", "auditor")},
+        "verifier_identity": {},
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_bytes(encode(spec))
+    runner_file = tmp_path / "runner.ps1"
+    runner_file.write_text("# offline mock; never executed\n")
+    state = tmp_path / "state"
+    script = r"""
+import {spawnSync} from "node:child_process";
+import {readFileSync,existsSync,readdirSync} from "node:fs";
+import {createHash} from "node:crypto";
+const [extension,specFile,state,runnerFile,marker,mutation]=process.argv.slice(2);
+process.env.DUAL_PI_STATE_DIR=state;
+process.env.DUAL_JOB_RUNNER=runnerFile;
+process.env.DUAL_POWERSHELL_EXE="fixture-shell";
+const {default:setup}=await import(extension);
+const bytes=readFileSync(specFile),spec=JSON.parse(bytes),tools=new Map();
+let helpers=0,launches=0,result,blocked=false,error="",entryExit=null;
+setup({registerTool:t=>tools.set(t.name,t),registerCommand(){},on(){},
+  async exec(binary,args,options){
+    if(binary==="git") return {code:0,stdout:args.includes("--show-toplevel")?spec.repoRoot:args.includes("HEAD")?spec.baseRevision:"",stderr:""};
+    if(binary===spec.runtime.python){
+      helpers++;
+      const out=spawnSync(binary,args,{cwd:options.cwd,encoding:"utf8",timeout:10000});
+      return {code:out.status,stdout:out.stdout,stderr:out.stderr};
+    }
+    if(binary!=="fixture-shell") throw new Error("Unexpected command");
+    launches++;
+    return {code:0,stdout:String(process.pid),stderr:""};
+  }});
+try {
+  result=await tools.get("background_job_submit").execute("id",
+    {title:"Offline pin control",task:"Offline fixture",doneWhen:["No model"],formalSpecPath:specFile,
+     formalSpecSha256:createHash("sha256").update(bytes).digest("hex")},
+    undefined,undefined,{cwd:spec.repoRoot,hasUI:true,ui:{confirm(){return true;},notify(){}}});
+} catch(exc) {blocked=true;error=String(exc);}
+if(!blocked && mutation!=="none"){
+  // Exercise only the real entrypoint import; the replaced fixture module raises before make_runner.
+  const out=spawnSync(spec.runtime.python,["-c",
+    "import sys; sys.path.insert(0,sys.argv.pop(1)); from ephy_worker.formal_runtime import main; main()",
+    spec.runtime.controller_source,"--job",result.details.jobDir+"/job.json"],
+    {encoding:"utf8",timeout:10000});
+  entryExit=out.status;
+}
+const jobs=existsSync(state+"/jobs")?readdirSync(state+"/jobs").length:0;
+console.log(JSON.stringify({blocked,error,helpers,launches,jobs,entryExit,marker:existsSync(marker),
+  admissionClaim:existsSync(state+"/background-admission.lock")}));
+"""
+    script_file = tmp_path / "pin-control.mjs"
+    script_file.write_text(script, encoding="utf-8")
+    command = [
+        str(caller), "--experimental-strip-types", "--experimental-loader",
+        (REPOSITORY / "tests/formal-submit-loader.mjs").as_uri(), str(script_file),
+        (REPOSITORY / ".pi/extensions/background-jobs.ts").as_uri(),
+        str(spec_file), str(state), str(runner_file), str(marker), mutation,
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", timeout=25, check=False)
+    assert result.returncode == 0, result.stderr
+    observed = json.loads(result.stdout)
+    assert observed["admissionClaim"] is False
+    if mutation == "none":
+        assert observed["blocked"] is False and observed["helpers"] == observed["launches"] == observed["jobs"] == 1
+    else:
+        assert observed["blocked"] is True, observed
+        assert "Integration verifier runtime pin mismatch" in observed["error"]
+        assert observed["helpers"] == observed["launches"] == observed["jobs"] == 0
+    assert observed["marker"] is False, observed
+    assert marker.exists() is False
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_strata_module_is_mandatory_for_owned_preflight(tmp_path, monkeypatch, missing):
+    from ephy_worker import formal_runtime as formal
+
+    class OfflineBoundary(Exception):
+        pass
+
+    executable = tmp_path / "frozen-runtime"
+    executable.write_bytes(b"offline")
+    governance = tmp_path / "governance"
+    doc = governance / "docs/self-improvement-mvp.md"
+    doc.parent.mkdir(parents=True)
+    doc.write_text("offline")
+    runner = object.__new__(FormalRunner)
+    runner.runtime = {
+        name: str(executable)
+        for name in (
+            "python", "pi", "server", "models_ini", "provider", "stage_guard",
+            "governance_gate", "worker_agent", "runner", "runner_test", "policy",
+        )
+    }
+    runner.runtime["governance_root"] = str(governance)
+    runner.contract = contract()
+    modules = [Path(formal.__file__).with_name(name) for name in (
+        "formal_runtime.py", "formal_artifacts.py", "formal_campaign.py", "strata_runtime.py",
+    )]
+    stop = tmp_path / "formal-stage-stop.ts"
+    stop.write_text("offline")
+    runner.contract["runtime_hashes"] = {
+        str(path): file_hash(path) for path in [executable, doc, stop, *modules]
+    }
+    if missing:
+        del runner.contract["runtime_hashes"][str(modules[-1])]
+    runner.job = {
+        "schemaVersion": 2, "humanAuthorization": "explicit-execute-proposal-only",
+        "controls": {"system_development_policy": file_hash(executable)},
+        "model_identities": {role: {"invocation_config_sha256": "offline"}
+                             for role in ("planner", "implementer", "auditor")},
+    }
+    runner.intact = lambda: None
+    runner.resources = lambda: None
+    monkeypatch.setattr(formal, "injected_context_pins", lambda *_: {})
+
+    def offline(*_):
+        raise OfflineBoundary("Mandatory pins passed; stop before any model/invocation")
+
+    monkeypatch.setattr(formal, "invocation_identity", offline)
+    if missing:
+        with pytest.raises(GateFailure, match="Missing mandatory executable/config pin"):
+            runner.preflight()
+    else:
+        with pytest.raises(OfflineBoundary):
+            runner.preflight()
+
+
+@pytest.mark.parametrize("mutation", ["none", "missing", "changed"])
+def test_strata_dispatch_pin_precedes_actual_module_import(tmp_path, mutation):
+    import shutil
+
+    package = tmp_path / "controller" / "ephy_worker"
+    package.mkdir(parents=True)
+    for name in ("__init__.py", "formal_runtime.py", "formal_artifacts.py", "formal_campaign.py"):
+        shutil.copy2(REPOSITORY / "src/ephy_worker" / name, package / name)
+    marker = tmp_path / "dispatch-imported.txt"
+    module = package / "strata_runtime.py"
+    module.write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('offline dispatch import')\n"
+        "def make_runner(job_file):\n"
+        "    raise RuntimeError('Offline dispatch boundary; no model starts')\n",
+        encoding="utf-8",
+    )
+    pins = {str(module): file_hash(module)}
+    if mutation == "missing":
+        pins.clear()
+    elif mutation == "changed":
+        module.write_text(module.read_text(encoding="utf-8") + "\n# changed after freeze\n", encoding="utf-8")
+    job = tmp_path / "job.json"
+    write_json(job, {"contract": {"runtime_hashes": pins}})
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import sys;sys.path.insert(0,sys.argv.pop(1));from ephy_worker.formal_runtime import main;main()",
+         str(package.parent), "--job", str(job)],
+        capture_output=True, text=True, encoding="utf-8", timeout=10, check=False,
+    )
+    assert result.returncode != 0
+    if mutation == "none":
+        assert marker.read_text() == "offline dispatch import"
+        assert "Offline dispatch boundary" in result.stderr
+    else:
+        assert marker.exists() is False, result.stderr
+        assert "Strata dispatch module lacks a matching frozen pin" in result.stderr

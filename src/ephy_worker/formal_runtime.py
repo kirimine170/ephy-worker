@@ -1191,7 +1191,7 @@ class FormalRunner:
         }
         required_runtime.update(
             str(Path(__file__).with_name(name))
-            for name in ("formal_runtime.py", "formal_artifacts.py", "formal_campaign.py")
+            for name in ("formal_runtime.py", "formal_artifacts.py", "formal_campaign.py", "strata_runtime.py")
         )
         required_runtime.add(str(Path(self.runtime["stage_guard"]).with_name("formal-stage-stop.ts").resolve()))
         context_pins = injected_context_pins(self.runtime, self.job["controls"])
@@ -1639,6 +1639,11 @@ def main() -> None:
     if args.verify_proposal_only:
         print(json.dumps({"patch": str(verify_proposal_for_integration(args.job)), "verified": True}))
         return
+    job = read_json(args.job)
+    dispatch_module = Path(__file__).with_name("strata_runtime.py")
+    expected = job.get("contract", {}).get("runtime_hashes", {}).get(str(dispatch_module))
+    if not expected or file_hash(dispatch_module) != expected:
+        raise GateFailure("Strata dispatch module lacks a matching frozen pin")
     from .strata_runtime import make_runner
 
     runner = make_runner(args.job)
