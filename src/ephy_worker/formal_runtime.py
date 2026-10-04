@@ -601,9 +601,9 @@ def stage_evidence(events: list[dict], model: str, role: str) -> dict:
 
 
 class FormalRunner:
-    def __init__(self, job_file: Path):
+    def __init__(self, job_file: Path, *, initial_job: dict | None = None):
         self.job_file = job_file.resolve()
-        self.job = read_json(job_file)
+        self.job = read_json(job_file) if initial_job is None else copy.deepcopy(initial_job)
         self.contract = self.job["contract"]
         self.directory = Path(self.job["jobDir"]).resolve()
         self.candidate = Path(self.job["worktreePath"]).resolve()
@@ -1282,6 +1282,7 @@ class FormalRunner:
 
     def run(self) -> None:
         try:
+            self.state("preparing", "Validating frozen runtime before preflight")
             self.preflight()
             self.state("running", "Fresh designated-model planning session")
             before = snapshot_hash(self.candidate)
@@ -1631,7 +1632,7 @@ def verify_proposal_for_integration(job_file: Path) -> Path:
     return patch
 
 
-def main() -> None:
+def main(*, launch_job_bytes: bytes | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--job", type=Path, required=True)
     parser.add_argument("--verify-proposal-only", action="store_true")
@@ -1639,14 +1640,19 @@ def main() -> None:
     if args.verify_proposal_only:
         print(json.dumps({"patch": str(verify_proposal_for_integration(args.job)), "verified": True}))
         return
-    job = read_json(args.job)
+    if launch_job_bytes is None:
+        job = read_json(args.job)
+    else:
+        if args.job.read_bytes() != launch_job_bytes:
+            raise GateFailure("Frozen launch job bytes changed before controller entry")
+        job = json.loads(launch_job_bytes.decode("utf-8"))
     dispatch_module = Path(__file__).with_name("strata_runtime.py")
     expected = job.get("contract", {}).get("runtime_hashes", {}).get(str(dispatch_module))
     if not expected or file_hash(dispatch_module) != expected:
         raise GateFailure("Strata dispatch module lacks a matching frozen pin")
     from .strata_runtime import make_runner
 
-    runner = make_runner(args.job)
+    runner = make_runner(args.job) if launch_job_bytes is None else make_runner(args.job, initial_job=job)
     with exclusive_lock(Path(runner.runtime["resource_lock"])):
         runner.run()
 

@@ -1605,7 +1605,10 @@ def test_documented_pi_submitter_is_allowed_offline(tmp_path, backend):
     # Keep the venv interpreter symlink and bind pins to the same absolute spelling.
     runner_file = tmp_path / "runner.ps1"
     runner_file.write_text("# offline fixture; never executed\n")
+    shell_file = tmp_path / "fixture-shell.exe"
+    shell_file.write_bytes(b"offline mocked shell; never executed")
     runtime = {
+        "powershell": str(shell_file),
         "runner": str(runner_file),
         "python": str(Path(sys.executable).absolute()),
         "pi": str(caller),
@@ -1616,7 +1619,7 @@ def test_documented_pi_submitter_is_allowed_offline(tmp_path, backend):
     frozen_contract["runtime_hashes"] = {
         str(path.absolute()): file_hash(path)
         for path in [
-            Path(sys.executable), caller, runner_file,
+            Path(sys.executable), caller, runner_file, shell_file,
             *[REPOSITORY / "src/ephy_worker" / name
               for name in ("__init__.py", "formal_runtime.py", "formal_artifacts.py", "formal_campaign.py", "strata_runtime.py")],
         ]
@@ -1668,10 +1671,11 @@ import {readFileSync} from "node:fs";
 const [extension,specFile,state,runnerFile,probe,backend] = process.argv.slice(2);
 process.env.DUAL_PI_STATE_DIR=state;
 process.env.DUAL_JOB_RUNNER=runnerFile;
-process.env.DUAL_POWERSHELL_EXE="fixture-shell";
+
 const {default:setup}=await import(extension);
 const bytes=readFileSync(specFile);
 const spec=JSON.parse(bytes);
+process.env.DUAL_POWERSHELL_EXE=spec.runtime.powershell;
 const {createHash}=await import("node:crypto");
 const tools=new Map();
 let launches=0,observations=0;
@@ -1683,7 +1687,7 @@ setup({registerTool:t=>tools.set(t.name,t),registerCommand(){},on(){},
       const out=spawnSync(binary,args,{cwd:options.cwd,encoding:"utf8",timeout:10000});
       return {code:out.status,stdout:out.stdout,stderr:out.stderr};
     }
-    if(binary!=="fixture-shell") throw new Error("Unexpected command");
+    if(binary!==spec.runtime.powershell) throw new Error("Unexpected command");
     launches++;
     return {code:0,stdout:String(process.pid),stderr:""};
   }});
@@ -1817,7 +1821,10 @@ def test_strata_module_pin_blocks_before_helper_or_launch(tmp_path, backend, mut
         shutil.copy2(REPOSITORY / "src/ephy_worker" / name, package / name)
     runner_file = tmp_path / "runner.ps1"
     runner_file.write_text("# offline mock; never executed\n")
+    shell_file = tmp_path / "fixture-shell.exe"
+    shell_file.write_bytes(b"offline mocked shell; never executed")
     runtime = {
+        "powershell": str(shell_file),
         "runner": str(runner_file),
         "python": str(Path(sys.executable).absolute()), "pi": str(caller),
         "controller_source": str(package.parent), "backend": backend,
@@ -1825,7 +1832,7 @@ def test_strata_module_pin_blocks_before_helper_or_launch(tmp_path, backend, mut
     frozen_contract = contract()
     frozen_contract["runtime_hashes"] = {
         str(path.absolute()): file_hash(path)
-        for path in [Path(runtime["python"]), caller, runner_file, *[package / name for name in module_names]]
+        for path in [Path(runtime["python"]), caller, runner_file, shell_file, *[package / name for name in module_names]]
     }
     strata_module = package / module_name
     (tmp_path / "control-module.txt").write_text(module_name, encoding="utf-8")
@@ -1855,9 +1862,10 @@ import {createHash} from "node:crypto";
 const [extension,specFile,state,runnerFile,marker,mutation]=process.argv.slice(2);
 process.env.DUAL_PI_STATE_DIR=state;
 process.env.DUAL_JOB_RUNNER=runnerFile;
-process.env.DUAL_POWERSHELL_EXE="fixture-shell";
+
 const {default:setup}=await import(extension);
 const bytes=readFileSync(specFile),spec=JSON.parse(bytes),tools=new Map();
+process.env.DUAL_POWERSHELL_EXE=spec.runtime.powershell;
 let helpers=0,launches=0,result,blocked=false,error="",entryExit=null;
 setup({registerTool:t=>tools.set(t.name,t),registerCommand(){},on(){},
   async exec(binary,args,options){
@@ -1867,7 +1875,7 @@ setup({registerTool:t=>tools.set(t.name,t),registerCommand(){},on(){},
       const out=spawnSync(binary,args,{cwd:options.cwd,encoding:"utf8",timeout:10000});
       return {code:out.status,stdout:out.stdout,stderr:out.stderr};
     }
-    if(binary!=="fixture-shell") throw new Error("Unexpected command");
+    if(binary!==spec.runtime.powershell) throw new Error("Unexpected command");
     launches++;
     return {code:0,stdout:String(process.pid),stderr:""};
   }});
@@ -2019,13 +2027,16 @@ def test_formal_detached_runner_uses_frozen_path_and_bytes(tmp_path, mutation):
     shell = shutil.which("powershell.exe") if os.name == "nt" else None
     if os.name == "nt":
         assert shell, "Windows CI must exercise the actual detached launcher"
+    shell_file = Path(shell) if shell else tmp_path / "fixture-shell.exe"
+    if not shell:
+        shell_file.write_bytes(b"offline mocked shell")
     caller = tmp_path / "pi.exe"
     shutil.copy2(node, caller)
     marker = tmp_path / "runner-executed.json"
     runner_file = tmp_path / "frozen-runner.ps1"
     marker_literal = str(marker).replace("'", "''")
     runner_file.write_text(
-        "param([string]$JobFile)\n"
+        "param([string]$JobFile, [string]$JobSha256)\n"
         "$ErrorActionPreference = 'Stop'\n"
         "$fixtureSha = [Security.Cryptography.SHA256]::Create()\n"
         "$fixtureHash = [BitConverter]::ToString($fixtureSha.ComputeHash([IO.File]::ReadAllBytes($PSCommandPath))).Replace('-', '').ToLowerInvariant()\n"
@@ -2036,13 +2047,14 @@ def test_formal_detached_runner_uses_frozen_path_and_bytes(tmp_path, mutation):
         encoding="utf-8",
     )
     runtime = {
+        "powershell": str(shell_file),
         "python": str(Path(sys.executable).absolute()), "pi": str(caller),
         "controller_source": str(REPOSITORY / "src"), "runner": str(runner_file),
     }
     pins = {
         str(file.absolute()): file_hash(file)
         for file in [
-            Path(runtime["python"]), caller, runner_file,
+            Path(runtime["python"]), caller, runner_file, shell_file,
             *[REPOSITORY / "src/ephy_worker" / name for name in (
                 "__init__.py", "formal_runtime.py", "formal_artifacts.py",
                 "formal_campaign.py", "strata_runtime.py",
@@ -2096,7 +2108,7 @@ setup({registerTool:t=>tools.set(t.name,t),registerCommand(){},on(){},
   if(binary!==shell) throw new Error("Unexpected command");
   launches++;
   launchCommand=Buffer.from(args[args.indexOf("-EncodedCommand")+1],"base64").toString("utf16le");
-  if(shell==="fixture-shell") return {code:0,stdout:String(process.pid),stderr:""};
+  if(process.platform!=="win32") return {code:0,stdout:String(process.pid),stderr:""};
   const out=spawnSync(binary,args,{encoding:"utf8",timeout:10000});
   launchExit=out.status;
   return {code:out.status,stdout:out.stdout,stderr:out.stderr};
@@ -2107,7 +2119,7 @@ try {
    formalSpecSha256:createHash("sha256").update(bytes).digest("hex")},
   undefined,undefined,{cwd:spec.repoRoot,hasUI:true,ui:{confirm(){return true;},notify(){}}});
 } catch(exc) {blocked=true;error=String(exc);}
-if(launches && shell!=="fixture-shell"){
+if(launches && process.platform==="win32"){
  const deadline=Date.now()+10000;
  while(!existsSync(marker) && Date.now()<deadline) await new Promise(resolve=>setTimeout(resolve,20));
 }
@@ -2125,7 +2137,7 @@ console.log(JSON.stringify({blocked,error,helpers,launches,launchCommand,launchE
             str(caller), "--experimental-strip-types", "--experimental-loader",
             (REPOSITORY / "tests/formal-submit-loader.mjs").as_uri(), str(script_file),
             (REPOSITORY / ".pi/extensions/background-jobs.ts").as_uri(),
-            str(spec_file), str(state), str(configured), shell or "fixture-shell", str(marker), mutation,
+            str(spec_file), str(state), str(configured), str(shell_file), str(marker), mutation,
         ],
         capture_output=True, text=True, encoding="utf-8", timeout=30, check=False,
     )
@@ -2154,7 +2166,7 @@ console.log(JSON.stringify({blocked,error,helpers,launches,launchCommand,launchE
 
 @pytest.mark.skipif(os.name != "nt", reason="Actual Windows PowerShell schema-v2 dispatch")
 @pytest.mark.parametrize("mutation", [
-    "none", "cwd_shadow", "cached_shadow", "missing_initializer", "changed_initializer",
+    "none", "cwd_shadow", "cached_shadow", "dependency_shadow", "missing_initializer", "changed_initializer",
     "missing_controller", "changed_controller", "missing_python",
 ])
 def test_formal_powershell_dispatch_imports_only_verified_controller(tmp_path, mutation):
@@ -2174,14 +2186,16 @@ def test_formal_powershell_dispatch_imports_only_verified_controller(tmp_path, m
         (package / name).write_text("# inert frozen fixture\n", encoding="utf-8")
     (package / "__init__.py").write_text("ORIGIN = 'frozen-initializer'\n", encoding="utf-8")
     (package / "formal_runtime.py").write_text(
-        "import json, sys\nfrom pathlib import Path\nimport ephy_worker\n"
+        "import decimal, json, sys\nfrom pathlib import Path\nimport ephy_worker\n"
         "from . import formal_artifacts, formal_campaign, strata_runtime\n"
-        "def main():\n"
+        "def main(*, launch_job_bytes=None):\n"
         "    evidence = {'interpreter': sys.executable, 'isolated': sys.flags.isolated,\n"
         "                'initializer': ephy_worker.__file__, 'initializer_origin': ephy_worker.ORIGIN,\n"
         "                'controller': __file__, 'argv': sys.argv[1:],\n"
         "                'other_modules': [m.__file__ for m in (formal_artifacts, formal_campaign, strata_runtime)]}\n"
-        f"    Path({str(marker)!r}).write_text(json.dumps(evidence), encoding='utf-8')\n"
+        f"    temporary = Path({str(marker)!r} + '.tmp')\n"
+        "    temporary.write_text(json.dumps(evidence), encoding='utf-8')\n"
+        f"    temporary.replace(Path({str(marker)!r}))\n"
         "if __name__ == '__main__': main()\n",
         encoding="utf-8",
     )
@@ -2196,6 +2210,8 @@ def test_formal_powershell_dispatch_imports_only_verified_controller(tmp_path, m
         shadow.mkdir()
         (shadow / "__init__.py").write_text(shadow_code, encoding="utf-8")
         (shadow / "formal_runtime.py").write_text(shadow_code, encoding="utf-8")
+    if mutation == "dependency_shadow":
+        (source / "decimal.py").write_text(shadow_code, encoding="utf-8")
     if mutation == "cached_shadow":
         # Valid timestamp/size cache for the verified initializer must not substitute unchecked bytecode.
         initializer = package / "__init__.py"
@@ -2225,8 +2241,8 @@ def test_formal_powershell_dispatch_imports_only_verified_controller(tmp_path, m
     write_json(job_file, {"schemaVersion": 2, "runtime": runtime, "contract": {"runtime_hashes": pins}})
     env = dict(os.environ, PYTHONPATH=str(cwd))
     result = subprocess.run(
-        [shell, "-NoProfile", "-NonInteractive", "-File", str(runner_file), "-JobFile", str(job_file)],
-        cwd=cwd, env=env, capture_output=True, text=True, encoding="utf-8", timeout=20, check=False,
+        [shell, "-NoProfile", "-NonInteractive", "-File", str(runner_file), "-JobFile", str(job_file), "-JobSha256", file_hash(job_file)],
+        cwd=cwd, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20, check=False,
     )
     observed = {
         "exit_code": result.returncode, "stderr": result.stderr,
@@ -2236,7 +2252,7 @@ def test_formal_powershell_dispatch_imports_only_verified_controller(tmp_path, m
     }
     write_json(tmp_path / "dispatch-observation.json", observed)
     assert shadow_marker.exists() is False, observed
-    if mutation in ("none", "cwd_shadow", "cached_shadow"):
+    if mutation in ("none", "cwd_shadow", "cached_shadow", "dependency_shadow"):
         assert result.returncode == 0 and marker.exists(), observed
         identity = observed["pinned_marker"]
         assert Path(identity["interpreter"]).resolve() == Path(runtime["python"]).resolve()
@@ -2249,3 +2265,270 @@ def test_formal_powershell_dispatch_imports_only_verified_controller(tmp_path, m
     else:
         assert result.returncode != 0 and marker.exists() is False, observed
         assert "Frozen controller bootstrap pin mismatch" in result.stderr
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Actual Windows shell/interpreter and detached dispatch controls")
+@pytest.mark.parametrize("mutation", [
+    "none", "shell_override", "missing_shell_pin", "shell_changed_after_helper",
+    "job_replaced", "python_changed_after_helper", "helper_cached_initializer", "helper_dependency_shadow", "runner_after_node_check", "delayed_job_consumer",
+])
+def test_formal_startup_binds_shell_job_and_interpreter(tmp_path, mutation):
+    """Real extension/helper/detached shell; all controller/alternate binaries are inert fixtures."""
+    import ast
+    import py_compile
+    import shutil
+    import struct
+    import sysconfig
+
+    node, shell = shutil.which("node"), shutil.which("powershell.exe")
+    assert node and shell
+    caller = tmp_path / "pi.exe"
+    shutil.copy2(node, caller)
+    state = tmp_path / "state"
+    marker = tmp_path / "controller-executed.json"
+    native_marker = tmp_path / "unverified-native-or-import.txt"
+    source = tmp_path / "controller"
+    package = source / "ephy_worker"
+    package.mkdir(parents=True)
+    modules = ("__init__.py", "formal_runtime.py", "formal_artifacts.py", "formal_campaign.py", "strata_runtime.py")
+    for name in modules:
+        shutil.copy2(REPOSITORY / "src/ephy_worker" / name, package / name)
+    module = package / "formal_runtime.py"
+    text = module.read_text(encoding="utf-8")
+    definition = next(x for x in ast.parse(text).body if isinstance(x, ast.FunctionDef) and x.name == "main")
+    lines = text.splitlines(keepends=True)
+    # Keep the actual submitting-process observer; replace only the execution entry with a no-model marker.
+    inert_main = (
+        "def main(*, launch_job_bytes=None):\n"
+        "    job_file = Path(sys.argv[sys.argv.index('--job') + 1])\n"
+        "    actual_bytes = job_file.read_bytes() if launch_job_bytes is None else launch_job_bytes\n"
+        "    import hashlib\n"
+        "    evidence = {'actual_job_sha256': hashlib.sha256(actual_bytes).hexdigest(),\n"
+        "                'passed_verified_bytes': launch_job_bytes is not None,\n"
+        "                'task': json.loads(actual_bytes)['contract']['task'],\n"
+        "                'interpreter': sys.executable, 'controller': __file__}\n"
+        f"    output = Path({str(marker)!r})\n"
+        "    staging = output.with_suffix('.tmp')\n"
+        "    staging.write_text(json.dumps(evidence), encoding='utf-8')\n"
+        "    staging.replace(output)\n"
+    )
+    module.write_text("".join(lines[:definition.lineno - 1]) + inert_main + "".join(lines[definition.end_lineno:]),
+                      encoding="utf-8")
+    runner_file = tmp_path / "run-background-job.ps1"
+    shutil.copy2(REPOSITORY / "tools/pi-local/windows/run-background-job.ps1", runner_file)
+    if mutation == "delayed_job_consumer":
+        delayed = runner_file.read_text(encoding="utf-8").replace(
+            "$job = Read-Job", "Start-Sleep -Milliseconds 750\n$job = Read-Job", 1,
+        )
+        runner_file.write_text(delayed, encoding="utf-8")
+    shutil.copy2(REPOSITORY / "tools/pi-local/windows/write-git-artifacts.ps1", tmp_path / "write-git-artifacts.ps1")
+    alternative = tmp_path / "inert-alternate.exe"
+    if mutation in ("shell_override", "shell_changed_after_helper", "python_changed_after_helper"):
+        code = (
+            "using System; using System.IO; using System.Diagnostics;\n"
+            "public class InertNativeProbe { public static void Main(string[] args) {\n"
+            f"File.WriteAllText({json.dumps(str(native_marker))}, \"inert unverified binary executed\");\n"
+            "Console.Write(Process.GetCurrentProcess().Id); } }\n"
+        )
+        compile_script = tmp_path / "compile-inert-probe.ps1"
+        compile_script.write_text(
+            "$ErrorActionPreference = 'Stop'\nAdd-Type -TypeDefinition @'\n" + code
+            + "'@ -OutputAssembly '" + str(alternative).replace("'", "''")
+            + "' -OutputType ConsoleApplication\n", encoding="utf-8",
+        )
+        compiled = subprocess.run([shell, "-NoProfile", "-NonInteractive", "-File", str(compile_script)],
+                                  capture_output=True, text=True, encoding="utf-8", timeout=20, check=False)
+        assert compiled.returncode == 0 and alternative.exists(), compiled.stderr
+    python = Path(sys.executable).absolute()
+    if mutation == "python_changed_after_helper":
+        # Existing interpreter/dependencies, copied into an owned fixture; never modify the installed interpreter.
+        venv = tmp_path / "fixture-venv"
+        scripts = venv / "Scripts"
+        scripts.mkdir(parents=True)
+        python = scripts / "python.exe"
+        shutil.copy2(sys.executable, python)
+        shutil.copy2(Path(sys.prefix) / "pyvenv.cfg", venv / "pyvenv.cfg")
+        site = venv / "Lib/site-packages"
+        site.mkdir(parents=True)
+        (site / "fixture-dependencies.pth").write_text(sysconfig.get_path("purelib") + "\n", encoding="utf-8")
+    frozen_shell = alternative if mutation == "shell_changed_after_helper" else Path(shell)
+    runtime = {
+        "python": str(python), "pi": str(caller), "powershell": str(frozen_shell),
+        "runner": str(runner_file), "controller_source": str(source), "backend": "owned_llama",
+    }
+    frozen_contract = contract()
+    frozen_contract["runtime_hashes"] = {
+        str(file): file_hash(file) for file in [python, caller, frozen_shell, runner_file, *[package / name for name in modules]]
+    }
+    if mutation == "missing_shell_pin":
+        del frozen_contract["runtime_hashes"][str(frozen_shell)]
+    if mutation == "helper_cached_initializer":
+        initializer = package / "__init__.py"
+        original, st = initializer.read_bytes(), initializer.stat()
+        initializer.write_text(
+            "from pathlib import Path\n"
+            f"Path({str(native_marker)!r}).write_text('unverified helper cache')\n"
+            "raise RuntimeError('inert cached initializer boundary')\n", encoding="utf-8",
+        )
+        cache = Path(py_compile.compile(str(initializer), doraise=True))
+        data = cache.read_bytes()
+        initializer.write_bytes(original)
+        os.utime(initializer, (st.st_atime, st.st_mtime))
+        cache.write_bytes(data[:8] + struct.pack("<II", int(st.st_mtime) & 0xFFFFFFFF, st.st_size) + data[16:])
+    elif mutation == "helper_dependency_shadow":
+        (source / "jsonschema.py").write_text(
+            "from pathlib import Path\n"
+            f"Path({str(native_marker)!r}).write_text('unverified helper dependency')\n"
+            "raise RuntimeError('inert dependency boundary')\n", encoding="utf-8",
+        )
+    spec = {
+        "repoRoot": str(tmp_path), "baseRevision": "a" * 40, "runtime": runtime, "contract": frozen_contract,
+        "controls": {}, "verifier_identity": {},
+        "model_identities": {role: {"model_id": "offline"} for role in ("planner", "implementer", "auditor")},
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_bytes(encode(spec))
+    script = r"""
+import {spawnSync} from "node:child_process";
+import {readFileSync,writeFileSync,existsSync,readdirSync,appendFileSync} from "node:fs";
+import {createHash} from "node:crypto";
+const [extension,specFile,state,marker,nativeMarker,alternative,mutation]=process.argv.slice(2);
+const bytes=readFileSync(specFile),spec=JSON.parse(bytes),tools=new Map();
+process.env.DUAL_PI_STATE_DIR=state;
+process.env.DUAL_JOB_RUNNER=spec.runtime.runner;
+process.env.DUAL_POWERSHELL_EXE=mutation==="shell_override"?alternative:spec.runtime.powershell;
+const {default:setup}=await import(extension);
+const stderrFile=state+"/runner.stderr",stdoutFile=state+"/runner.stdout";
+let helpers=0,launches=0,blocked=false,error="",launchCommand="",originalJobSHA=null,containsJobBinding=false,outerStderr="";
+setup({registerTool:t=>tools.set(t.name,t),registerCommand(){},on(){},
+ async exec(binary,args,options){
+  if(binary==="git") return {code:0,stdout:args.includes("--show-toplevel")?spec.repoRoot:args.includes("HEAD")?spec.baseRevision:"",stderr:""};
+  if(binary===spec.runtime.python){
+   helpers++;
+   const out=spawnSync(binary,args,{cwd:options.cwd,encoding:"utf8",timeout:10000});
+   if(mutation==="shell_changed_after_helper") appendFileSync(spec.runtime.powershell,"\nowned inert PE overlay mutation\n");
+   if(mutation==="python_changed_after_helper") writeFileSync(spec.runtime.python,readFileSync(alternative));
+   return {code:out.status,stdout:out.stdout,stderr:out.stderr};
+  }
+  launches++;
+  launchCommand=Buffer.from(args[args.indexOf("-EncodedCommand")+1],"base64").toString("utf16le");
+  const jobFile=state+"/jobs/"+readdirSync(state+"/jobs")[0]+"/job.json";
+  const original=readFileSync(jobFile);
+  originalJobSHA=createHash("sha256").update(original).digest("hex");
+  containsJobBinding=launchCommand.includes("-JobSha256") && launchCommand.includes(originalJobSHA);
+  if(mutation==="job_replaced"){
+   const replacement=JSON.parse(original);replacement.contract.task="UNAUTHORIZED REPLACEMENT TASK";
+   writeFileSync(jobFile,JSON.stringify(replacement));
+  }
+  if(mutation==="runner_after_node_check"){
+   const literal="'"+nativeMarker.replaceAll("'","''")+"'";
+   writeFileSync(spec.runtime.runner,"param([string]$JobFile,[string]$JobSha256)\n[IO.File]::WriteAllText("+literal+", 'unverified runner after Node check')\n");
+  }
+  // Capture the actual detached child's diagnostics; only output redirection is added by the SDK fixture.
+  const literal=v=>"'"+v.replaceAll("'","''")+"'";
+  const instrumented=launchCommand.replace("-PassThru -WindowStyle Hidden",
+    "-RedirectStandardError "+literal(stderrFile)+" -RedirectStandardOutput "+literal(stdoutFile)+" -PassThru -WindowStyle Hidden");
+  const actualArgs=[...args];actualArgs[actualArgs.indexOf("-EncodedCommand")+1]=Buffer.from(instrumented,"utf16le").toString("base64");
+  const out=spawnSync(binary,actualArgs,{encoding:"utf8",timeout:10000});
+  outerStderr=out.stderr;
+  return {code:out.status,stdout:out.stdout,stderr:out.stderr};
+ }});
+try {
+ await tools.get("background_job_submit").execute("id",
+  {title:"Startup binding",task:"Offline",doneWhen:["No model"],formalSpecPath:specFile,
+   formalSpecSha256:createHash("sha256").update(bytes).digest("hex")},
+  undefined,undefined,{cwd:spec.repoRoot,hasUI:true,ui:{confirm(){return true;},notify(){}}});
+} catch(exc) {blocked=true;error=String(exc);}
+if(launches){
+ const deadline=Date.now()+10000;
+ while(!existsSync(marker)&&!existsSync(nativeMarker)&&!outerStderr&&!(existsSync(stderrFile)&&readFileSync(stderrFile).length)&&Date.now()<deadline)
+  await new Promise(resolve=>setTimeout(resolve,20));
+}
+console.log(JSON.stringify({mutation,blocked,error,helpers,launches,containsJobBinding,originalJobSHA,outerStderr,
+ marker:existsSync(marker)?JSON.parse(readFileSync(marker,"utf8")):null,nativeMarker:existsSync(nativeMarker),
+ childStderr:existsSync(stderrFile)?readFileSync(stderrFile,"utf8"):"",
+ admissionClaim:existsSync(state+"/background-admission.lock")}));
+"""
+    script_file = tmp_path / "startup-control.mjs"
+    script_file.write_text(script, encoding="utf-8")
+    result = subprocess.run([
+        str(caller), "--experimental-strip-types", "--experimental-loader",
+        (REPOSITORY / "tests/formal-submit-loader.mjs").as_uri(), str(script_file),
+        (REPOSITORY / ".pi/extensions/background-jobs.ts").as_uri(), str(spec_file), str(state),
+        str(marker), str(native_marker), str(alternative), mutation,
+    ], capture_output=True, text=True, encoding="utf-8", timeout=35, check=False)
+    assert result.returncode == 0, result.stderr
+    observed = json.loads(result.stdout)
+    observed["finalJobSHA"] = file_hash(next((state / "jobs").glob("*/job.json"))) if observed["launches"] else None
+    write_json(tmp_path / "startup-observation.json", observed)
+    assert observed["admissionClaim"] is False
+    assert observed["nativeMarker"] is False and native_marker.exists() is False, observed
+    if mutation in ("none", "helper_cached_initializer", "helper_dependency_shadow", "delayed_job_consumer"):
+        assert observed["blocked"] is False and observed["helpers"] == observed["launches"] == 1, observed
+        assert observed["marker"]["actual_job_sha256"] == observed["originalJobSHA"], observed
+        assert observed["finalJobSHA"] == observed["originalJobSHA"], observed
+        assert observed["marker"]["task"] == frozen_contract["task"], observed
+        assert Path(observed["marker"]["interpreter"]).resolve() == python.resolve()
+        assert observed["marker"]["controller"] == str(module), observed
+    elif mutation == "job_replaced":
+        assert observed["helpers"] == observed["launches"] == 1, observed
+        assert observed["containsJobBinding"] is True and observed["marker"] is None, observed
+        assert "Frozen launch job bytes changed" in observed["childStderr"], observed
+    elif mutation == "runner_after_node_check":
+        assert observed["helpers"] == observed["launches"] == 1 and observed["marker"] is None, observed
+        assert "Frozen detached launch pin mismatch" in observed["outerStderr"], observed
+    elif mutation == "python_changed_after_helper":
+        assert observed["helpers"] == observed["launches"] == 1 and observed["marker"] is None, observed
+        assert "Python executable pin mismatch" in observed["childStderr"], observed
+    else:
+        assert observed["blocked"] is True and observed["launches"] == 0 and observed["marker"] is None, observed
+        assert observed["helpers"] == (1 if mutation == "shell_changed_after_helper" else 0), observed
+
+
+def test_frozen_initial_job_is_the_dispatch_and_controller_authority(tmp_path):
+    from ephy_worker.strata_runtime import make_runner
+
+    initial = {
+        "jobDir": str(tmp_path), "worktreePath": str(tmp_path / "candidate"), "repoRoot": str(tmp_path),
+        "contract": {"timeout_seconds": 30}, "runtime": {"backend": "owned_llama"},
+    }
+    job_file = tmp_path / "job.json"
+    replacement = copy.deepcopy(initial)
+    replacement["runtime"]["backend"] = "unrecognized replacement"
+    replacement["contract"]["timeout_seconds"] = 999
+    write_json(job_file, replacement)
+    runner = make_runner(job_file, initial_job=initial)
+    assert isinstance(runner, FormalRunner)
+    assert runner.runtime == initial["runtime"] and runner.contract == initial["contract"]
+    initial["contract"]["timeout_seconds"] = 1
+    assert runner.contract["timeout_seconds"] == 30
+    with pytest.raises(GateFailure, match="Frozen contract changed"):
+        runner.intact()
+
+
+def test_controller_records_owner_before_preflight(tmp_path, monkeypatch):
+    """An accepted controller claims its PID before slow preflight; gate failure still stops it."""
+    job_file = tmp_path / "job.json"
+    initial = {
+        "schemaVersion": 2, "status": "queued", "jobDir": str(tmp_path),
+        "worktreePath": str(tmp_path / "candidate"), "repoRoot": str(tmp_path),
+        "contract": contract(), "runtime": {},
+    }
+    write_json(job_file, initial)
+    runner = FormalRunner(job_file)
+    observed = []
+
+    def preflight_boundary():
+        current = read_json(job_file)
+        observed.append(current)
+        assert current["runnerPid"] == os.getpid()
+        assert current["status"] == "preparing"
+        assert current["contract"] == initial["contract"] and current["runtime"] == initial["runtime"]
+        raise GateFailure("Offline preflight boundary")
+
+    monkeypatch.setattr(runner, "preflight", preflight_boundary)
+    with pytest.raises(GateFailure, match="Offline preflight boundary"):
+        runner.run()
+    assert len(observed) == 1
+    assert read_json(job_file)["status"] == "failed"
+    assert read_json(tmp_path / "runner-error.json")["type"] == "GateFailure"

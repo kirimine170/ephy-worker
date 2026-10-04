@@ -1,6 +1,7 @@
 param(
   [Parameter(Mandatory = $true)]
-  [string]$JobFile
+  [string]$JobFile,
+  [string]$JobSha256
 )
 
 Set-StrictMode -Version Latest
@@ -114,7 +115,21 @@ function Read-LoggedExitCode {
 }
 
 function Read-Job {
-  Get-Content -Raw -LiteralPath $JobFile | ConvertFrom-Json
+  $initialBytes = [IO.File]::ReadAllBytes($JobFile)
+  if ($JobSha256) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+      $actual = [BitConverter]::ToString($sha.ComputeHash($initialBytes)).Replace("-", "").ToLowerInvariant()
+    } finally { $sha.Dispose() }
+    if ($JobSha256 -notmatch '^[a-f0-9]{64}$' -or $actual -cne $JobSha256) {
+      throw "Frozen launch job bytes changed"
+    }
+  }
+  $parsed = [Text.Encoding]::UTF8.GetString($initialBytes) | ConvertFrom-Json
+  if ($parsed.schemaVersion -eq 2 -and -not $JobSha256) {
+    throw "Formal launch job byte binding is missing"
+  }
+  return $parsed
 }
 
 function Save-Job {
@@ -513,7 +528,10 @@ import hashlib, importlib.abc, importlib.util, json, sys
 from pathlib import Path
 
 job_file = Path(sys.argv[1]).resolve(strict=True)
-job = json.loads(job_file.read_text(encoding="utf-8"))
+job_bytes = job_file.read_bytes()
+if hashlib.sha256(job_bytes).hexdigest() != sys.argv[2]:
+    raise SystemExit("Frozen launch job bytes changed before bootstrap import")
+job = json.loads(job_bytes.decode("utf-8"))
 runtime = job["runtime"]
 source = Path(runtime["controller_source"]).resolve(strict=True)
 pins = job["contract"]["runtime_hashes"]
@@ -556,15 +574,20 @@ class FrozenController(importlib.abc.MetaPathFinder, importlib.abc.Loader):
             module.__path__ = [str(file.parent)]
         exec(compile(data, str(file), "exec"), module.__dict__)
 
-sys.path.insert(0, str(source))
 sys.meta_path.insert(0, FrozenController())
 from ephy_worker.formal_runtime import main
 sys.argv = [sys.argv[0], "--job", str(job_file)]
-main()
+main(launch_job_bytes=job_bytes)
 '@
   # Base64 avoids Windows PowerShell 5 native-argument quote stripping.
   $bootstrapBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($formalBootstrap))
-  & $formalPython -I -c "import base64; exec(compile(base64.b64decode('$bootstrapBase64'), '<frozen-controller-bootstrap>', 'exec'))" $JobFile
+  $pythonPin = @($job.contract.runtime_hashes.PSObject.Properties | Where-Object {
+    [IO.Path]::GetFullPath($_.Name) -eq [IO.Path]::GetFullPath($formalPython)
+  })
+  if ($pythonPin.Count -ne 1 -or (Get-FileSha256 -Path $formalPython) -cne [string]$pythonPin[0].Value) {
+    throw "Frozen controller bootstrap pin mismatch: Python executable pin mismatch"
+  }
+  & $formalPython -I -c "import base64; exec(compile(base64.b64decode('$bootstrapBase64'), '<frozen-controller-bootstrap>', 'exec'))" $JobFile $JobSha256
   exit $LASTEXITCODE
 }
 $cancelFile = Join-Path $job.jobDir "cancel.request"

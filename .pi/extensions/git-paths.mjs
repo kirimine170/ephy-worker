@@ -32,7 +32,7 @@ function windowsProcessArgument(value) {
 	return /\s/.test(value) ? `"${value}"` : value;
 }
 
-export function buildDetachedRunnerCommand(shell, runner, jobFile) {
+export function buildDetachedRunnerCommand(shell, runner, jobFile, jobSha256, launchHashes) {
 	const runnerArguments = [
 		"-NoProfile",
 		"-NonInteractive",
@@ -43,8 +43,20 @@ export function buildDetachedRunnerCommand(shell, runner, jobFile) {
 		"-JobFile",
 		jobFile,
 	];
+	if (jobSha256 !== undefined) runnerArguments.push("-JobSha256", jobSha256);
+	if (jobSha256 !== undefined && !launchHashes) throw new Error("Frozen detached launch hashes missing");
+	const pinChecks = launchHashes ? (
+		'$ErrorActionPreference = "Stop"; ' +
+		'function Assert-DetachedLaunchPin([string]$file, [string]$expected) { ' +
+		'$sha = [Security.Cryptography.SHA256]::Create(); try { ' +
+		'$actual = [BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($file))).Replace("-", "").ToLowerInvariant() ' +
+		'} finally { $sha.Dispose() }; ' +
+		'if ($actual -cne $expected) { throw ("Frozen detached launch pin mismatch: " + $file) } }; ' +
+		'Assert-DetachedLaunchPin ' + powerShellLiteral(shell) + ' ' + powerShellLiteral(launchHashes.powershell) + '; ' +
+		'Assert-DetachedLaunchPin ' + powerShellLiteral(runner) + ' ' + powerShellLiteral(launchHashes.runner) + '; '
+	) : "";
 	return (
-		`$process = Start-Process -FilePath ${powerShellLiteral(shell)} ` +
+		pinChecks + `$process = Start-Process -FilePath ${powerShellLiteral(shell)} ` +
 		`-ArgumentList @(${runnerArguments.map((value) => powerShellLiteral(windowsProcessArgument(value))).join(", ")}) ` +
 		"-PassThru -WindowStyle Hidden; [Console]::Out.Write($process.Id)"
 	);

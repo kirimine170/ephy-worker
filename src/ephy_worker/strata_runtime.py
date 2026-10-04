@@ -175,8 +175,8 @@ class ExistingService:
 class StrataRunner(FormalRunner):
     """Reuse managed Pi, fixed checks and frozen artifacts without owning Strata."""
 
-    def __init__(self, job_file: Path):
-        super().__init__(job_file)
+    def __init__(self, job_file: Path, *, initial_job: dict | None = None):
+        super().__init__(job_file, initial_job=initial_job)
         if (
             self.runtime.get("backend") != "external_strata"
             or self.runtime.get("provider_id") != "strata-local"
@@ -256,13 +256,14 @@ class StrataRunner(FormalRunner):
             self.last_service_probe = time.monotonic()
 
 
-def make_runner(job_file: Path) -> FormalRunner:
-    backend = read_json(job_file)["runtime"].get("backend", "owned_llama")
+def make_runner(job_file: Path, *, initial_job: dict | None = None) -> FormalRunner:
+    job = read_json(job_file) if initial_job is None else initial_job
+    backend = job["runtime"].get("backend", "owned_llama")
     if backend == "external_strata":
-        return StrataRunner(job_file)
+        return StrataRunner(job_file, initial_job=job)
     if backend != "owned_llama":
         raise GateFailure("Unknown frozen model backend")
-    return FormalRunner(job_file)
+    return FormalRunner(job_file, initial_job=job)
 
 
 def freeze_external_proposal(runner: FormalRunner, bundle: Path, audit_input: dict) -> None:

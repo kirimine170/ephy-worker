@@ -145,6 +145,16 @@ function verifyFormalDetachedRunner(job: BackgroundJob, configuredRunner: string
 }
 
 
+function verifyFormalShell(job: BackgroundJob, configuredShell: string): string {
+	const formal = job as BackgroundJob & { runtime: { powershell: string }; contract: { runtime_hashes: Record<string, string> } };
+	if (typeof formal.runtime.powershell !== "string" || !path.isAbsolute(formal.runtime.powershell)) throw new Error("Frozen PowerShell path is missing");
+	const frozen = path.resolve(formal.runtime.powershell);
+	if (!path.isAbsolute(configuredShell) || path.resolve(configuredShell) !== frozen) throw new Error("PowerShell differs from the frozen path");
+	const expected = formal.contract.runtime_hashes[frozen] ?? Object.entries(formal.contract.runtime_hashes).find(([key]) => path.resolve(key) === frozen)?.[1];
+	if (!expected || createHash("sha256").update(fs.readFileSync(frozen)).digest("hex") !== expected) throw new Error("PowerShell frozen pin mismatch");
+	return frozen;
+}
+
 function verifyFormalRuntimePins(job: BackgroundJob): void {
 	const formal = job as BackgroundJob & { runtime: { python: string; controller_source: string }; contract: { runtime_hashes: Record<string, string> } };
 	const files = [formal.runtime.python, ...["__init__.py", "formal_runtime.py", "formal_artifacts.py", "formal_campaign.py", "strata_runtime.py"].map(name => path.join(formal.runtime.controller_source, "ephy_worker", name))];
@@ -154,13 +164,26 @@ function verifyFormalRuntimePins(job: BackgroundJob): void {
 	}
 }
 
+function formalControllerArguments(job: BackgroundJob, body: string, args: string[]): string[] {
+	const formal = job as BackgroundJob & { runtime: { python: string; controller_source: string }; contract: { runtime_hashes: Record<string, string> } };
+	const modules: Record<string, { path: string; sha256: string }> = {};
+	for (const name of ["__init__.py", "formal_runtime.py", "formal_artifacts.py", "formal_campaign.py", "strata_runtime.py"]) {
+		const file = path.resolve(formal.runtime.controller_source, "ephy_worker", name);
+		const expected = formal.contract.runtime_hashes[file] ?? Object.entries(formal.contract.runtime_hashes).find(([key]) => path.resolve(key) === file)?.[1];
+		if (!expected) throw new Error("Frozen helper controller pin missing");
+		modules[name === "__init__.py" ? "ephy_worker" : "ephy_worker." + name.slice(0, -3)] = { path: file, sha256: expected };
+	}
+	const bootstrap = "import hashlib, importlib.abc, importlib.util, json, sys\nfrom pathlib import Path\n\ncontext = json.loads(sys.argv.pop(1))\nif Path(sys.executable).resolve(strict=True) != Path(context[\"python\"]).resolve(strict=True):\n    raise SystemExit(\"Frozen helper interpreter mismatch\")\nmodules = {}\nfor name, pin in context[\"modules\"].items():\n    file = Path(pin[\"path\"])\n    data = file.read_bytes()\n    if hashlib.sha256(data).hexdigest() != pin[\"sha256\"]:\n        raise SystemExit(\"Frozen helper controller pin mismatch: \" + str(file))\n    modules[name] = (file, data)\nif any(name == \"ephy_worker\" or name.startswith(\"ephy_worker.\") for name in sys.modules):\n    raise SystemExit(\"Controller package was imported before frozen helper bootstrap\")\n\nclass FrozenController(importlib.abc.MetaPathFinder, importlib.abc.Loader):\n    def find_spec(self, fullname, path=None, target=None):\n        if fullname in modules:\n            file, _ = modules[fullname]\n            return importlib.util.spec_from_loader(fullname, self, origin=str(file), is_package=fullname == \"ephy_worker\")\n        if fullname.startswith(\"ephy_worker.\"):\n            raise ImportError(\"Controller module lacks a frozen helper pin: \" + fullname)\n        return None\n\n    def create_module(self, spec):\n        return None\n\n    def exec_module(self, module):\n        file, data = modules[module.__name__]\n        module.__file__ = str(file)\n        if module.__name__ == \"ephy_worker\":\n            module.__path__ = [str(file.parent)]\n        exec(compile(data, str(file), \"exec\"), module.__dict__)\n\nsys.meta_path.insert(0, FrozenController())\n";
+	return ["-I", "-c", bootstrap + "\n" + body, JSON.stringify({ python: path.resolve(formal.runtime.python), modules }), ...args];
+}
+
 async function verifyFormalIntegration(pi: ExtensionAPI, job: BackgroundJob): Promise<void> {
 	if (job.schemaVersion !== 2) return;
 	verifyFormalRuntimePins(job);
 	const formal = job as BackgroundJob & { runtime: { python: string; controller_source: string } };
-	const check = await pi.exec(formal.runtime.python, ["-c",
-		"import sys; sys.path.insert(0,sys.argv.pop(1)); from ephy_worker.formal_runtime import main; main()",
-		formal.runtime.controller_source, "--job", path.join(job.jobDir, "job.json"), "--verify-proposal-only"], { cwd: job.repoRoot, timeout: 30_000 });
+	const check = await pi.exec(formal.runtime.python, formalControllerArguments(job,
+		"from ephy_worker.formal_runtime import main; main()",
+		["--job", path.join(job.jobDir, "job.json"), "--verify-proposal-only"]), { cwd: job.repoRoot, timeout: 30_000 });
 	if (check.code !== 0) throw new Error(`Formal integration verification failed: ${check.stderr || check.stdout}`);
 }
 
@@ -171,9 +194,9 @@ async function captureSubmittingProcess(pi: ExtensionAPI, job: BackgroundJob): P
 	const executable = path.resolve(formal.runtime.pi);
 	const expected = formal.contract.runtime_hashes[executable] ?? Object.entries(formal.contract.runtime_hashes).find(([file]) => path.resolve(file) === executable)?.[1];
 	if (!expected) throw new Error("Submitting Pi runtime pin missing");
-	const observed = await pi.exec(formal.runtime.python, ["-c",
-		"import json,sys; sys.path.insert(0,sys.argv.pop(1)); from ephy_worker.formal_runtime import observe_submitting_process; print(json.dumps(observe_submitting_process(int(sys.argv[1]),sys.argv[2],sys.argv[3])))",
-		formal.runtime.controller_source, String(process.pid), executable, expected], { cwd: job.repoRoot, timeout: 30_000 });
+	const observed = await pi.exec(formal.runtime.python, formalControllerArguments(job,
+		"from ephy_worker.formal_runtime import observe_submitting_process; print(json.dumps(observe_submitting_process(int(sys.argv[1]),sys.argv[2],sys.argv[3])))",
+		[String(process.pid), executable, expected]), { cwd: job.repoRoot, timeout: 30_000 });
 	if (observed.code !== 0) throw new Error(`Submitting Pi observation failed: ${observed.stderr || observed.stdout}`);
 	const identity = JSON.parse(observed.stdout);
 	if (!identity || Object.keys(identity).sort().join() !== ["pid", "created_at", "executable", "executable_sha256"].sort().join() ||
@@ -192,10 +215,11 @@ function getJobsDir(): string {
 	return path.join(getStateDir(), "jobs");
 }
 
-function atomicWriteJson(filePath: string, value: unknown): void {
+function atomicWriteJson(filePath: string, value: unknown): string {
 	fs.mkdirSync(path.dirname(filePath), { recursive: true });
 	const temporary = `${filePath}.${process.pid}.tmp`;
-	fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+	const serialized = `${JSON.stringify(value, null, 2)}\n`;
+	fs.writeFileSync(temporary, serialized, "utf8");
 	try {
 		fs.renameSync(temporary, filePath);
 	} catch {
@@ -203,6 +227,7 @@ function atomicWriteJson(filePath: string, value: unknown): void {
 		fs.copyFileSync(temporary, filePath);
 		fs.unlinkSync(temporary);
 	}
+	return serialized;
 }
 
 function loadJobFile(filePath: string): LoadedJob {
@@ -311,8 +336,10 @@ async function startDetachedRunner(
 	shell: string,
 	runner: string,
 	jobFile: string,
+	jobSha256?: string,
+	launchHashes?: { runner: string; powershell: string },
 ): Promise<{ code: number; pid?: number; stdout: string; stderr: string }> {
-	const command = buildDetachedRunnerCommand(shell, runner, jobFile);
+	const command = buildDetachedRunnerCommand(shell, runner, jobFile, jobSha256, launchHashes);
 	const encoded = Buffer.from(command, "utf16le").toString("base64");
 	const result = await pi.exec(shell, ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], { timeout: 10_000 });
 	const pid = Number.parseInt(result.stdout.trim(), 10);
@@ -387,7 +414,7 @@ export default function (pi: ExtensionAPI): void {
 				}
 			}
 			const runner = process.env.DUAL_JOB_RUNNER;
-			const shell = process.env.DUAL_POWERSHELL_EXE ?? "powershell.exe";
+			const shell = process.env.DUAL_POWERSHELL_EXE ?? formalSpec?.runtime.powershell ?? "powershell.exe";
 			if (!runner || !fs.existsSync(runner)) {
 				return { content: [{ type: "text", text: "Background runner is not configured." }], details: {} };
 			}
@@ -510,17 +537,29 @@ export default function (pi: ExtensionAPI): void {
 					job.timeoutMinutes = formalSpec.contract.timeout_seconds / 60;
 					job.maxRepairAttempts = formalSpec.contract.max_repairs;
 					verifyFormalDetachedRunner(job, runner);
+					verifyFormalShell(job, shell);
 					job.submitting_process = await captureSubmittingProcess(pi, job);
 				}
 				fs.mkdirSync(jobDir, { recursive: true });
 				fs.writeFileSync(path.join(jobDir, "TASK.md"), renderTask(job), "utf8");
 				const jobFile = path.join(jobDir, "job.json");
-				atomicWriteJson(jobFile, job);
+				const launchDocument = atomicWriteJson(jobFile, job);
+				const launchSha256 = job.schemaVersion === 2 ? createHash("sha256").update(launchDocument, "utf8").digest("hex") : undefined;
 
 				let verifiedRunner = runner;
+				let verifiedShell = shell;
+				let launchHashes: { runner: string; powershell: string } | undefined;
 				if (job.schemaVersion === 2) {
 					try {
 						verifiedRunner = verifyFormalDetachedRunner(job, runner);
+						verifiedShell = verifyFormalShell(job, shell);
+						const pins = (job as BackgroundJob & { contract: { runtime_hashes: Record<string, string> } }).contract.runtime_hashes;
+						const expected = (file: string): string => {
+							const pin = pins[file] ?? Object.entries(pins).find(([key]) => path.resolve(key) === file)?.[1];
+							if (!pin) throw new Error("Frozen detached launch hash missing");
+							return pin;
+						};
+						launchHashes = { runner: expected(verifiedRunner), powershell: expected(verifiedShell) };
 					} catch (error) {
 						job.status = "failed";
 						job.updatedAt = now();
@@ -529,7 +568,7 @@ export default function (pi: ExtensionAPI): void {
 						throw error;
 					}
 				}
-				const launch = await startDetachedRunner(pi, shell, verifiedRunner, jobFile);
+				const launch = await startDetachedRunner(pi, verifiedShell, verifiedRunner, jobFile, launchSha256, launchHashes);
 				if (launch.code !== 0 || !launch.pid) {
 					job.status = "failed";
 					job.updatedAt = now();
@@ -541,7 +580,7 @@ export default function (pi: ExtensionAPI): void {
 					};
 				}
 				const currentJob = loadJobFile(jobFile);
-				if (currentJob.status === "queued") {
+				if (job.schemaVersion === 1 && currentJob.status === "queued") {
 					currentJob.runnerPid = launch.pid;
 					currentJob.updatedAt = now();
 					currentJob.message = "Background runner process launched";
