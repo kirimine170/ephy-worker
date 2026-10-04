@@ -13,7 +13,7 @@
 - 環境不備をcandidateのrepairへ渡しません．agentの自己申告やtest合格だけを承認根拠にしません．
 - proposal-onlyはcommit，push，PR，merge，apply，deployを許可しません．これらは別の明示的なユーザー承認が必要です．
 - managed Piの正式Jobでは，runnerがpolicy本文とhashをsystem payloadへ注入し，`governance_ack`成立前の変更可能toolを遮断します．このgateが使えない場合，正式な実装または監査として続行しません．
-- 今回の明示承認されたCodex bootstrapについては，[限定採用経路のADR](docs/adr/0004-authorized-codex-bootstrap-adoption.md)をProposedの整合案としてレビューします．この草案はactive policy例外やmerge readinessを成立させません．一般の自己改善Jobの来歴，監査，停止，権限gateは維持します．
+- 今回のCodex bootstrapは，[限定採用経路のADR](docs/adr/0004-authorized-codex-bootstrap-adoption.md)に記録した2026-10-04の明示承認に従って採用します．対象はPR17の名前付き基盤と6文書の整合だけです．最終headのCI，独立Codex Review，P0／P1解消を確認してから別roleのIntegration／release operatorがmergeします．不足した旧来歴を合格にせず，一般の自己改善Jobの来歴，監査，予算，停止，権限gateは維持します．
 
 ## Code Review Rules
 

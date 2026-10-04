@@ -2,7 +2,7 @@
 
 今回の基盤実装は，ユーザーが明示したCodexによる修正・PR・merge依頼として作成する．gpt-oss／Qwenで実装した正式Jobではなく，過去コードをQwenの成果へ認定し直さない．CIとPRレビューを通すbootstrapの基盤修正と，このrunnerで新規実行するモデルのproposalを区別する．
 
-PR15／PR16をmain向けにまとめる[限定bootstrap採用経路のADR](adr/0004-authorized-codex-bootstrap-adoption.md)はProposedである．対象コードのformal pre-audit実装来歴は未実施のまま保持し，旧PR15の来歴P1を消して完了扱いにしない．現在のCIと実StrataのMarkdown試験は，それぞれの固定sourceと候補に結び付ける．新しい全範囲レビューで，Codex bootstrapという実際の来歴と採用評価案を検討する．この草案によるpolicy例外の有効化，正式合格状態への昇格，mergeは行わない．
+PR15／PR16をmain向けにまとめる[限定bootstrap採用経路のADR](adr/0004-authorized-codex-bootstrap-adoption.md)は，2026-10-04の明示承認によりAcceptedである．今回のPR17基盤だけを，最終headのCI，main向け全範囲の独立Codex Review，P0／P1解消を確認して採用・mergeする．対象コードのformal pre-audit実装来歴は未実施のまま保持し，旧来歴gateや停止したJobを完了扱いにしない．既存CIと実StrataのMarkdown試験は元のsource／policy／candidateへ結び付け，変更後headの新規実モデル実行とは記録しない．採用判断は別roleのIntegration／release operatorが記録し，runnerの正式合格状態，integration拒否，一般Jobの監査・予算・CI／review要件を変更しない．
 
 ## 入口と実装範囲
 

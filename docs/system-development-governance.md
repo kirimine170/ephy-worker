@@ -1,7 +1,7 @@
 # ephy-worker システム開発ガバナンス
 
 - Policy ID：`ephy.system-development-governance.v1`
-- Version：`1.3.0`
+- Version：`1.4.0`
 - Status：active
 
 この文書は，ephy-worker自身の変更，評価基盤，実行runner，prompt，skill，checkerを含むシステム開発の正本です．個別の作業指示より優先し，上位のsystem／developer指示とユーザーが明示した権限境界には従います．
@@ -92,13 +92,13 @@ agentの「完了した」「問題ない」「tests passed」という説明は
 
 ユーザーが事前にmodel役割の見直しとCodexによる基盤変更を明示承認した場合，その限定scopeのbootstrapはCodexが担当できます．実modelによる候補実装とは区別して記録し，旧Jobを遡って合格にしません．今回承認された既存Strata profileは，loopback endpoint，listener／engine PIDと開始時刻，実行binary／設定hash，APIが返すloaded modelとcontextを固定し，起動・停止・unload・設定変更を行いません．これは稼働中weight bytesの暗号学的証明ではなく，ユーザーが許可した既存serviceのdeployment identityです．このprofileはMarkdown候補と外部Codex Review待ちの未適用proposalに限定し，実行コードのverifier隔離がない状態でcode／tool／MCP候補を許可しません．
 
-### 今回のCodex bootstrap採用経路の整合案（Proposed）
+### 今回のCodex bootstrapの限定採用（Accepted）
 
-ユーザーが明示した既存StrataとPiの接続，model役割見直し，Codexによる基盤実装，P0／P1解消後mergeの方針を，[限定採用経路のADR](adr/0004-authorized-codex-bootstrap-adoption.md)へ対象と証拠を指定して対応付けています．この草案の対象はPR15とPR16のsource treeをまとめたmain向け40ファイルと，必要な6文書の整合であり，新規追加のAGENTS差分とADRを含め全42ファイルです．
+ユーザーは2026-10-04，不足した旧Pi実装／formal pre-audit来歴を開示して今回の基盤だけを採用し，P0／P1解消後にPR17をmergeする方針を明示承認しました．対象と条件は[限定採用経路のADR](adr/0004-authorized-codex-bootstrap-adoption.md)に固定します．対象はPR15／PR16をまとめたmain向け40ファイルと6文書の整合からなる全42ファイルであり，PR17の独立レビュー済みhead `2d4c175d82e116ef340b6565f0e71f02601c70ff`を基盤の参照点とします．今回の6文書の確定後は，新しい完全patch／tree／headを記録し，最終headの必須CIとmain向け全範囲の独立Codex Reviewを確認してからmergeします．新しいpushは以前のCI／reviewを無効にします．
 
-対象コードは従来のpre-audit workflowを実施していないCodex bootstrapです．実PiのMarkdown候補，基盤のunit test，CI，独立Codex Reviewをそれぞれの証拠として評価しますが，対象コードのPi実装来歴やformal auditへ読み替えません．草案では，名前付きbootstrapだけの別採用評価条件，元sourceと変更後文書のhash差，main向け全範囲レビュー，旧P1と既存承認との対応を提案します．
+対象コードは従来のpre-audit workflowを実施していないCodex bootstrapです．実PiのMarkdown候補，基盤のunit test，CI，独立Codex Reviewは元のsource／policy／candidate bindingを保持して評価し，対象コードのPi実装来歴やformal auditへ読み替えません．今回の採用はADRの限定条件を別roleのIntegration／release operatorが確認して記録する手動の判断であり，runnerの新しい合格状態や一般candidateの採用権限を追加しません．
 
-この節とADRはProposedであり，別経路の採用確定やactive例外ではありません．本policyの完了式，review transportの前提，正式runnerのintegration判定，一般の自己改善Jobの全gateは変更しません．最終採用判断とmergeは別に記録するまで保留し，設計，限定修正，検証，draft PRのレビューを継続します．不足した旧来歴を遡って合格にしません．
+通常のformal／external Jobの完了式，review transportのpre-audit前提，正式runnerのintegration拒否，role，scope，監査，予算，停止条件，CI／review要件を維持します．今回の採用経路を将来の自己改善Jobや別sourceへ転用せず，不足した旧来歴や停止した旧Jobを遡って合格にしません．PR15／PR16の整理と新規実験はこの承認範囲に含めません．
 
 ## 3．実行順序をrunnerが保証する
 
@@ -223,6 +223,8 @@ proposal-onlyで許される変更は，隔離candidate内の未適用差分と�
 停止した試行は失敗例として保持し，条件をその場で変更して成功扱いにしません．
 
 ## 完了式
+
+次の式は通常のformal／external proposal Jobに適用します．今回の名前付き基盤の手動採用だけは，前節とADR0004に固定した別の条件と明示承認に従います．この限定判断によって，対象コードのpre_audit_workflow_gateやformal auditを成立済みとは記録しません．
 
 ここで`pre_audit_workflow_gate`は，固定済み契約に従ってpreflight，designated-model plan，指定Pi実装，独立検証，final candidate freezeまでのrole，model，順序，hash bindingが成立した状態を表す．formal audit，audit execution attestation，`review_ready`は含まない．
 

@@ -128,24 +128,24 @@ independent Codex Review with no unresolved P0/P1, and explicit human merge
 approval. A new push invalidates previous CI and review. Raw logs, local paths,
 authorization transcripts and private evidence stay outside Git.
 
-## Named bootstrap adoption alignment draft
+## Accepted named bootstrap adoption
 
-The [Proposed ADR](adr/0004-authorized-codex-bootstrap-adoption.md) maps the
-user-authorized Codex infrastructure work to a separate, named bootstrap
-evaluation proposal. It combines PR15 and PR16 for a main-targeted full-scope
-review without changing their owner branches or automatically resolving old
-findings. The proposal discloses that Pi did not implement this infrastructure
-through the formal pre-audit workflow. Its scope is the original 40-file source
-plus documentation alignment, totaling 42 files.
+The [accepted ADR](adr/0004-authorized-codex-bootstrap-adoption.md) records the
+user's 2026-10-04 approval to adopt only PR17's named Codex infrastructure and
+six-document alignment, with absent Pi implementation and formal pre-audit
+provenance disclosed. Its main-targeted scope remains 42 files. The separate
+Integration／release operator must bind the final full patch／tree／head, pass
+current-head CI and independent full-scope Codex Review, and resolve all P0／P1
+before the approved merge.
 
-This is a draft policy alignment, not an active adoption exception, completed
-formal audit, new runner state or permission for any candidate to merge. The
-existing integration rejection and all profile limits remain. Source875c4ba CI,
-review and live Markdown results keep their original head/policy/candidate
-bindings. They are not current-head CI or review for this new draft, nor live
-execution under changed governance hashes. New draft CI and independent review
-must cover the full main-targeted source; any final bootstrap adoption decision
-and merge are deferred. General self-improvement workflow gates are unchanged.
+This manual infrastructure adoption does not add a runner state or pass a
+historical formal gate. Existing integration rejection, Markdown-only limits,
+roles, audits, budgets and ordinary proposal gates remain. Existing CI, review
+and live Markdown results keep their original source／policy／candidate bindings;
+they are not current-head evidence or live execution under changed policy hashes.
+Policy／skill delivery controls and final-head CI／review must be checked again.
+Adopting this baseline does not adopt any unapplied Markdown candidate, authorize
+future workflow exemptions, clean up PR15／PR16 or add new experiments.
 
 ## Finite campaigns
 
