@@ -179,11 +179,18 @@ def validate_corpus(batch: bytes, gold: bytes) -> tuple[dict, dict]:
                      and isinstance(record["components"], dict)
                      and all(isinstance(k, str) and k and isinstance(v, str)
                              and re.fullmatch("[a-f0-9]{64}", v) for k, v in record["components"].items()),
-                     "Malformed measured evidence")
+                      "Malformed measured evidence")
+        ci = data.get("ci")
+        if "ci" in data:
+            _require(isinstance(ci, dict)
+                     and set(ci) == {"expected_id", "observed_id", "expected_revision", "observed_revision"}
+                     and all(isinstance(v, str) and v for v in ci.values()), "Malformed CI evidence")
+        stale_ci = ci is not None and ci["expected_revision"] != ci["observed_revision"]
         answer = expected[identifier]
         refs = set(answer["evidence_ids"])
         _require(refs <= ids, "Gold cites nonexistent evidence")
         diagnosis = answer["diagnosis"]
+        _require(not stale_ci or diagnosis == "STALE_CI", "Stale CI requires STOP/STALE_CI")
         _require(diagnosis in {"MATCH", "UNATTRIBUTED", "STALE_CI"}
                  or diagnosis.startswith("component:") and diagnosis[len("component:"):] in identifiable_components(row["input"]),
                  "Unsupported gold diagnosis")
@@ -191,10 +198,7 @@ def validate_corpus(batch: bytes, gold: bytes) -> tuple[dict, dict]:
         if diagnosis.startswith("component:"):
             _require(refs == pair and answer["decision"] == "STOP", "Unsupported component answer")
         elif diagnosis == "STALE_CI":
-            ci = data.get("ci", {})
-            _require(set(ci) == {"expected_id", "observed_id", "expected_revision", "observed_revision"}
-                     and all(isinstance(ci[k], str) and ci[k] for k in ("expected_revision", "observed_revision"))
-                     and ci["expected_revision"] != ci["observed_revision"]
+            _require(stale_ci
                      and refs == {ci["expected_id"], ci["observed_id"]} and answer["decision"] == "STOP",
                      "Unsupported stale CI answer")
         else:
@@ -202,9 +206,11 @@ def validate_corpus(batch: bytes, gold: bytes) -> tuple[dict, dict]:
             if diagnosis == "MATCH":
                 _require(data["expected"]["aggregate"] == data["observed"]["aggregate"]
                          and data["expected"]["components"] == data["observed"]["components"]
+                         and not stale_ci
                          and answer["decision"] == "PASS", "Unsupported match answer")
             else:
                 _require(data["expected"]["aggregate"] != data["observed"]["aggregate"]
+                         and not identifiable_components(row["input"]) and not stale_ci
                          and answer["decision"] == "STOP", "Unsupported unattributed answer")
     return inputs, expected
 

@@ -16,7 +16,7 @@ import httpx
 
 from ephy_worker.strata_runtime import process_identity
 from ephy_worker.verifier_triage_consumer import json_bytes, payload_strings
-from ephy_worker.verifier_triage_evaluation import SKILL_PATH, sha256
+from ephy_worker.verifier_triage_evaluation import BASE_REVISION, SKILL_PATH, sha256
 from ephy_worker.verifier_triage_fixtures import development_fixture, development_skill
 from ephy_worker.verifier_triage_isolation import (
     FAKE_MODEL,
@@ -37,6 +37,8 @@ REASONS = {"missing": "FileNotFoundError", "batch_leak": "Held-out/gold leakage"
            "tool_substitution": "Tool-result bytes substituted", "freeze_change": "Frozen artifact changed"}
 ADAPTER_CASES = ("adapter_good", "adapter_lock", "adapter_capture_cap", "adapter_thinking",
                  "invalid_duplicate", "invalid_answer", "invalid_evidence", "invalid_diagnosis", "invalid_allstop",
+                 "invalid_unattributed_component", "invalid_unattributed_stale_ci",
+                 "invalid_match_stale_ci", "invalid_component_stale_ci", "invalid_ci_schema",
                  "adapter_missing", "adapter_batch_leak", "adapter_gold_leak", "adapter_runtime_change", "adapter_rebound_lock")
 
 
@@ -73,6 +75,28 @@ def run_adapter_case(pi, directory, case):
     elif case == "invalid_allstop":
         for answer in answers:
             answer["decision"] = "STOP"
+    elif case == "invalid_unattributed_component":
+        answers[0]["diagnosis"] = "UNATTRIBUTED"
+    elif case == "invalid_unattributed_stale_ci":
+        data = json.loads(rows[8]["input"])
+        data["observed"]["aggregate"] = "b"*64
+        rows[8]["input"] = json.dumps(data, separators=(",", ":"))
+        answers[8]["diagnosis"] = "UNATTRIBUTED"
+        answers[8]["evidence_ids"] = ["e", "o"]
+    elif case in {"invalid_match_stale_ci", "invalid_component_stale_ci", "invalid_ci_schema"}:
+        data = json.loads(rows[8]["input"])
+        if case == "invalid_ci_schema":
+            data["ci"]["observed_revision"] = 42
+        else:
+            answers[8]["evidence_ids"] = ["e", "o"]
+            if case == "invalid_match_stale_ci":
+                answers[8]["decision"], answers[8]["diagnosis"] = "PASS", "MATCH"
+            else:
+                data["expected"]["components"] = {"PATH": "a"*64}
+                data["observed"]["components"] = {"PATH": "b"*64}
+                data["observed"]["aggregate"] = "b"*64
+                answers[8]["diagnosis"] = "component:PATH"
+        rows[8]["input"] = json.dumps(data, separators=(",", ":"))
     batch, gold = json_bytes(rows), json_bytes(answers)
     for name, data in (("batch.json", batch), ("gold.json", gold), ("deployment.json", b'{"synthetic":true}')):
         (directory/name).write_bytes(data)
@@ -245,7 +269,7 @@ def run_adapter_case(pi, directory, case):
         job_directory = directory/"job"
         job_directory.mkdir()
         job = {"schemaVersion": 2, "id": directory.name, "humanAuthorization": "explicit-execute-proposal-only",
-               "baseRevision": formal.git(repository, "rev-parse", "HEAD").decode().strip(), "repoRoot": str(repository),
+               "baseRevision": BASE_REVISION, "repoRoot": str(repository),
                "jobDir": str(job_directory), "worktreePath": str(directory/"candidate"), "runtime": runtime,
                "contract": contract, "controls": {n: sha256((ROOT/p).read_bytes()) for n, p in formal.CONTROL_PATHS.items()},
                "model_identities": model_ids, "verifier_identity": formal.observed_verifier_identity(runtime, contract)}
@@ -291,6 +315,11 @@ def run_adapter_case(pi, directory, case):
                "adapter_thinking": "thinking=off", "invalid_duplicate": "Duplicate case ID",
                "invalid_answer": "Unknown decision", "invalid_evidence": "nonexistent evidence",
                "invalid_diagnosis": "Unsupported gold diagnosis", "invalid_allstop": "Uninformative decision",
+               "invalid_unattributed_component": "Unsupported unattributed answer",
+               "invalid_unattributed_stale_ci": "Stale CI requires STOP/STALE_CI",
+               "invalid_match_stale_ci": "Stale CI requires STOP/STALE_CI",
+               "invalid_component_stale_ci": "Stale CI requires STOP/STALE_CI",
+               "invalid_ci_schema": "Malformed CI evidence",
                "adapter_runtime_change": "Generation freeze belongs to another external job"}
     admission_errors = [json.loads(p.read_bytes()).get("error") for p in (directory/"run/planner").glob("http-*.receipt.json")]
     if case in {"adapter_missing", "adapter_batch_leak", "adapter_gold_leak"}:

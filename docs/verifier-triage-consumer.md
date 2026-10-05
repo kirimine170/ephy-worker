@@ -254,8 +254,14 @@ proposal-stop verification and binding to four native consumer sessions.
 The checker is independently exercised against known-good, unchanged,
 wrong-answer, weakened-test and scope-escape fixtures. Regression tests, Ruff
 and repository validation execute as real commands. Lock contention, aggregate
-capture overflow, enabled thinking and five invalid-corpus controls require
+capture overflow, enabled thinking and ten invalid-corpus controls require
 zero forwarded POSTs.
+The invalid-corpus controls include UNATTRIBUTED gold with identifiable component
+differences or stale CI. These contradictions are rejected before authoring.
+CI schema and revisions are validated independently of the gold diagnosis.
+Stale CI requires STOP/STALE_CI, including when aggregate/component evidence
+matches. The synthetic job base is fixed to BASE_REVISION; runtime/code come
+from the reviewed source checkout, whose head may differ from that baseline.
 Missing prior admission, batch leakage and gold leakage are also injected at
 the actual adapter boundary and must stop before a third upstream POST.
 Changing the shared-lock path after freeze requires zero authoring POSTs;

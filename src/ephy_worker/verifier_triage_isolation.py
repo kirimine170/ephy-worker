@@ -66,6 +66,7 @@ def freeze_generation(repository, pi, identity, batch, gold, directory, token_ar
     c.require(not directory.exists(), "Fresh pre-authoring freeze required")
     batch_bytes, gold_bytes = batch.read_bytes(), gold.read_bytes()
     validate_corpus(batch_bytes, gold_bytes)
+    token_argv = [str(Path(arg).resolve()) if Path(arg).is_file() else arg for arg in token_argv]
     c.require(isinstance(identity["model_id"], str) and identity["model_id"], "Invalid model identity")
     if identity["model_id"] != FAKE_MODEL:
         c.require(generation_job is not None, "Real generation requires a pre-bound external job")

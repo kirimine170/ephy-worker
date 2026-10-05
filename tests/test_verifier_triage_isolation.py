@@ -228,7 +228,7 @@ def alternate_corpus():
     return result
 
 
-def pure_freeze(tmp_path, monkeypatch, batch=None, gold=None):
+def pure_freeze(tmp_path, monkeypatch, batch=None, gold=None, token_argv=None):
     import sys
 
     original_batch, original_gold = development_fixture()
@@ -237,8 +237,33 @@ def pure_freeze(tmp_path, monkeypatch, batch=None, gold=None):
     gold_path.write_bytes(original_gold if gold is None else gold)
     monkeypatch.setattr(isolation, "verify_identity", lambda _: None)
     repository = Path(isolation.__file__).resolve().parents[2]
-    return isolation.freeze_generation(repository, Path(sys.executable), {"model_id": isolation.FAKE_MODEL},
-                                       batch_path, gold_path, tmp_path/"freeze", [sys.executable])
+    # uv uses a symlink for its POSIX interpreter; pin the actual binary.
+    return isolation.freeze_generation(repository, Path(sys.executable).resolve(), {"model_id": isolation.FAKE_MODEL},
+                                       batch_path, gold_path, tmp_path/"freeze", token_argv or [sys.executable])
+
+
+def test_tokenizer_argv_uses_pinned_executable_identity(tmp_path, monkeypatch):
+    import sys
+
+    path = pure_freeze(tmp_path, monkeypatch)
+    contract = isolation.frozen(path, sha256(path.read_bytes()))
+    executable = str(Path(sys.executable).resolve())
+    assert contract["token_argv"] == [executable]
+    assert contract["pins"][executable] == sha256(Path(executable).read_bytes())
+    assert not Path(executable).is_symlink()
+
+
+def test_resolved_tokenizer_file_substitution_is_rejected(tmp_path, monkeypatch):
+    import sys
+
+    counter = tmp_path/"counter.py"
+    counter.write_bytes(b"print(1)\n")
+    path = pure_freeze(tmp_path, monkeypatch, token_argv=[sys.executable, str(counter)])
+    expected = sha256(path.read_bytes())
+    isolation.frozen(path, expected)
+    counter.write_bytes(b"print(2)\n")
+    with pytest.raises(InvalidEvaluation, match="Frozen artifact changed"):
+        isolation.frozen(path, expected)
 
 
 def test_source_replacement_is_frozen_from_one_read_per_input(tmp_path, monkeypatch):
@@ -281,7 +306,9 @@ def test_declared_input_hashes_cannot_authorize_other_valid_corpus(tmp_path, mon
                                       sha256(alternate["batch"]), sha256(alternate["gold"]), "unused-skill")
 
 
-@pytest.mark.parametrize("mutation", ["duplicate", "decision", "evidence", "diagnosis", "all_stop", "malformed"])
+@pytest.mark.parametrize("mutation", ["duplicate", "decision", "evidence", "diagnosis", "all_stop", "malformed",
+                                      "unattributed_component", "unattributed_stale_ci", "malformed_ci", "match_stale_ci",
+                                      "component_stale_ci"])
 def test_invalid_complete_corpus_fails_before_identity_or_authoring(tmp_path, monkeypatch, mutation):
     batch, gold = development_fixture()
     rows, answers = json.loads(batch), json.loads(gold)
@@ -296,6 +323,25 @@ def test_invalid_complete_corpus_fails_before_identity_or_authoring(tmp_path, mo
     elif mutation == "all_stop":
         for answer in answers:
             answer["decision"] = "STOP"
+    elif mutation == "unattributed_component":
+        answers[0]["diagnosis"] = "UNATTRIBUTED"
+    elif mutation in {"unattributed_stale_ci", "match_stale_ci", "malformed_ci", "component_stale_ci"}:
+        data = json.loads(rows[8]["input"])
+        if mutation == "malformed_ci":
+            data["ci"]["observed_revision"] = 42
+        elif mutation == "component_stale_ci":
+            data["expected"]["components"] = {"PATH": "a"*64}
+            data["observed"]["components"] = {"PATH": "b"*64}
+            data["observed"]["aggregate"] = "b"*64
+            answers[8]["diagnosis"] = "component:PATH"
+            answers[8]["evidence_ids"] = ["e", "o"]
+        else:
+            answers[8]["diagnosis"] = "UNATTRIBUTED" if mutation == "unattributed_stale_ci" else "MATCH"
+            answers[8]["decision"] = "STOP" if mutation == "unattributed_stale_ci" else "PASS"
+            answers[8]["evidence_ids"] = ["e", "o"]
+            if mutation == "unattributed_stale_ci":
+                data["observed"]["aggregate"] = "b"*64
+        rows[8]["input"] = json.dumps(data, separators=(",", ":"))
     else:
         rows[0]["input"] = "not evidence JSON"
     # A malformed corpus must be rejected before even querying the service.
