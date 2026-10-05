@@ -161,9 +161,17 @@ def validate_contract(contract):
              sha256((private / "skill.md").read_bytes()))
             == (frozen.batch_sha256, frozen.gold_sha256, frozen.skill_sha256), "Wrong frozen inputs")
     if contract["purpose"] == "native_controls":
-        require(contract["identity"]["model_id"] == "synthetic-triage-consumer-fixture"
+        require(contract["identity"]["model_id"] in {"synthetic-triage-consumer-fixture", "synthetic-triage-generation-fixture"}
                 and contract["identity"]["listener"]["pid"]
                 == contract["identity"]["engine"]["pid"] == os.getpid(), "Not an owned fake provider")
+        if contract.get("generation_job"):
+            from .verifier_triage_isolation import verify_native_binding
+            job = json.loads(Path(contract["generation_job"]).read_bytes())
+            require(contract["resource_lock"] == job["runtime"]["resource_lock"], "Wrong shared resource lock")
+            verify_external_proposal(Path(contract["generation_job"]))
+            verify_native_binding(Path(contract["generation_job"]), Path(contract["isolation_freeze"]),
+                                  contract["isolation_sha256"], frozen.batch_sha256, frozen.gold_sha256,
+                                  frozen.skill_sha256, contract["identity"])
     else:
         live_generation_isolation_gate(contract["generation_job"], contract.get("isolation_freeze"),
                                        contract.get("isolation_sha256"), frozen.batch_sha256,
@@ -207,9 +215,17 @@ def build_contract(
     require(type(stage_seconds) in (int, float) and 0 < stage_seconds <= STAGE_SECONDS,
             "Invalid stage deadline")
     if purpose == "native_controls":
-        require(identity["model_id"] == "synthetic-triage-consumer-fixture", "Not a fake model")
+        require(identity["model_id"] in {"synthetic-triage-consumer-fixture", "synthetic-triage-generation-fixture"}, "Not a fake model")
         require(identity["listener"]["pid"] == identity["engine"]["pid"] == os.getpid(),
                 "Synthetic server must belong to this controller")
+        if generation_job:
+            from .verifier_triage_isolation import verify_native_binding
+            job = json.loads(generation_job.read_bytes())
+            validate_generation_budget(job)
+            verify_external_proposal(generation_job)
+            require(isolation_freeze and isolation_sha256, "Native paired capture missing")
+            verify_native_binding(generation_job, isolation_freeze, isolation_sha256, sha256(batch.read_bytes()),
+                                  sha256(gold.read_bytes()), sha256(skill.read_bytes()), identity)
     else:
         require(generation_job is not None, "Live trial requires bound external proposal")
         job = json.loads(generation_job.read_bytes())
@@ -268,7 +284,7 @@ def build_contract(
         paths.append(str(generation_job))
         paths += list(job["contract"]["runtime_hashes"])
     if isolation_freeze:
-        require(purpose == "fixed_trial", "Native consumer must not claim generation isolation")
+        require(generation_job is not None, "Unbound generation isolation capture")
         snapshot(isolation_freeze.parent)
         paths += [str(p) for p in isolation_freeze.parent.rglob("*") if p.is_file()]
     pins = {name: sha256(Path(name).read_bytes()) for name in paths}
@@ -283,7 +299,7 @@ def build_contract(
         "identity": identity, "runtime": required_runtime, "canonical_root": str(canonical),
         "canonical_manifest": canonical_manifest, "private_root": str(private),
         "directory": str(directory), "resource_lock": (
-            job["runtime"]["resource_lock"] if purpose == "fixed_trial"
+            job["runtime"]["resource_lock"] if generation_job
             else str(directory / "resource.lock")),
         "token_argv": token_argv, "pins": pins, "stage_seconds": stage_seconds,
         "max_requests": 8, "max_log_bytes": 8388608, "max_process_rss_bytes": 4294967296,
@@ -299,7 +315,7 @@ def build_contract(
     return path
 
 
-def count_payload(contract, raw, directory, label):
+def count_payload(contract, raw, directory, label, *, budget_guard=None):
     """Counter receives the complete request including tools/system/context."""
     intact(contract)
     result = subprocess.run(
@@ -309,6 +325,8 @@ def count_payload(contract, raw, directory, label):
         timeout=min(20, contract["stage_seconds"]),
         **({"creationflags": 0x08000000} if os.name == "nt" else {}),
     )
+    if budget_guard:
+        budget_guard(len(result.stdout)+len(result.stderr))
     write_new(directory / (label + ".token-counter.stdout"), result.stdout)
     write_new(directory / (label + ".token-counter.stderr"), result.stderr)
     require(result.returncode == 0, "Frozen tokenizer failed")
@@ -402,6 +420,8 @@ class Gateway:
                     self.connection.settimeout(max(0.01, gateway.deadline - time.monotonic()))
                     raw = self.rfile.read(size)
                     require(len(raw) == size, "Truncated HTTP request")
+                    if generation_capture is not None:
+                        generation_capture.guard_write(len(raw))
                     write_new(directory / f"http-{number}.json", raw)
                     payload = json.loads(raw)
                     intact(contract)
@@ -436,7 +456,9 @@ class Gateway:
                         write_new(directory / "complete-batch-projection.json", projected)
                         record["complete_batch_fit"] = count_payload(
                             contract, projected, directory, "complete-batch-projection")
-                    record["actual_payload_fit"] = count_payload(contract, raw, directory, f"http-{number}")
+                    record["actual_payload_fit"] = count_payload(
+                        contract, raw, directory, f"http-{number}",
+                        budget_guard=generation_capture.guard_write if generation_capture is not None else None)
                     intact(contract)
                     verify_identity(contract["identity"])
                     upstream = contract["identity"]["base_url"] + "/v1/chat/completions"
@@ -457,6 +479,8 @@ class Gateway:
                                         "Gateway deadline/closure while reading response")
                                 total += len(chunk)
                                 require(total <= contract["max_log_bytes"], "Response log cap exceeded")
+                                if generation_capture is not None:
+                                    generation_capture.guard_write(total)
                                 chunks.append(chunk)
                             body = b"".join(chunks)
                             write_new(directory / f"http-{number}.response", body)
@@ -472,7 +496,10 @@ class Gateway:
                     answer = (503, json_bytes({"error": gateway.failure}), "application/json")
                 finally:
                     try:
-                        write_new(directory / f"http-{number}.receipt.json", json_bytes(record))
+                        receipt = json_bytes(record)
+                        if generation_capture is not None:
+                            generation_capture.guard_write(len(receipt))
+                        write_new(directory / f"http-{number}.receipt.json", receipt)
                     finally:
                         gateway.lock.release()
                 # A successful response is visible only after the immutable
@@ -691,6 +718,7 @@ def run_contract(path: Path, expected_sha256: str):
         result["live_execution_attested"] = contract["purpose"] == "fixed_trial"
         result["adoption_authorized"] = False
         result["generation_isolation_attested"] = contract["purpose"] == "fixed_trial"
+        result["synthetic_generation_capture_verified"] = contract["purpose"] == "native_controls" and bool(contract["generation_job"])
         result["live_trial_enabled"] = contract["purpose"] == "fixed_trial"
         write_new(Path(contract["directory"]) / "result.json", json_bytes(result))
     return result

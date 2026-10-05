@@ -19,6 +19,7 @@ from pathlib import Path
 
 import psutil
 
+from .formal_artifacts import encode
 from .formal_runtime import (
     command_environment,
     exclusive_lock,
@@ -27,7 +28,7 @@ from .formal_runtime import (
     stop_tree,
 )
 from .strata_runtime import StrataRunner, verify_identity
-from .verifier_triage_evaluation import BASE_REVISION, SKILL_PATH, evaluator_sha256, sha256
+from .verifier_triage_evaluation import BASE_REVISION, SKILL_PATH, evaluator_sha256, sha256, validate_corpus
 
 FAKE_MODEL = "synthetic-triage-generation-fixture"
 TASK = (
@@ -63,6 +64,8 @@ def freeze_generation(repository, pi, identity, batch, gold, directory, token_ar
     """Called before either fresh Pi process or candidate creation."""
     c = helpers()
     c.require(not directory.exists(), "Fresh pre-authoring freeze required")
+    batch_bytes, gold_bytes = batch.read_bytes(), gold.read_bytes()
+    validate_corpus(batch_bytes, gold_bytes)
     c.require(isinstance(identity["model_id"], str) and identity["model_id"], "Invalid model identity")
     if identity["model_id"] != FAKE_MODEL:
         c.require(generation_job is not None, "Real generation requires a pre-bound external job")
@@ -82,13 +85,8 @@ def freeze_generation(repository, pi, identity, batch, gold, directory, token_ar
         data = (repository / name).read_bytes()
         c.write_new(canonical / name, data)
         canonical_manifest[name] = {"sha256": sha256(data), "bytes": len(data)}
-    for name, source in (("batch.json", batch), ("gold.json", gold)):
-        c.write_new(directory / "private" / name, source.read_bytes())
-    c.canonical_consumer_input(batch.read_bytes())
-    # Both rows and keys are retained privately and match exactly.
-    b, g = load(batch), load(gold)
-    c.require(len(b) == len(g) == 12 and {v["id"] for v in b} == {v["id"] for v in g},
-              "Wrong pre-authoring batch/gold")
+    for name, data in (("batch.json", batch_bytes), ("gold.json", gold_bytes)):
+        c.write_new(directory / "private" / name, data)
     runtime = {
         "pi": str(pi.resolve()), "provider": str(repository / "tools/pi-local/strata-provider.ts"),
         "stage_guard": str(repository / "tools/pi-local/formal-stage-guard.ts"),
@@ -102,20 +100,32 @@ def freeze_generation(repository, pi, identity, batch, gold, directory, token_ar
     pins += [str(directory / "private" / n) for n in ("batch.json", "gold.json")]
     pins += [str(Path(sys.executable).resolve()), *[a for a in token_argv if Path(a).is_file()]]
     binding = None
+    log_root = None
+    task = TASK
     if generation_job:
         job = load(generation_job)
         c.validate_generation_budget(job)
         c.require(not directory.resolve().is_relative_to(Path(job["worktreePath"]).resolve()),
                   "Private freeze inside generation root")
         binding = {"job_id": job["id"], "base": job["baseRevision"],
-                   "contract_sha256": sha256(c.json_bytes(job["contract"])),
+                   "contract_sha256": sha256(encode(job["contract"])),
+                   "runtime_sha256": sha256(encode(job["runtime"])), "job_dir": job["jobDir"],
                    "worktree": job["worktreePath"]}
+        log_root = job["jobDir"]
+        task = job["contract"]["task"]
+        for name in ("pi", "provider", "stage_guard", "governance_gate", "runner", "runner_test"):
+            runtime[name] = job["runtime"][name]
+        c.require(Path(runtime["pi"]).resolve() == pi.resolve(), "Generation Pi differs from frozen job")
+        for p, digest in job["contract"]["runtime_hashes"].items():
+            c.require(sha256(Path(p).read_bytes()) == digest, "Generation job runtime pin changed")
+        pins += list(job["contract"]["runtime_hashes"])
     freeze = {
         "schema": "ephy.triage-generation-freeze.v1", "job_id": str(uuid.uuid4()),
         "created_at": time.time(), "plan": PLAN, "caps": CAPS,
-        "evaluator_sha256": evaluator_sha256(), "task": TASK,
-        "batch_sha256": sha256(batch.read_bytes()), "gold_sha256": sha256(gold.read_bytes()),
-        "directory": str(directory.resolve()), "private_root": str((directory / "private").resolve()),
+        "evaluator_sha256": evaluator_sha256(), "task": task,
+        "batch_sha256": sha256(batch_bytes), "gold_sha256": sha256(gold_bytes),
+        "directory": str(directory.resolve()), "log_root": log_root,
+        "private_root": str((directory / "private").resolve()),
         "canonical_root": str(canonical.resolve()), "identity": identity, "runtime": runtime,
         "canonical_manifest": canonical_manifest,
         "token_argv": token_argv, "stage_seconds": 300, "max_requests": 8,
@@ -128,7 +138,7 @@ def freeze_generation(repository, pi, identity, batch, gold, directory, token_ar
         "frozen": {"policy_sha256": sha256((canonical / c.CANONICAL[0]).read_bytes())},
     }
     path = directory / "freeze.json"
-    c.write_new(path, c.json_bytes(freeze))
+    write_capture(freeze, path, c.json_bytes(freeze))
     return path
 
 
@@ -140,6 +150,12 @@ def frozen(path, expected):
               and value["plan"] == PLAN and value["caps"] == CAPS,
               "Unfrozen plan/scope/budgets")
     c.intact(value)
+    private = Path(value["private_root"])
+    batch, gold = (private/"batch.json").read_bytes(), (private/"gold.json").read_bytes()
+    c.require((sha256(batch), sha256(gold)) == (value["batch_sha256"], value["gold_sha256"]),
+              "Frozen input hashes differ from private bytes")
+    validate_corpus(batch, gold)
+    capture_budget(value, 0)
     c.require(value["evaluator_sha256"] == evaluator_sha256(), "Evaluator changed")
     c.require(value["controller"] == {"executable": str(Path(sys.executable).resolve()),
                                     "python_version": sys.version}, "Controller changed")
@@ -247,6 +263,31 @@ def wire_matches(contract, directory, number, raw, config, events):
     ]}
 
 
+def capture_budget(contract, pending_bytes, trace=None):
+    roots = [Path(contract["directory"])]
+    if contract.get("log_root"):
+        roots.append(Path(contract["log_root"]))
+    paths = {p.resolve() for root in roots for p in root.rglob("*") if p.is_file()}
+    if trace and trace.exists():
+        paths.add(trace.resolve())
+    total = 0
+    for path in paths:
+        try:
+            total += path.stat().st_size
+        except FileNotFoundError:
+            # Git renames its transient index lock when it commits the index.
+            if not path.name.endswith(".index.lock"):
+                raise
+    helpers().require(type(pending_bytes) is int and pending_bytes >= 0
+                      and total+pending_bytes <= contract["max_log_bytes"],
+                      "Generation capture cumulative log cap")
+
+
+def write_capture(contract, path, data):
+    capture_budget(contract, len(data))
+    helpers().write_new(path, data)
+
+
 class GenerationCapture:
     def __init__(self, freeze_path, freeze_sha256, directory):
         self.freeze_path, self.freeze_sha256, self.directory = freeze_path, freeze_sha256, directory
@@ -255,6 +296,14 @@ class GenerationCapture:
         self.config = load(directory / "config.json")
         self.completed = []
         self.nonce = None
+
+    def guard_write(self, pending_bytes):
+        trace = Path(self.config.get("trace_path", str(self.directory/"trace.jsonl")))
+        capture_budget(self.contract, pending_bytes, trace)
+
+    def write_new(self, path, data):
+        self.guard_write(len(data))
+        helpers().write_new(path, data)
 
     def check_prefix(self):
         c = helpers()
@@ -283,7 +332,7 @@ class GenerationCapture:
             c.require(len(starts) == 1, "Missing observed generation process")
             child = psutil.Process(starts[0]["pid"])
             c.require(child.ppid() == os.getpid(), "Generation process is not controller-owned")
-            c.write_new(process_path, c.json_bytes({"pid": child.pid, "created_at": child.create_time(),
+            self.write_new(process_path, c.json_bytes({"pid": child.pid, "created_at": child.create_time(),
                         "executable": str(Path(child.exe()).resolve()), "argv": self.config["argv"]}))
         process = load(process_path)
         owned = psutil.Process(process["pid"])
@@ -304,13 +353,16 @@ class GenerationCapture:
                   and set(actual) - set(before) <= ({SKILL_PATH} if self.config["role"] == "implementer" else set()),
                   "Generation inputs changed")
         # Immutable prefix retained before network forwarding.
-        c.write_new(self.directory / f"http-{number}.trace-prefix", trace)
+        self.guard_write(len(trace))
+        self.write_new(self.directory / f"http-{number}.trace-prefix", trace)
         admission = {"schema": "ephy.triage-generation-admission.v1", "number": number,
                      "session_id": self.config["session_id"], "role": self.config["role"],
                      "freeze_sha256": self.freeze_sha256, "payload_sha256": sha256(raw),
                      "preview_sha256": sha256((self.directory / f"previews/{number}.json").read_bytes()),
                      "trace_prefix_sha256": sha256(trace), "process": process, **binding}
-        c.write_new(self.directory / f"http-{number}.admission.json", c.json_bytes(admission))
+        body = c.json_bytes(admission)
+        self.guard_write(len(body))
+        self.write_new(self.directory / f"http-{number}.admission.json", body)
         return {"generation_admission_sha256": sha256(c.json_bytes(admission))}
 
     def complete(self, number):
@@ -321,7 +373,8 @@ class GenerationCapture:
                    "payload_sha256": sha256((self.directory / names[0]).read_bytes()),
                    "files": {n: sha256((self.directory / n).read_bytes()) for n in names}}
         data = c.json_bytes(closure)
-        c.write_new(self.directory / f"http-{number}.complete.json", data)
+        self.guard_write(len(data)+4096)
+        self.write_new(self.directory / f"http-{number}.complete.json", data)
         self.completed.append(sha256(data))
 
 
@@ -338,29 +391,31 @@ def run_generation_session(freeze_path, expected, index):
     c.require(not directory.exists(), "Generation session reuse")
     directory.mkdir()
     guest = directory / "input"
-    c.write_new(guest / "authoring/task.md", TASK.encode())
+    write_capture(contract, guest / "authoring/task.md", TASK.encode())
     if index:
         previous = verify_session(freeze_path, expected, Path(contract["directory"]) / "planner")
-        c.write_new(guest / "authoring/plan.md", (Path(contract["directory"]) / "planner/output.txt").read_bytes())
+        write_capture(contract, guest / "authoring/plan.md", (Path(contract["directory"]) / "planner/output.txt").read_bytes())
         c.require(previous["role"] == "planner", "Missing planner")
     before = c.snapshot(guest)
     for sub in ("previews", "managed", "temp"):
         (directory / sub).mkdir()
-    c.write_new(directory / "managed/settings.json",
+    write_capture(contract, directory / "managed/settings.json",
                 c.json_bytes({"retry": {"enabled": False}, "compaction": {"enabled": False}}))
     prompt = TASK + "\nStage: " + role
     config = {"root": str(guest), "session_id": str(uuid.uuid4()), "role": role, "prompt": prompt,
               "model_id": identity["model_id"], "provider_id": "strata-local",
               "allowed_files": [SKILL_PATH] if index else [], "input_snapshot": before,
               "allowed_reads": list(before), "previews": str(directory / "previews"),
+              "capture_root": contract["directory"], "max_log_bytes": contract["max_log_bytes"],
+              "log_root": contract.get("log_root"),
               **{k: CAPS[k] for k in ("max_requests", "output_token_budget", "max_response_tokens")}}
-    c.write_new(directory / "config.json", c.json_bytes(config))
-    c.write_new(directory / "prompt.txt", prompt.encode())
+    write_capture(contract, directory / "config.json", c.json_bytes(config))
+    write_capture(contract, directory / "prompt.txt", prompt.encode())
     capture = GenerationCapture(freeze_path, expected, directory)
     runtime = contract["runtime"]
     gateway = c.Gateway(contract, directory, "generation", generation_capture=capture)
     with gateway as origin:
-        c.write_new(directory / "provider-identity.json", c.json_bytes({
+        write_capture(contract, directory / "provider-identity.json", c.json_bytes({
             "base_url": origin, "model_id": identity["model_id"], "context": identity["context"]}))
         env = command_environment(guest, directory / "temp")
         env.update(PI_CODING_AGENT_DIR=str(directory / "managed"), PI_OFFLINE="1",
@@ -385,7 +440,7 @@ def run_generation_session(freeze_path, expected, index):
                 record = {"pid": process.pid, "created_at": owned.create_time(),
                           "executable": str(Path(owned.exe()).resolve()), "argv": args}
                 c.require(record["executable"] == runtime["pi"], "Wrong launched Pi")
-                c.write_new(directory / "process.json", c.json_bytes(record))
+                write_capture(contract, directory / "process.json", c.json_bytes(record))
                 while process.poll() is None:
                     c.require(time.monotonic() - started < CAPS["stage_seconds"], "Generation stage timeout")
                     c.resource_gate(contract, directory)
@@ -405,7 +460,7 @@ def run_generation_session(freeze_path, expected, index):
               f"Generation rejected (exit {process.returncode}): {gateway.failure}")
     output = final_assistant_text(directory / "stdout.jsonl")
     c.require(output == final_assistant_text(directory / "session.jsonl", session=True), "Generation stdout/session mismatch")
-    c.write_new(directory / "output.txt", output.encode())
+    write_capture(contract, directory / "output.txt", output.encode())
     after = c.snapshot(guest)
     c.require(all(after.get(k) == v for k, v in before.items())
               and set(after) - set(before) == ({SKILL_PATH} if index else set()), "Generation input/scope changed")
@@ -416,7 +471,7 @@ def run_generation_session(freeze_path, expected, index):
                "input_before": before, "input_after": after, "captures": capture.completed,
                "files": {p.relative_to(directory).as_posix(): sha256(p.read_bytes())
                          for p in directory.rglob("*") if p.is_file()}}
-    c.write_new(directory / "receipt.json", c.json_bytes(receipt))
+    write_capture(contract, directory / "receipt.json", c.json_bytes(receipt))
     return verify_session(freeze_path, expected, directory)
 
 
@@ -495,7 +550,7 @@ def run_native_generation(freeze_path, expected):
                   "sessions": ["planner", "implementer"], "synthetic_only": True,
                   "real_model_generations": 0, "candidate_sha256": sha256(
                       (Path(contract["directory"]) / "implementer/input" / SKILL_PATH).read_bytes())}
-        c.write_new(Path(contract["directory"]) / "capture.json", c.json_bytes(result))
+        write_capture(contract, Path(contract["directory"]) / "capture.json", c.json_bytes(result))
     return result
 
 
@@ -529,16 +584,24 @@ class IsolatedStrataRunner(StrataRunner):
         binding = self.isolation["generation_binding"]
         c.require(binding is not None and binding == {
             "job_id": self.job["id"], "base": self.job["baseRevision"],
-            "contract_sha256": sha256(c.json_bytes(self.contract)), "worktree": self.job["worktreePath"]},
+            "contract_sha256": sha256(encode(self.contract)),
+            "runtime_sha256": sha256(encode(self.runtime)), "job_dir": self.job["jobDir"],
+            "worktree": self.job["worktreePath"]},
             "Generation freeze belongs to another external job")
         c.require(self.identity == self.isolation["identity"], "Generation deployment differs")
         c.validate_generation_budget(self.job)
+        c.require(all(self.runtime.get("thinking", {}).get(role) == "off" for role in ("planner", "implementer")),
+                  "Isolated generation requires planner/implementer thinking=off")
         required = [str(Path(__file__).resolve()), self.isolation["runtime"]["extra_guard"],
                     str(Path(__file__).with_name("verifier_triage_consumer.py").resolve())]
         c.require(all(self.contract["runtime_hashes"].get(p) == sha256(Path(p).read_bytes()) for p in required),
                   "Isolation adapter/guard must be pinned before submission")
         self.isolation_stages = []
         self.active_isolation = None
+
+    def resources(self):
+        super().resources()
+        capture_budget(self.isolation, 0)
 
     def stage(self, role, prompt, label, root, envelope=None):
         c = helpers()
@@ -558,10 +621,12 @@ class IsolatedStrataRunner(StrataRunner):
         for name, source in (("trace.jsonl", self.directory/(label+"-trace.jsonl")),
                              ("stdout.jsonl", self.directory/(label+".stdout.log")),
                              ("session.jsonl", self.directory/(label+"-session.jsonl"))):
-            c.write_new(directory/name, source.read_bytes())
+            body = source.read_bytes()
+            self._generation_capture.guard_write(len(body))
+            write_capture(self.isolation, directory/name, body)
         c.require(text == final_assistant_text(directory/"session.jsonl", session=True),
                   "External stdout/session differs")
-        c.write_new(directory/"output.txt", text.encode())
+        write_capture(self.isolation, directory/"output.txt", text.encode())
         config = load(directory/"config.json")
         after = c.snapshot(root)
         c.require(all(after.get(k) == v for k, v in config["input_snapshot"].items()
@@ -581,7 +646,7 @@ class IsolatedStrataRunner(StrataRunner):
                    "captures": self._generation_capture.completed,
                    "files": {p.relative_to(directory).as_posix(): sha256(p.read_bytes())
                              for p in directory.rglob("*") if p.is_file()}}
-        c.write_new(directory/"receipt.json", c.json_bytes(receipt))
+        write_capture(self.isolation, directory/"receipt.json", c.json_bytes(receipt))
         verify_session(self.isolation_path, self.isolation_expected, directory)
         self.isolation_stages.append(role)
         return text
@@ -592,25 +657,34 @@ class IsolatedStrataRunner(StrataRunner):
         c = helpers()
         directory, _role, prompt = self.active_isolation
         config = load(Path(stage_environment["EPHY_FORMAL_STAGE_CONFIG"]))
+        prompt_path = self.directory/(label+"-prompt.txt")
+        raw_prompt = prompt_path.read_bytes()
+        c.require(raw_prompt == prompt.replace("\n", os.linesep).encode("utf-8"),
+                  "External authoring prompt differs from the controlled task")
+        write_capture(self.isolation, directory/"prompt.txt", raw_prompt)
         inputs = c.snapshot(cwd)
         allowed_reads = [name for name in inputs if Path(name).suffix in {".md", ".json", ".toml", ".yaml", ".yml"}
                          and not name.startswith(".git/")]
         for name in allowed_reads:
             deny_leak(self.isolation, (cwd/name).read_text(encoding="utf-8", errors="strict"))
-        config.update(session_id=str(uuid.uuid4()), prompt=prompt, input_snapshot=inputs,
+        config.update(session_id=str(uuid.uuid4()), prompt=raw_prompt.decode("utf-8"), input_snapshot=inputs,
+                      capture_root=self.isolation["directory"], max_log_bytes=self.isolation["max_log_bytes"],
+                      log_root=self.isolation.get("log_root"),
                       allowed_reads=allowed_reads, previews=str(directory/"previews"),
-                      prompt_path=str(self.directory/(label+"-prompt.txt")),
+                      prompt_path=str(prompt_path),
                       trace_path=stage_environment["EPHY_FORMAL_TRACE"])
         marker = argv.index(self.runtime["governance_gate"])
         c.require(argv[marker-1] == "--extension", "Missing final governance extension")
         argv = [*argv[:marker-1], "--extension", self.isolation["runtime"]["extra_guard"], *argv[marker-1:]]
         config["argv"] = argv
-        c.write_new(directory/"config.json", c.json_bytes(config))
+        config_raw = c.json_bytes(config)
+        capture_budget(self.isolation, len(config_raw))
+        write_capture(self.isolation, directory/"config.json", config_raw)
         capture = GenerationCapture(self.isolation_path, self.isolation_expected, directory)
         gateway = c.Gateway(self.isolation, directory, "generation", generation_capture=capture)
         with gateway as origin:
             identity_path = directory/"provider-identity.json"
-            c.write_new(identity_path, c.json_bytes({"base_url": origin, "model_id": self.identity["model_id"],
+            write_capture(self.isolation, identity_path, c.json_bytes({"base_url": origin, "model_id": self.identity["model_id"],
                                                    "context": self.identity["context"]}))
             env = {**stage_environment, "EPHY_TRIAGE_GENERATION_CONFIG": str(directory/"config.json"),
                    "EPHY_STRATA_IDENTITY": str(identity_path)}
@@ -621,6 +695,12 @@ class IsolatedStrataRunner(StrataRunner):
         return result
 
     def run(self):
+        # Direct callers and the supported entrypoint hold the same existing
+        # lock as consumers and other external jobs for the complete workflow.
+        with exclusive_lock(Path(self.runtime["resource_lock"])):
+            return self._run_isolated()
+
+    def _run_isolated(self):
         super().run()
         c = helpers()
         c.require(self.isolation_stages == ["planner", "implementer"]
@@ -628,23 +708,30 @@ class IsolatedStrataRunner(StrataRunner):
         result = {"schema": "ephy.triage-generation-capture.v1",
                   "freeze_sha256": self.isolation_expected, "sessions": self.isolation_stages,
                   "synthetic_only": self.identity["model_id"] == FAKE_MODEL,
-                  "real_model_generations": sum(self.provenance[i]["requests"] for i in range(2)),
+                  "real_model_generations": (0 if self.identity["model_id"] == FAKE_MODEL
+                                             else sum(self.provenance[i]["requests"] for i in range(2))),
                   "candidate_sha256": sha256((self.candidate/SKILL_PATH).read_bytes())}
-        c.write_new(Path(self.isolation["directory"])/"capture.json", c.json_bytes(result))
+        write_capture(self.isolation, Path(self.isolation["directory"])/"capture.json", c.json_bytes(result))
         verify_capture(self.isolation_path, self.isolation_expected)
 
 
-def verify_live_binding(job_path, freeze_path, expected, batch_sha, gold_sha, skill_sha):
-    """Additional gate; never substitutes for verify_external_proposal."""
+def run_isolated_external_job(job_file, freeze_path, expected):
+    runner = IsolatedStrataRunner(job_file, freeze_path, expected)
+    runner.run()
+    return verify_capture(freeze_path, expected)
+
+
+def _verify_job_binding(job_path, freeze_path, expected, batch_sha, gold_sha, skill_sha):
+    """Shared complete binding; caller separately enforces live/native domain."""
     c = helpers()
     contract = frozen(freeze_path, expected)
     result = verify_capture(freeze_path, expected)
-    c.require(contract["identity"]["model_id"] != FAKE_MODEL and result["synthetic_only"] is False,
-              "Native capture cannot authorize a live trial")
     job = load(job_path)
     binding = contract["generation_binding"]
+    c.require(contract["task"] == job["contract"]["task"], "Generation task differs from frozen job")
     c.require(binding == {"job_id": job["id"], "base": job["baseRevision"],
-                          "contract_sha256": sha256(c.json_bytes(job["contract"])),
+                          "contract_sha256": sha256(encode(job["contract"])),
+                          "runtime_sha256": sha256(encode(job["runtime"])), "job_dir": job["jobDir"],
                           "worktree": job["worktreePath"]},
               "Isolation capture belongs to another generation job")
     c.require((contract["batch_sha256"], contract["gold_sha256"], result["candidate_sha256"])
@@ -662,6 +749,24 @@ def verify_live_binding(job_path, freeze_path, expected, batch_sha, gold_sha, sk
                   and p["session_sha256"] == sha256((directory/"session.jsonl").read_bytes()),
                   "Capture belongs to another actual generation session")
     return result
+
+
+def verify_live_binding(job_path, freeze_path, expected, batch_sha, gold_sha, skill_sha):
+    contract = frozen(freeze_path, expected)
+    result = verify_capture(freeze_path, expected)
+    helpers().require(contract["identity"]["model_id"] != FAKE_MODEL
+                      and contract["identity"]["listener"]["pid"] != contract["identity"]["engine"]["pid"]
+                      and result["synthetic_only"] is False, "Native capture cannot authorize a live trial")
+    return _verify_job_binding(job_path, freeze_path, expected, batch_sha, gold_sha, skill_sha)
+
+
+def verify_native_binding(job_path, freeze_path, expected, batch_sha, gold_sha, skill_sha, identity):
+    helpers().require(identity["model_id"] == FAKE_MODEL
+                      and identity["listener"]["pid"] == identity["engine"]["pid"] == os.getpid(),
+                      "Native binding requires controller-owned scripted provider")
+    contract = frozen(freeze_path, expected)
+    helpers().require(contract["identity"] == identity, "Native capture uses other provider")
+    return _verify_job_binding(job_path, freeze_path, expected, batch_sha, gold_sha, skill_sha)
 
 
 def main():

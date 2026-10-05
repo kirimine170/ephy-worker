@@ -1,6 +1,6 @@
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync, readdirSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { stopManagedStage } from "./formal-stage-stop.ts";
 
@@ -10,9 +10,27 @@ export default function (pi: ExtensionAPI) {
   const rawConfig = readFileSync(process.env.EPHY_TRIAGE_GENERATION_CONFIG!);
   const cfg = JSON.parse(rawConfig.toString("utf8"));
   const hash = (b: Buffer) => createHash("sha256").update(b).digest("hex");
-  const record = (kind: string, value: object) =>
-    appendFileSync(process.env.EPHY_FORMAL_TRACE!,
-      JSON.stringify({ kind, session_id: cfg.session_id, role: cfg.role, ...value }) + "\n");
+  function budget(bytes: number) {
+    const paths = new Map<string, number>();
+    function visit(root: string) {
+      for (const f of readdirSync(root, {withFileTypes: true})) {
+        const path = join(root, f.name);
+        if (f.isDirectory()) visit(path);
+        else paths.set(resolve(path), statSync(path).size);
+      }
+    }
+    visit(cfg.capture_root);
+    if (cfg.log_root) visit(cfg.log_root);
+    try { paths.set(resolve(process.env.EPHY_FORMAL_TRACE!), statSync(process.env.EPHY_FORMAL_TRACE!).size); }
+    catch (e: any) { if (e.code !== "ENOENT") throw e; }
+    const total = [...paths.values()].reduce((a, b) => a + b, 0);
+    if (total + bytes > cfg.max_log_bytes) stopManagedStage("Generation capture cumulative log cap");
+  }
+  const record = (kind: string, value: object) => {
+    const line = JSON.stringify({ kind, session_id: cfg.session_id, role: cfg.role, ...value }) + "\n";
+    budget(Buffer.byteLength(line, "utf8"));
+    appendFileSync(process.env.EPHY_FORMAL_TRACE!, line);
+  };
   const pending = new Map<string, {name: string, input: any}>();
   const seen = new Set<string>();
   let requests = 0;
@@ -54,6 +72,7 @@ export default function (pi: ExtensionAPI) {
     if (pending.size) stop("Unfinished tool result");
     const raw = Buffer.from(JSON.stringify(e.payload), "utf8");
     const number = ++requests;
+    budget(raw.length);
     writeFileSync(join(cfg.previews, number + ".json"), raw, {flag: "wx"});
     record("generation_preview", { number, sha256: hash(raw) });
   });

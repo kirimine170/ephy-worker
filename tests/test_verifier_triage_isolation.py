@@ -149,7 +149,7 @@ def test_native_label_change_cannot_authorize_live(monkeypatch):
         isolation.verify_live_binding(Path("job"), Path("freeze"), "hash", "batch", "gold", "skill")
 
 
-@pytest.mark.parametrize("change", ["none", "job", "budget", "pins"])
+@pytest.mark.parametrize("change", ["none", "job", "budget", "pins", "runtime", "job_dir"])
 def test_external_adapter_binds_existing_job_and_original_caps(monkeypatch, tmp_path, change):
     from ephy_worker.verifier_triage_evaluation import BASE_REVISION, SKILL_PATH
     module = Path(isolation.__file__).resolve()
@@ -160,25 +160,32 @@ def test_external_adapter_binds_existing_job_and_original_caps(monkeypatch, tmp_
                 "output_token_budget": 2200, "max_response_tokens": 1024, "stage_seconds": 300,
                 "timeout_seconds": 900, "runtime_hashes": {p: sha256(Path(p).read_bytes()) for p in required}}
     job = {"id": "bound-job", "baseRevision": BASE_REVISION, "contract": contract,
-           "worktreePath": str(tmp_path/"candidate")}
+           "worktreePath": str(tmp_path/"candidate"), "jobDir": str(tmp_path/"job"),
+           "runtime": {"thinking": {"planner": "off", "implementer": "off"}, "resource_lock": str(tmp_path/"lock")}}
     identity = {"model_id": "fixed-existing-model"}
     freeze = {"identity": identity, "runtime": {"extra_guard": required[1]},
               "generation_binding": {"job_id": job["id"], "base": BASE_REVISION,
-                                     "contract_sha256": sha256(json_bytes(contract)),
+                                     "contract_sha256": sha256(isolation.encode(contract)),
+                                     "runtime_sha256": sha256(isolation.encode(job["runtime"])), "job_dir": job["jobDir"],
                                      "worktree": job["worktreePath"]}}
     called = []
     def original_init(self, *_):
         called.append("existing runner init")
         self.job, self.contract, self.identity = job, contract, identity
+        self.runtime = job["runtime"]
     monkeypatch.setattr(isolation.StrataRunner, "__init__", original_init)
     if change == "job":
         freeze["generation_binding"]["job_id"] = "unrelated-job"
     elif change == "budget":
         contract["max_requests"] = 9
-        freeze["generation_binding"]["contract_sha256"] = sha256(json_bytes(contract))
+        freeze["generation_binding"]["contract_sha256"] = sha256(isolation.encode(contract))
     elif change == "pins":
         contract["runtime_hashes"] = {}
-        freeze["generation_binding"]["contract_sha256"] = sha256(json_bytes(contract))
+        freeze["generation_binding"]["contract_sha256"] = sha256(isolation.encode(contract))
+    elif change == "runtime":
+        job["runtime"]["resource_lock"] = str(tmp_path/"different-lock")
+    elif change == "job_dir":
+        job["jobDir"] = str(tmp_path/"different-job")
     monkeypatch.setattr(isolation, "frozen", lambda *_: freeze)
     if change == "none":
         runner = isolation.IsolatedStrataRunner(tmp_path/"job", tmp_path/"freeze", "hash")
@@ -198,3 +205,150 @@ def test_replayed_payload_is_refused_before_process_or_network(tmp_path, monkeyp
     monkeypatch.setattr(isolation.psutil, "Process", lambda *_: pytest.fail("Process reached"))
     with pytest.raises(InvalidEvaluation, match="Replay/duplicate payload"):
         c.admit(raw, 2)
+
+
+def alternate_corpus():
+    batch, gold = development_fixture()
+    rows, answers = json.loads(batch), json.loads(gold)
+    for row in rows:
+        data = json.loads(row["input"])
+        for name in ("expected", "observed"):
+            data[name]["id"] += "B"
+            data[name]["aggregate"] = data[name]["aggregate"].replace("a", "c").replace("b", "d")
+            data[name]["components"] = {k: v.replace("a", "c").replace("b", "d")
+                                        for k, v in data[name]["components"].items()}
+        if "ci" in data:
+            for key in data["ci"]:
+                data["ci"][key] += "B"
+        row["input"] = json.dumps(data, separators=(",", ":"))
+    for answer in answers:
+        answer["evidence_ids"] = [v+"B" for v in answer["evidence_ids"]]
+    result = json_bytes(rows), json_bytes(answers)
+    isolation.validate_corpus(*result)
+    return result
+
+
+def pure_freeze(tmp_path, monkeypatch, batch=None, gold=None):
+    import sys
+
+    original_batch, original_gold = development_fixture()
+    batch_path, gold_path = tmp_path/"batch.json", tmp_path/"gold.json"
+    batch_path.write_bytes(original_batch if batch is None else batch)
+    gold_path.write_bytes(original_gold if gold is None else gold)
+    monkeypatch.setattr(isolation, "verify_identity", lambda _: None)
+    repository = Path(isolation.__file__).resolve().parents[2]
+    return isolation.freeze_generation(repository, Path(sys.executable), {"model_id": isolation.FAKE_MODEL},
+                                       batch_path, gold_path, tmp_path/"freeze", [sys.executable])
+
+
+def test_source_replacement_is_frozen_from_one_read_per_input(tmp_path, monkeypatch):
+    original_read = Path.read_bytes
+    first = development_fixture()
+    second = alternate_corpus()
+    targets = {tmp_path/"batch.json": (first[0], second[0]), tmp_path/"gold.json": (first[1], second[1])}
+    counts = {p: 0 for p in targets}
+
+    def replaced_read(path):
+        if path in targets:
+            counts[path] += 1
+            if counts[path] == 1:
+                path.write_bytes(targets[path][1])
+                return targets[path][0]
+        return original_read(path)
+
+    monkeypatch.setattr(Path, "read_bytes", replaced_read)
+    path = pure_freeze(tmp_path, monkeypatch)
+    contract = isolation.frozen(path, sha256(path.read_bytes()))
+    assert counts == {p: 1 for p in targets}
+    assert (contract["batch_sha256"], contract["gold_sha256"]) == tuple(sha256(v) for v in first)
+    assert tuple((Path(contract["private_root"])/n).read_bytes() for n in ("batch.json", "gold.json")) == first
+    assert tuple(original_read(p) for p in targets) == second
+
+
+@pytest.mark.parametrize("fields", [("batch",), ("gold",), ("batch", "gold")])
+def test_declared_input_hashes_cannot_authorize_other_valid_corpus(tmp_path, monkeypatch, fields):
+    path = pure_freeze(tmp_path, monkeypatch)
+    contract = json.loads(path.read_bytes())
+    alternate = dict(zip(("batch", "gold"), alternate_corpus(), strict=True))
+    for name in fields:
+        contract[name+"_sha256"] = sha256(alternate[name])
+    path.write_bytes(json_bytes(contract))
+    expected = sha256(path.read_bytes())
+    with pytest.raises(InvalidEvaluation, match="hashes differ from private bytes"):
+        isolation.frozen(path, expected)
+    with pytest.raises(InvalidEvaluation, match="hashes differ from private bytes"):
+        isolation.verify_live_binding(tmp_path/"unused-job.json", path, expected,
+                                      sha256(alternate["batch"]), sha256(alternate["gold"]), "unused-skill")
+
+
+@pytest.mark.parametrize("mutation", ["duplicate", "decision", "evidence", "diagnosis", "all_stop", "malformed"])
+def test_invalid_complete_corpus_fails_before_identity_or_authoring(tmp_path, monkeypatch, mutation):
+    batch, gold = development_fixture()
+    rows, answers = json.loads(batch), json.loads(gold)
+    if mutation == "duplicate":
+        rows[-1] = rows[0]
+    elif mutation == "decision":
+        answers[0]["decision"] = "MAYBE"
+    elif mutation == "evidence":
+        answers[0]["evidence_ids"] = ["absent", "also-absent"]
+    elif mutation == "diagnosis":
+        answers[0]["diagnosis"] = "component:invented"
+    elif mutation == "all_stop":
+        for answer in answers:
+            answer["decision"] = "STOP"
+    else:
+        rows[0]["input"] = "not evidence JSON"
+    # A malformed corpus must be rejected before even querying the service.
+    monkeypatch.setattr(isolation, "verify_identity", lambda _: pytest.fail("Service queried"))
+    import sys
+    repository = Path(isolation.__file__).resolve().parents[2]
+    (tmp_path/"batch.json").write_bytes(json_bytes(rows))
+    (tmp_path/"gold.json").write_bytes(json_bytes(answers))
+    with pytest.raises(InvalidEvaluation):
+        isolation.freeze_generation(repository, Path(sys.executable), {"model_id": isolation.FAKE_MODEL},
+                                    tmp_path/"batch.json", tmp_path/"gold.json", tmp_path/"freeze", [sys.executable])
+    assert not (tmp_path/"freeze").exists()
+
+
+def test_cumulative_budget_includes_pending_writes_and_external_job_logs(tmp_path):
+    capture, job = tmp_path/"capture", tmp_path/"job"
+    capture.mkdir()
+    job.mkdir()
+    (capture/"http.json").write_bytes(b"x"*8)
+    trace = job/"trace.jsonl"
+    trace.write_bytes(b"x"*10)
+    contract = {"directory": str(capture), "log_root": str(job), "max_log_bytes": 32}
+    isolation.capture_budget(contract, 14, trace)
+    with pytest.raises(InvalidEvaluation, match="cumulative log cap"):
+        isolation.write_capture(contract, capture/"pending.json", b"x"*15)
+    assert not (capture/"pending.json").exists()
+
+
+def test_overlapping_capture_roots_are_counted_once(tmp_path):
+    (tmp_path/"inner").mkdir()
+    (tmp_path/"inner/data").write_bytes(b"x"*8)
+    isolation.capture_budget({"directory": str(tmp_path), "log_root": str(tmp_path/"inner"), "max_log_bytes": 16}, 8)
+
+
+@pytest.mark.parametrize("filename", ["diff.index.lock", "http-1.json"])
+def test_only_transient_git_index_lock_disappearance_is_permitted(tmp_path, monkeypatch, filename):
+    path = tmp_path/filename
+    path.write_bytes(b"temporary")
+    original = Path.stat
+    calls = 0
+
+    def renamed_stat(p, *args, **kwargs):
+        nonlocal calls
+        if p == path:
+            calls += 1
+            if calls >= 2:
+                raise FileNotFoundError(path)
+        return original(p, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", renamed_stat)
+    contract = {"directory": str(tmp_path), "max_log_bytes": 32}
+    if filename.endswith(".index.lock"):
+        isolation.capture_budget(contract, 20)
+    else:
+        with pytest.raises(FileNotFoundError):
+            isolation.capture_budget(contract, 20)

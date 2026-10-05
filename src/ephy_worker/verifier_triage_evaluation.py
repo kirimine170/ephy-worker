@@ -157,6 +157,58 @@ def _rows(value, keys: set[str]) -> dict[str, dict]:
     return result
 
 
+
+def validate_corpus(batch: bytes, gold: bytes) -> tuple[dict, dict]:
+    """Validate the complete private evaluation definition before any authoring."""
+    canonical_consumer_input(batch)
+    inputs = _rows(_json(batch), {"id", "input"})
+    expected = _rows(_json(gold), {"id", "decision", "diagnosis", "evidence_ids"})
+    _require(inputs.keys() == expected.keys(), "Answer key is not the identical complete batch")
+    _require({r["decision"] for r in expected.values()} == {"PASS", "STOP"}, "Uninformative decision fixture")
+    for identifier, row in inputs.items():
+        _require(isinstance(row["input"], str) and row["input"], "Missing case input")
+        data = _json(row["input"].encode())
+        _require(isinstance(data, dict) and {"expected", "observed"} <= set(data)
+                 and set(data) <= {"expected", "observed", "ci"}, "Malformed case evidence")
+        ids = evidence_ids(row["input"])
+        for key in ("expected", "observed"):
+            record = data[key]
+            _require(isinstance(record, dict) and set(record) == {"id", "aggregate", "components"}
+                     and isinstance(record["aggregate"], str)
+                     and re.fullmatch("[a-f0-9]{64}", record["aggregate"])
+                     and isinstance(record["components"], dict)
+                     and all(isinstance(k, str) and k and isinstance(v, str)
+                             and re.fullmatch("[a-f0-9]{64}", v) for k, v in record["components"].items()),
+                     "Malformed measured evidence")
+        answer = expected[identifier]
+        refs = set(answer["evidence_ids"])
+        _require(refs <= ids, "Gold cites nonexistent evidence")
+        diagnosis = answer["diagnosis"]
+        _require(diagnosis in {"MATCH", "UNATTRIBUTED", "STALE_CI"}
+                 or diagnosis.startswith("component:") and diagnosis[len("component:"):] in identifiable_components(row["input"]),
+                 "Unsupported gold diagnosis")
+        pair = {data["expected"]["id"], data["observed"]["id"]}
+        if diagnosis.startswith("component:"):
+            _require(refs == pair and answer["decision"] == "STOP", "Unsupported component answer")
+        elif diagnosis == "STALE_CI":
+            ci = data.get("ci", {})
+            _require(set(ci) == {"expected_id", "observed_id", "expected_revision", "observed_revision"}
+                     and all(isinstance(ci[k], str) and ci[k] for k in ("expected_revision", "observed_revision"))
+                     and ci["expected_revision"] != ci["observed_revision"]
+                     and refs == {ci["expected_id"], ci["observed_id"]} and answer["decision"] == "STOP",
+                     "Unsupported stale CI answer")
+        else:
+            _require(refs == pair, "Gold diagnosis cites different records")
+            if diagnosis == "MATCH":
+                _require(data["expected"]["aggregate"] == data["observed"]["aggregate"]
+                         and data["expected"]["components"] == data["observed"]["components"]
+                         and answer["decision"] == "PASS", "Unsupported match answer")
+            else:
+                _require(data["expected"]["aggregate"] != data["observed"]["aggregate"]
+                         and answer["decision"] == "STOP", "Unsupported unattributed answer")
+    return inputs, expected
+
+
 def _complete_reads(events: list[dict]) -> dict[str, set[str]]:
     pending = {}
     identifiers = set()

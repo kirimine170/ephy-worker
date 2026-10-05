@@ -157,6 +157,18 @@ caps, raw batch/gold hashes, evaluator hash, canonical documents, controller
 Python/dependencies and source/runtime pins. Retain the freeze hash outside the
 candidate. For a real job it also binds job ID, base, contract hash and worktree;
 the actual pinned Strata tokenizer/spec must match the existing deployment.
+The complete runtime, shared-lock path and job directory are also bound before
+authoring and rechecked at consumer admission. Contract/runtime hashes use the
+inherited runner's canonical JSON encoding so its status-file rewrites preserve
+the binding.
+
+Each source batch/gold is read once. The same bytes are validated, privately
+copied and hashed. The pure complete-corpus validator rejects duplicate IDs,
+malformed answers/evidence, nonexistent references, unsupported diagnoses and
+an all-STOP answer key before any authoring or service probe. Saved verification
+also requires the declared hashes to match the pinned private copies. Valid
+corpora A/B with identical IDs cannot substitute for one another during freeze.
+The existing pure scoring semantics and its assertions remain unchanged.
 
 IsolatedStrataRunner composes the existing external Strata proposal runner.
 The adapter, consumer controller and additional guard must already be included
@@ -166,6 +178,22 @@ requirements. It restricts generation reads to a closed snapshot of Markdown,
 JSON, TOML and YAML files, and writes to the one Markdown skill only.
 Planner and implementer remain separate fresh processes/sessions. The additional
 extension is loaded before the unchanged final governance gate.
+
+run_isolated_external_job is the supported entrypoint. IsolatedStrataRunner.run
+holds the job's existing shared resource lock for the entire workflow; a
+contending call refuses before the first POST. Both authoring roles require
+thinking=off. The adapter records the exact bytes of the prompt file written
+by the inherited runner, including Windows line endings, and compares those
+bytes with the actual model-visible user context.
+
+The 8 MiB cumulative capture budget covers the freeze tree and original job
+logs, previews, HTTP bodies/responses, counter output, trace prefixes, copies
+and receipts. The isolation controller and additional guard include their
+pending bytes before writing;
+inherited resource checks additionally measure the combined directories.
+Overlapping paths are counted once. Only a transient Git index lock that has
+already been renamed can disappear during size measurement; missing immutable
+evidence still fails verification.
 
 A Pi-owned preview records the complete input before the last governance hook.
 The HTTP gateway independently captures the actual final body and permits only
@@ -212,3 +240,27 @@ result and changed frozen gold controls stop before the next upstream POST.
 Independent verification runs in another Python process. Failed development
 runs remain retained; synthetic tests do not establish a held-out effect,
 formal audit, real-model execution, or adoption.
+
+The full adapter controls use a separate command:
+
+~~~text
+python scripts/verify_triage_generation_boundary.py --pi EXISTING_PI_EXE --artifacts FRESH_PRIVATE_DIRECTORY --case adapter_all
+~~~
+
+This invokes the actual adapter and inherited runner without replacing their
+methods. The positive fixture executes preflight, baseline checks, two fresh
+authoring sessions, independent checks, diff/patch and audit-bundle freeze,
+proposal-stop verification and binding to four native consumer sessions.
+The checker is independently exercised against known-good, unchanged,
+wrong-answer, weakened-test and scope-escape fixtures. Regression tests, Ruff
+and repository validation execute as real commands. Lock contention, aggregate
+capture overflow, enabled thinking and five invalid-corpus controls require
+zero forwarded POSTs.
+Missing prior admission, batch leakage and gold leakage are also injected at
+the actual adapter boundary and must stop before a third upstream POST.
+Changing the shared-lock path after freeze requires zero authoring POSTs;
+changing it after generation/proposal freeze refuses consumer admission.
+verify_live_binding rejects the fake deployment; verify_native_binding verifies
+its same-job provenance before native consumer
+admission. Native result flags retain live execution/isolation authorization
+as false. These fixtures establish composed infrastructure behavior only.
