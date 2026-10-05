@@ -364,6 +364,90 @@ def payload_strings(value, depth=0):
             yield from payload_strings(item, depth)
 
 
+def read_delivery(identifier, content, event):
+    """Validate all transmitted read blocks and bind their complete text bytes."""
+    if isinstance(content, list):
+        require(all(isinstance(block, dict) and set(block) == {"type", "text"}
+                    and block["type"] == "text" and isinstance(block["text"], str)
+                    for block in content), "Nontext transmitted read")
+        content = "".join(block["text"] for block in content)
+    require(isinstance(content, str), "Missing transmitted read text")
+    body = content.encode("utf-8")
+    require(event["full_content_delivered"] is True
+            and len(body) == event["raw_bytes"]
+            and sha256(body) == event["raw_sha256"] == event["delivered_sha256"],
+            "Transmitted read bytes differ from raw artifact")
+    return {"toolCallId": identifier, "path": event["path"],
+            "bytes": len(body), "sha256": sha256(body)}
+
+
+def consumer_read_delivery(messages, events):
+    """Check closed read call/result correspondence before upstream delivery."""
+    reads = [event for event in events if event.get("kind") == "triage_exact_read"]
+    evidence = {event["toolCallId"]: event for event in reads}
+    require(len(evidence) == len(reads), "Duplicate consumer read evidence")
+    calls, delivered = {}, {}
+    require(isinstance(messages, list) and all(isinstance(message, dict) for message in messages),
+            "Malformed consumer messages")
+    for message in messages:
+        if message.get("role") != "assistant":
+            continue
+        tool_calls = message.get("tool_calls", [])
+        require(isinstance(tool_calls, list), "Malformed consumer tool calls")
+        for call in tool_calls:
+            require(isinstance(call, dict) and isinstance(call.get("function"), dict),
+                    "Malformed consumer tool call")
+            identifier, function = call.get("id"), call["function"]
+            require(isinstance(identifier, str) and identifier not in calls
+                    and function.get("name") in {"read", "governance_ack"},
+                    "Unbound/duplicate consumer tool call")
+            calls[identifier] = function
+            if function["name"] == "read":
+                require(identifier in evidence and isinstance(function.get("arguments"), str),
+                        "Read call lacks exact delivery evidence")
+                arguments = json.loads(function["arguments"])
+                require(isinstance(arguments, dict) and set(arguments) == {"path"}
+                        and arguments["path"] == evidence[identifier]["path"], "Unbound consumer read path")
+    read_ids = {identifier for identifier, function in calls.items() if function["name"] == "read"}
+    require(read_ids == evidence.keys(), "Consumer read call/evidence mismatch")
+    for message in messages:
+        if message.get("role") != "tool":
+            continue
+        identifier = message.get("tool_call_id")
+        require(identifier in calls, "Unbound consumer tool result")
+        if identifier in read_ids:
+            require(identifier not in delivered, "Duplicate consumer read result")
+            delivered[identifier] = read_delivery(identifier, message.get("content"), evidence[identifier])
+    require(delivered.keys() == read_ids, "Missing consumer read result")
+    return list(delivered.values())
+
+
+def consumer_wire_matches(directory, number, raw):
+    """Bind the whole final body to the saved preview before any forwarding."""
+    events = [json.loads(line) for line in (directory / "trace.jsonl").read_bytes().splitlines()
+              if line.strip()]
+    previews = [event for event in events if event.get("kind") == "triage_preview"]
+    require([event["number"] for event in previews] == list(range(1, number + 1)),
+            "Missing/duplicate consumer preview")
+    preview_raw = (directory / f"previews/{number}.json").read_bytes()
+    require(sha256(preview_raw) == previews[-1]["sha256"], "Consumer preview hash changed")
+    expected = json.loads(preview_raw)
+    if number == 1:
+        acknowledgements = [tool for tool in expected["tools"]
+                            if tool.get("function", {}).get("name") == "governance_ack"]
+        require(len(acknowledgements) == 1, "Missing exact consumer governance tool")
+        expected["tools"] = acknowledgements
+        expected["tool_choice"] = {"type": "function", "function": {"name": "governance_ack"}}
+    def canonical(value):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    actual = json.loads(raw)
+    require(canonical(actual) == canonical(expected),
+            "Final consumer HTTP input differs from immutable preview/governance transformation")
+    return {"number": number, "preview_sha256": sha256(preview_raw),
+            "payload_sha256": sha256(raw), "first_governance_transform": number == 1,
+            "read_results": consumer_read_delivery(actual["messages"], events)}
+
+
 class Gateway:
     """An owned loopback capture boundary; fixed upstream, no arbitrary routes."""
     def __init__(self, contract, directory, arm, *, generation_capture=None):
@@ -468,6 +552,8 @@ class Gateway:
                             "Gateway deadline/closure before forwarding")
                     if generation_capture is not None:
                         record.update(generation_capture.admit(raw, number))
+                    else:
+                        record["consumer_preview_binding"] = consumer_wire_matches(directory, number, raw)
                     record["accepted"] = True
                     with httpx.Client(trust_env=False, follow_redirects=False,
                                       timeout=max(0.01, gateway.deadline - time.monotonic())) as client:
@@ -551,18 +637,7 @@ def wire_read_delivery(directory, records, events):
             call = message.get("tool_call_id")
             if message.get("role") != "tool" or call not in expected:
                 continue
-            content = message.get("content")
-            if isinstance(content, list):
-                content = "".join(c["text"] for c in content if c.get("type") == "text")
-            require(isinstance(content, str), "Missing transmitted read text")
-            body = content.encode("utf-8")
-            event = expected[call]
-            require(event["full_content_delivered"] is True
-                    and len(body) == event["raw_bytes"]
-                    and sha256(body) == event["raw_sha256"] == event["delivered_sha256"],
-                    "Transmitted read bytes differ from raw artifact")
-            delivered[call] = {"toolCallId": call, "path": event["path"],
-                               "bytes": len(body), "sha256": sha256(body)}
+            delivered[call] = read_delivery(call, message.get("content"), expected[call])
     require(expected and delivered.keys() == expected.keys(), "Exact read never reached provider payload")
     return list(delivered.values())
 

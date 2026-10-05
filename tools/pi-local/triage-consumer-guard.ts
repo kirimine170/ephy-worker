@@ -33,10 +33,13 @@ export default function (pi: ExtensionAPI) {
     if (event.toolName !== "read") return;
     const path = reads.get(event.toolCallId);
     reads.delete(event.toolCallId);
-    if (!path || event.isError) stop("Missing/error read result");
+    if (!path || event.isError || !Array.isArray(event.content)
+      || !event.content.every((v: any) => v !== null && typeof v === "object"
+        && v.type === "text" && typeof v.text === "string"
+        && Object.keys(v).every((key: string) => key === "type" || key === "text")))
+      stop("Missing/error/nontext read result");
     const raw = readFileSync(join(config.root, path));
-    const delivered = Buffer.from((event.content ?? []).filter((v: any) => v.type === "text")
-      .map((v: any) => v.text).join(""), "utf8");
+    const delivered = Buffer.from(event.content.map((v: any) => v.text).join(""), "utf8");
     const same = raw.equals(delivered);
     appendFileSync(process.env.EPHY_FORMAL_TRACE!, JSON.stringify({
       kind: "triage_exact_read", toolCallId: event.toolCallId, path,
@@ -48,7 +51,7 @@ export default function (pi: ExtensionAPI) {
   });
   // This is before the final governance hook, so it is explicitly a preview,
   // never claimed as the transmitted payload. The controller captures the
-  // actual final HTTP body and uses this tool-definition superset for preflight.
+  // actual final HTTP body and verifies this hash-bound preview before forwarding.
   pi.on("before_provider_request", (event: any) => {
     if (!Array.isArray(event.payload?.tools)) stop("Missing consumer tool definitions");
     const payload = { ...event.payload, tools: event.payload.tools
@@ -61,8 +64,13 @@ export default function (pi: ExtensionAPI) {
         strict: true,
       } }) };
     try {
+      const raw = JSON.stringify(payload);
       writeFileSync(join(config.previews, String(++requests) + ".json"),
-        JSON.stringify(payload), { flag: "wx" });
+        raw, { flag: "wx" });
+      appendFileSync(process.env.EPHY_FORMAL_TRACE!, JSON.stringify({
+        kind: "triage_preview", number: requests,
+        sha256: createHash("sha256").update(raw, "utf8").digest("hex"),
+      }) + "\n");
     } catch { stop("Cannot retain provider preview"); }
     return payload;
   });

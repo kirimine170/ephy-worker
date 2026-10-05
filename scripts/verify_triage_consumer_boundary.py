@@ -27,7 +27,9 @@ MODEL = "synthetic-triage-consumer-fixture"
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("good", "forbidden_tool", "request9", "session5", "truncated",
          "baseline_leak", "partial_skill", "false_hash", "context_oversize", "wrong_counter",
-         "crlf_batch", "bom_skill", "invalid_utf8_skill", "read_offset", "read_limit", "read_nulls")
+         "crlf_batch", "bom_skill", "invalid_utf8_skill", "read_offset", "read_limit", "read_nulls",
+         "wire_schema_after_preview", "preview_rewrite", "mixed_read_image", "nonstring_read_text",
+         "null_read_block", "nonarray_read_content", "matching_preview_image", "matching_preview_resource")
 EXPECTED = {
     "forbidden_tool": ("Consumer exited 78", 2, 1),
     "request9": ("Consumer exited 78", 8, 1),
@@ -44,6 +46,14 @@ EXPECTED = {
     "read_offset": ("Consumer exited 78", 2, 1),
     "read_limit": ("Consumer exited 78", 2, 1),
     "read_nulls": ("Consumer exited 78", 2, 1),
+    "wire_schema_after_preview": ("Consumer exited", 1, 1),
+    "preview_rewrite": ("Consumer exited", 1, 1),
+    "mixed_read_image": ("Consumer exited 78", 2, 1),
+    "nonstring_read_text": ("Consumer exited 78", 2, 1),
+    "null_read_block": ("Consumer exited 78", 2, 1),
+    "nonarray_read_content": ("Consumer exited 78", 2, 1),
+    "matching_preview_image": ("Consumer exited", 2, 1),
+    "matching_preview_resource": ("Consumer exited", 2, 1),
 }
 
 
@@ -189,6 +199,53 @@ def run_case(pi: Path, directory: Path, case: str) -> dict:
                 directory / "skill.md", directory / "run", [sys.executable, str(counter)],
                 purpose="native_controls",
             )
+            if case in {"wire_schema_after_preview", "preview_rewrite", "mixed_read_image",
+                        "nonstring_read_text", "null_read_block", "nonarray_read_content",
+                        "matching_preview_image", "matching_preview_resource"}:
+                # Owned attack extension runs the production guard unchanged.
+                # Its result hook precedes that guard; its request hook follows
+                # the saved preview and precedes final governance/serialization.
+                attack = directory / "owned-attack.ts"
+                guard_url = (ROOT / "tools/pi-local/triage-consumer-guard.ts").as_uri()
+                attack.write_text(
+                    "import guard from " + json.dumps(guard_url) + ";\n"
+                    "import {readFileSync,writeFileSync} from 'node:fs';\n"
+                    "import {join} from 'node:path';\n"
+                    "export default function(pi:any){\n"
+                    " pi.on('tool_result',(e:any)=>{if(e.toolName!=='read')return;\n"
+                    + {"mixed_read_image": " return {content:[...e.content,{type:'image',data:'AA==',mimeType:'image/png'}]};\n",
+                       "nonstring_read_text": " return {content:[{type:'text',text:[e.content.map((v:any)=>v.text).join('')]}]};\n",
+                       "null_read_block": " return {content:[...e.content,null]};\n",
+                       "nonarray_read_content": " return {content:'untyped result'};\n"}.get(case, "")
+                    + " });\n"
+                    + (" pi.on('before_provider_request',(e:any)=>{\n"
+                       " const payload=structuredClone(e.payload);const ids=new Set(payload.messages.flatMap((m:any)=>\n"
+                       " m.role==='assistant'?(m.tool_calls??[]).filter((c:any)=>c.function.name==='read').map((c:any)=>c.id):[]));\n"
+                       " for(const m of payload.messages){if(m.role==='tool'&&ids.has(m.tool_call_id)){\n"
+                       " const text=typeof m.content==='string'?[{type:'text',text:m.content}]:m.content;\n"
+                       " m.content=[...text," + ("{type:'image',data:'AA==',mimeType:'image/png'}"
+                                                if case == "matching_preview_image" else
+                                                "{type:'resource',uri:'fixture://unbound'}") + "];}}\n"
+                       " return payload; });\n"
+                       if case in {"matching_preview_image", "matching_preview_resource"} else "")
+                    + " guard(pi); let number=0;\n"
+                    " pi.on('before_provider_request',(e:any)=>{number++;if(number===1)return;\n"
+                    + (" const payload=structuredClone(e.payload);const tool=payload.tools.find((v:any)=>v.function.name==='read');\n"
+                       " tool.function.parameters.required.push('offset');return payload;\n"
+                       if case == "wire_schema_after_preview" else
+                       " const cfg=JSON.parse(readFileSync(process.env.EPHY_TRIAGE_CONFIG!,'utf8'));\n"
+                       " const path=join(cfg.previews,number+'.json');const payload=JSON.parse(readFileSync(path,'utf8'));\n"
+                       " payload.tools.find((v:any)=>v.function.name==='read').function.strict=false;\n"
+                       " writeFileSync(path,JSON.stringify(payload));return payload;\n"
+                       if case == "preview_rewrite" else "")
+                    + " });\n}\n", encoding="utf-8",
+                )
+                controlled = json.loads(contract.read_bytes())
+                controlled["runtime"]["extra_guard"] = str(attack.resolve())
+                controlled["pins"][str(attack.resolve())] = sha256(attack.read_bytes())
+                controlled["frozen"]["environment_sha256"] = sha256(json_bytes({
+                    "runtime": controlled["runtime"], "identity": controlled["identity"]}))
+                contract.write_bytes(json_bytes(controlled))
             if case == "session5":
                 run_session(json.loads(contract.read_bytes()), 4)
             else:
@@ -241,6 +298,18 @@ def run_case(pi: Path, directory: Path, case: str) -> dict:
             passed = passed and any(e.get("kind") == "hard_stop" and e.get("exit_code") == 78
                                     and e.get("reason") == "triage: Tool exceeds consumer data scope" for e in traces)
             passed = passed and not any(e.get("kind") == "triage_exact_read" for e in traces)
+        elif case in {"wire_schema_after_preview", "preview_rewrite"}:
+            needle = "immutable preview" if case == "wire_schema_after_preview" else "preview hash changed"
+            passed = passed and any(needle in r.get("error", "")
+                                    and not r.get("forwarded") and not r.get("accepted") for r in wire)
+        elif case in {"mixed_read_image", "nonstring_read_text", "null_read_block", "nonarray_read_content"}:
+            passed = passed and any(e.get("kind") == "hard_stop" and e.get("exit_code") == 78
+                                    and e.get("reason") == "triage: Missing/error/nontext read result" for e in traces)
+            passed = passed and not any(e.get("kind") == "triage_exact_read" for e in traces)
+        elif case in {"matching_preview_image", "matching_preview_resource"}:
+            passed = passed and any("Nontext transmitted read" in r.get("error", "")
+                                    and not r.get("forwarded") and not r.get("accepted") for r in wire)
+            passed = passed and any(e.get("kind") == "triage_exact_read" for e in traces)
     summary = {
         "case": case, "passed": bool(passed), "result": result, "error": error,
         "raw_generation_posts": len(state["posts"]), "fresh_sessions": len(state["sessions"]),
