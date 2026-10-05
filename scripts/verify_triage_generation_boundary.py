@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import httpx
+from jsonschema import Draft7Validator
 
 from ephy_worker.strata_runtime import process_identity
 from ephy_worker.verifier_triage_consumer import json_bytes, payload_strings
@@ -30,17 +31,50 @@ from ephy_worker.verifier_triage_isolation import (
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("good", "missing", "batch_leak", "gold_leak", "duplicate", "session", "hash", "tool_substitution",
-         "freeze_change")
+         "freeze_change", "read_offset", "read_limit", "read_nulls", "search_tool")
 REASONS = {"missing": "FileNotFoundError", "batch_leak": "Held-out/gold leakage",
            "gold_leak": "Held-out/gold leakage", "duplicate": "already failed",
            "session": "Wrong generation session", "hash": "Earlier captured file changed",
-           "tool_substitution": "Tool-result bytes substituted", "freeze_change": "Frozen artifact changed"}
+           "tool_substitution": "Tool-result bytes substituted", "freeze_change": "Frozen artifact changed",
+           "read_offset": "78", "read_limit": "78", "read_nulls": "78", "search_tool": "78"}
 ADAPTER_CASES = ("adapter_good", "adapter_lock", "adapter_capture_cap", "adapter_thinking",
                  "invalid_duplicate", "invalid_answer", "invalid_evidence", "invalid_diagnosis", "invalid_allstop",
                  "invalid_unattributed_component", "invalid_unattributed_stale_ci",
                  "invalid_match_stale_ci", "invalid_component_stale_ci", "invalid_ci_schema",
                  "adapter_missing", "adapter_batch_leak", "adapter_gold_leak", "adapter_runtime_change", "adapter_rebound_lock",
                  "adapter_lock_pin", "adapter_nonlock_pin_change")
+
+
+def tool_schema_evidence(payload, role, bootstrap, *, consumer=False, treatment=False):
+    """Assert the interface actually transmitted by Pi, after all payload hooks."""
+    definitions = {tool["function"]["name"]: tool["function"] for tool in payload["tools"]}
+    assert len(definitions) == len(payload["tools"]), "Duplicate tool definition"
+    expected = {"governance_ack"} if bootstrap else ({"read", "write"}
+               if role == "implementer" and not consumer else {"read"})
+    assert set(definitions) == expected, "Role-external tool exposed on wire"
+    assert 0 < payload["max_tokens"] <= 1024 and "max_completion_tokens" not in payload
+    if not bootstrap:
+        read = definitions["read"]
+        schema = read["parameters"]
+        assert schema["type"] == "object" and schema["required"] == ["path"]
+        assert set(schema["properties"]) == {"path"} and schema["additionalProperties"] is False
+        assert read["strict"] is True and schema["properties"]["path"]["enum"]
+        assert "offset, limit" in read["description"] and "prohibited" in read["description"]
+        if consumer:
+            from ephy_worker.verifier_triage_evaluation import BATCH_PATH
+            assert set(schema["properties"]["path"]["enum"]) == (
+                {BATCH_PATH, SKILL_PATH} if treatment else {BATCH_PATH})
+        if "write" in definitions:
+            write = definitions["write"]["parameters"]
+            assert write["properties"]["path"]["enum"] == [SKILL_PATH]
+            assert set(write["properties"]) == {"path", "content"}
+            assert write["additionalProperties"] is False
+    return definitions
+
+
+def validate_scripted_calls(definitions, calls):
+    for name, arguments in calls:
+        Draft7Validator(definitions[name]["parameters"]).validate(arguments)
 
 
 def run_adapter_case(pi, directory, case):
@@ -123,7 +157,7 @@ def run_adapter_case(pi, directory, case):
         controls.append({"name": name, "actual": result.returncode, "expected": 0 if name == "known_good" else 1})
     controls_path = directory/"checker-controls.json"
     controls_path.write_bytes(json_bytes(controls))
-    state = {"posts": 0, "nonces": set()}
+    state = {"posts": 0, "nonces": set(), "wire_schema_checks": 0}
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -151,6 +185,10 @@ def run_adapter_case(pi, directory, case):
             nonce = re.search(r"Acknowledgement-Nonce: ([^\s]+)", strings).group(1)
             state["nonces"].add(nonce)
             role = re.search(r"Role: ([^\s]+)", strings).group(1)
+            consumer = PROMPT in strings
+            definitions = tool_schema_evidence(payload, role, "Acknowledgement-State: required" in strings,
+                                               consumer=consumer, treatment="Treatment:" in strings)
+            state["wire_schema_checks"] += 1
             calls, text = [], None
             results = [m for m in payload["messages"] if m.get("role") == "tool"]
             if "Acknowledgement-State: required" in strings:
@@ -178,6 +216,7 @@ def run_adapter_case(pi, directory, case):
                 calls = [("write", {"path": SKILL_PATH, "content": development_skill().decode()})]
             else:
                 text = "DONE"
+            validate_scripted_calls(definitions, calls)
             delta = {"role": "assistant"}
             if calls:
                 delta["tool_calls"] = [{"index": index, "id": f"adapter-{name}-{state['posts']}-{index}",
@@ -348,6 +387,7 @@ def run_adapter_case(pi, directory, case):
     else:
         passed = error is not None and reasons[case] in error and state["posts"] == 0
     summary = {"case": case, "passed": bool(passed), "fake_posts": state["posts"], "fresh_sessions": len(state["nonces"]),
+               "wire_schema_checks": state["wire_schema_checks"],
                "error": error, "generation": result, "consumer": consumer_result, "live_domain_rejection": live_rejection,
                "admission_errors": admission_errors, "unmocked_adapter": True, "real_model_generations": 0,
                "resource_lock_exists_before_pinning": True,
@@ -368,7 +408,7 @@ def run_case(pi, directory, case):
                        f"print(json.dumps({{'payload_sha256':hashlib.sha256(b).hexdigest(),"
                        f"'model_id':{FAKE_MODEL!r},'input_tokens':4000,'synthetic_counter':True}}))\n",
                        encoding="utf-8")
-    state = {"posts": 0, "nonces": set(), "duplicate_status": None}
+    state = {"posts": 0, "nonces": set(), "duplicate_status": None, "wire_schema_checks": 0}
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -393,6 +433,8 @@ def run_case(pi, directory, case):
             nonce = re.search(r"Acknowledgement-Nonce: ([^\s]+)", strings).group(1)
             state["nonces"].add(nonce)
             role = re.search(r"Role: ([^\s]+)", strings).group(1)
+            definitions = tool_schema_evidence(payload, role, "Acknowledgement-State: required" in strings)
+            state["wire_schema_checks"] += 1
             stage = directory / "run" / role
             if state["posts"] == 2 and case != "good":
                 if case == "missing":
@@ -439,6 +481,16 @@ def run_case(pi, directory, case):
                 calls = [("write", {"path": SKILL_PATH, "content": development_skill().decode()})]
             else:
                 text = "DONE"
+            if state["posts"] == 2 and case in {"read_offset", "read_limit", "read_nulls", "search_tool"}:
+                if case == "search_tool":
+                    calls = [("ls", {"path": "."})]
+                else:
+                    calls = [("read", {"path": "authoring/task.md", **{
+                        "read_offset": {"offset": 1}, "read_limit": {"limit": 1},
+                        "read_nulls": {"offset": None, "limit": None},
+                    }[case]})]
+            else:
+                validate_scripted_calls(definitions, calls)
             delta = {"role": "assistant"}
             if calls:
                 delta["tool_calls"] = [{"index": i, "id": f"generation-{state['posts']}-{i}", "type": "function",
@@ -492,7 +544,14 @@ def run_case(pi, directory, case):
               else error is not None and REASONS[case] in error and state["posts"] == 2)
     if case == "duplicate":
         passed = passed and state["duplicate_status"] == 409
+    if case in {"read_offset", "read_limit", "read_nulls", "search_tool"}:
+        trace = [json.loads(line) for line in (directory / "run/planner/trace.jsonl").read_bytes().splitlines()]
+        passed = passed and any(e.get("kind") == "hard_stop" and e.get("exit_code") == 78
+                                and e.get("reason") == "Tool exceeds closed generation scope" for e in trace)
+        passed = passed and not any(e.get("kind") == "generation_tool_call"
+                                    and e.get("name") != "governance_ack" for e in trace)
     summary = {"case": case, "passed": passed, "fake_posts": state["posts"],
+               "wire_schema_checks": state["wire_schema_checks"],
                "fresh_sessions": len(state["nonces"]), "error": error, "result": result,
                "independent_verifier": verifier, "real_model_generations": 0}
     (directory/"summary.json").write_text(json.dumps(summary, indent=2)+"\n", encoding="utf-8")

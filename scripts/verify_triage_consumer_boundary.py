@@ -10,6 +10,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from verify_triage_generation_boundary import tool_schema_evidence, validate_scripted_calls
+
 from ephy_worker.strata_runtime import process_identity
 from ephy_worker.verifier_triage_consumer import (
     build_contract,
@@ -25,7 +27,7 @@ MODEL = "synthetic-triage-consumer-fixture"
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("good", "forbidden_tool", "request9", "session5", "truncated",
          "baseline_leak", "partial_skill", "false_hash", "context_oversize", "wrong_counter",
-         "crlf_batch", "bom_skill", "invalid_utf8_skill")
+         "crlf_batch", "bom_skill", "invalid_utf8_skill", "read_offset", "read_limit", "read_nulls")
 EXPECTED = {
     "forbidden_tool": ("Consumer exited 78", 2, 1),
     "request9": ("Consumer exited 78", 8, 1),
@@ -39,6 +41,9 @@ EXPECTED = {
     "crlf_batch": ("canonical UTF-8/LF", 0, 0),
     "bom_skill": ("canonical UTF-8/LF", 0, 0),
     "invalid_utf8_skill": ("not valid UTF-8", 0, 0),
+    "read_offset": ("Consumer exited 78", 2, 1),
+    "read_limit": ("Consumer exited 78", 2, 1),
+    "read_nulls": ("Consumer exited 78", 2, 1),
 }
 
 
@@ -71,7 +76,7 @@ def run_case(pi: Path, directory: Path, case: str) -> dict:
         f"'model_id':{MODEL!r},'input_tokens':{count},'synthetic_counter':True}}))\n",
         encoding="utf-8",
     )
-    state = {"posts": [], "sessions": set()}
+    state = {"posts": [], "sessions": set(), "wire_schema_checks": 0}
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -101,6 +106,9 @@ def run_case(pi: Path, directory: Path, case: str) -> dict:
             state["posts"].append({"sha256": sha256(raw), "max_tokens": payload.get("max_tokens"),
                                    "alias": payload.get("max_completion_tokens")})
             treatment = "Treatment:" in strings
+            definitions = tool_schema_evidence(payload, "planner", "Acknowledgement-State: required" in strings,
+                                               consumer=True, treatment=treatment)
+            state["wire_schema_checks"] += 1
             calls, text = [], None
             if "Acknowledgement-State: required" in strings:
                 arguments = {
@@ -114,6 +122,9 @@ def run_case(pi: Path, directory: Path, case: str) -> dict:
                 calls = [("write", {"path": "escape.txt", "content": "must not be written"})]
             elif expected[0]["id"] not in strings or case == "request9":
                 calls = [("read", {"path": BATCH_PATH})]
+                if case in {"read_offset", "read_limit", "read_nulls"}:
+                    calls[0][1].update({"read_offset": {"offset": 1}, "read_limit": {"limit": 1},
+                                       "read_nulls": {"offset": None, "limit": None}}[case])
                 if treatment:
                     args = {"path": SKILL_PATH}
                     if case == "partial_skill":
@@ -131,6 +142,8 @@ def run_case(pi: Path, directory: Path, case: str) -> dict:
                 }, separators=(",", ":"))
                 if case == "truncated":
                     text = text[:-2]
+            if case not in {"forbidden_tool", "partial_skill", "read_offset", "read_limit", "read_nulls"}:
+                validate_scripted_calls(definitions, calls)
             delta = {"role": "assistant"}
             if text is not None:
                 delta["content"] = text
@@ -224,9 +237,14 @@ def run_case(pi: Path, directory: Path, case: str) -> dict:
                       "context_oversize": "exceeds context",
                       "wrong_counter": "Tokenizer measured different"}[case]
             passed = passed and any(needle in r.get("error", "") for r in wire)
+        elif case in {"read_offset", "read_limit", "read_nulls"}:
+            passed = passed and any(e.get("kind") == "hard_stop" and e.get("exit_code") == 78
+                                    and e.get("reason") == "triage: Tool exceeds consumer data scope" for e in traces)
+            passed = passed and not any(e.get("kind") == "triage_exact_read" for e in traces)
     summary = {
         "case": case, "passed": bool(passed), "result": result, "error": error,
         "raw_generation_posts": len(state["posts"]), "fresh_sessions": len(state["sessions"]),
+        "wire_schema_checks": state["wire_schema_checks"],
         "cap_fields": state["posts"], "violations": violations,
         "full_byte_batch_reads": len(full_batch), "full_byte_skill_reads": len(full_skill),
         "synthetic_only": True, "real_model_contacted": False,

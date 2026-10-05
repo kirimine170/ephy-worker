@@ -47,6 +47,23 @@ export default function (pi: ExtensionAPI) {
       && typeof input.content === "string" && Object.keys(input).length === 2) return;
     stop("Tool exceeds closed generation scope");
   }
+  function narrow(payload: any) {
+    if (!Array.isArray(payload?.tools)) stop("Missing generation tool definitions");
+    const names = new Set(["governance_ack", "read", ...(cfg.role === "implementer" ? ["write"] : [])]);
+    const tools = payload.tools.filter((tool: any) => names.has(tool?.function?.name)).map((tool: any) => {
+      if (tool.function.name !== "read" && tool.function.name !== "write") return tool;
+      const writing = tool.function.name === "write";
+      return { ...tool, function: { ...tool.function,
+        description: writing ? "Write only the frozen Markdown skill path with its complete content."
+          : "Read one permitted text file completely and byte-exactly. Supply only path; offset, limit, partial reads and other arguments are prohibited.",
+        parameters: { type: "object", required: writing ? ["path", "content"] : ["path"],
+          properties: { path: { type: "string", enum: writing
+            ? [".agents/skills/ephy-verifier-triage/SKILL.md"] : cfg.allowed_reads },
+            ...(writing ? { content: { type: "string" } } : {}) }, additionalProperties: false },
+        strict: true } };
+    });
+    return { ...payload, tools };
+  }
   record("generation_start", { config_sha256: hash(rawConfig), pid: process.pid });
   pi.on("tool_call", (e: any) => {
     check(e.toolName, e.input);
@@ -70,11 +87,13 @@ export default function (pi: ExtensionAPI) {
   });
   pi.on("before_provider_request", (e: any) => {
     if (pending.size) stop("Unfinished tool result");
-    const raw = Buffer.from(JSON.stringify(e.payload), "utf8");
+    const payload = narrow(e.payload);
+    const raw = Buffer.from(JSON.stringify(payload), "utf8");
     const number = ++requests;
     budget(raw.length);
     writeFileSync(join(cfg.previews, number + ".json"), raw, {flag: "wx"});
     record("generation_preview", { number, sha256: hash(raw) });
+    return payload;
   });
   pi.on("message_end", (e: any) => {
     if (e.message?.role !== "assistant") return;

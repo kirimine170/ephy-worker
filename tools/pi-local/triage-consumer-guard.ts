@@ -22,7 +22,8 @@ export default function (pi: ExtensionAPI) {
   }
   function check(name: string, input: any) {
     if (name === "governance_ack") return;
-    if (name !== "read" || !allowed.has(input?.path)) stop("Tool exceeds consumer data scope");
+    if (name !== "read" || Object.keys(input ?? {}).length !== 1
+      || !allowed.has(input?.path)) stop("Tool exceeds consumer data scope");
   }
   pi.on("tool_call", (event: any) => {
     check(event.toolName, event.input);
@@ -49,10 +50,21 @@ export default function (pi: ExtensionAPI) {
   // never claimed as the transmitted payload. The controller captures the
   // actual final HTTP body and uses this tool-definition superset for preflight.
   pi.on("before_provider_request", (event: any) => {
+    if (!Array.isArray(event.payload?.tools)) stop("Missing consumer tool definitions");
+    const payload = { ...event.payload, tools: event.payload.tools
+      .filter((tool: any) => ["governance_ack", "read"].includes(tool?.function?.name))
+      .map((tool: any) => tool.function.name !== "read" ? tool : { ...tool, function: {
+        ...tool.function,
+        description: "Read one permitted text file completely and byte-exactly. Supply only path; offset, limit, partial reads and other arguments are prohibited.",
+        parameters: { type: "object", required: ["path"],
+          properties: { path: { type: "string", enum: [...allowed] } }, additionalProperties: false },
+        strict: true,
+      } }) };
     try {
       writeFileSync(join(config.previews, String(++requests) + ".json"),
-        JSON.stringify(event.payload), { flag: "wx" });
+        JSON.stringify(payload), { flag: "wx" });
     } catch { stop("Cannot retain provider preview"); }
+    return payload;
   });
   pi.on("message_end", (event: any) => {
     if (event.message?.role !== "assistant") return;
