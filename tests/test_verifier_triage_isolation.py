@@ -164,6 +164,7 @@ def test_external_adapter_binds_existing_job_and_original_caps(monkeypatch, tmp_
            "runtime": {"thinking": {"planner": "off", "implementer": "off"}, "resource_lock": str(tmp_path/"lock")}}
     identity = {"model_id": "fixed-existing-model"}
     freeze = {"identity": identity, "runtime": {"extra_guard": required[1]},
+              "pins": dict(contract["runtime_hashes"]),
               "generation_binding": {"job_id": job["id"], "base": BASE_REVISION,
                                      "contract_sha256": sha256(isolation.encode(contract)),
                                      "runtime_sha256": sha256(isolation.encode(job["runtime"])), "job_dir": job["jobDir"],

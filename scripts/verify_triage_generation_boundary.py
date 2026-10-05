@@ -39,7 +39,8 @@ ADAPTER_CASES = ("adapter_good", "adapter_lock", "adapter_capture_cap", "adapter
                  "invalid_duplicate", "invalid_answer", "invalid_evidence", "invalid_diagnosis", "invalid_allstop",
                  "invalid_unattributed_component", "invalid_unattributed_stale_ci",
                  "invalid_match_stale_ci", "invalid_component_stale_ci", "invalid_ci_schema",
-                 "adapter_missing", "adapter_batch_leak", "adapter_gold_leak", "adapter_runtime_change", "adapter_rebound_lock")
+                 "adapter_missing", "adapter_batch_leak", "adapter_gold_leak", "adapter_runtime_change", "adapter_rebound_lock",
+                 "adapter_lock_pin", "adapter_nonlock_pin_change")
 
 
 def run_adapter_case(pi, directory, case):
@@ -239,7 +240,11 @@ def run_adapter_case(pi, directory, case):
                    "thinking": {r: "off" for r in ("planner", "implementer", "auditor")}}
         if case == "adapter_thinking":
             runtime["thinking"]["planner"] = "medium"
-        pins = [Path(v) for v in runtime.values() if isinstance(v, str) and Path(v).is_file()]
+        # Existing deployments already have their coordination file before pinning.
+        Path(runtime["resource_lock"]).write_bytes(b"0")
+        pins = formal.runtime_artifact_paths(runtime)
+        if case == "adapter_lock_pin":
+            pins.append(Path(runtime["resource_lock"]))
         pins += list((ROOT/"src/ephy_worker").rglob("*.py"))
         pins += [ROOT/name for name in formal.CONTROL_PATHS.values()]
         pins += [Path(p) for p in formal.injected_context_pins(runtime, {n: sha256((ROOT/p).read_bytes())
@@ -279,6 +284,9 @@ def run_adapter_case(pi, directory, case):
             freeze = freeze_generation(ROOT, pi, identity, directory/"batch.json", directory/"gold.json",
                                        directory/"run", [sys.executable, str(counter)], generation_job=job_path)
             expected = sha256(freeze.read_bytes())
+            if case == "adapter_nonlock_pin_change":
+                with (managed/"settings.json").open("ab") as stream:
+                    stream.write(b"\n")
             if case == "adapter_runtime_change":
                 job["runtime"]["resource_lock"] = str(directory/"different-resource.lock")
                 job_path.write_bytes(json_bytes(job))
@@ -320,7 +328,9 @@ def run_adapter_case(pi, directory, case):
                "invalid_match_stale_ci": "Stale CI requires STOP/STALE_CI",
                "invalid_component_stale_ci": "Stale CI requires STOP/STALE_CI",
                "invalid_ci_schema": "Malformed CI evidence",
-               "adapter_runtime_change": "Generation freeze belongs to another external job"}
+               "adapter_runtime_change": "Generation freeze belongs to another external job",
+               "adapter_lock_pin": "coordination path",
+               "adapter_nonlock_pin_change": "Frozen artifact changed"}
     admission_errors = [json.loads(p.read_bytes()).get("error") for p in (directory/"run/planner").glob("http-*.receipt.json")]
     if case in {"adapter_missing", "adapter_batch_leak", "adapter_gold_leak"}:
         reason = "FileNotFoundError" if case == "adapter_missing" else "Held-out/gold leakage"
@@ -330,13 +340,18 @@ def run_adapter_case(pi, directory, case):
                   and state["posts"] == 7 and len(state["nonces"]) == 2 and consumer_result is None)
     elif case == "adapter_good":
         passed = (error is None and result is not None and consumer_result is not None
+                  and str(Path(runtime["resource_lock"]).resolve()) not in contract["runtime_hashes"]
+                  and str(Path(runtime["resource_lock"]).resolve()) not in json.loads(freeze.read_bytes())["pins"]
+                  and str(Path(runtime["resource_lock"]).resolve()) not in json.loads(consumer.read_bytes())["pins"]
                   and consumer_result["synthetic_generation_capture_verified"] and not consumer_result["live_execution_attested"]
                   and live_rejection and state["posts"] == 19 and len(state["nonces"]) == 6)
     else:
         passed = error is not None and reasons[case] in error and state["posts"] == 0
     summary = {"case": case, "passed": bool(passed), "fake_posts": state["posts"], "fresh_sessions": len(state["nonces"]),
                "error": error, "generation": result, "consumer": consumer_result, "live_domain_rejection": live_rejection,
-               "admission_errors": admission_errors, "unmocked_adapter": True, "real_model_generations": 0}
+               "admission_errors": admission_errors, "unmocked_adapter": True, "real_model_generations": 0,
+               "resource_lock_exists_before_pinning": True,
+               "resource_lock_content_pinned": str(Path(runtime["resource_lock"]).resolve()) in contract["runtime_hashes"]}
     (directory/"summary.json").write_text(json.dumps(summary, indent=2)+"\n", encoding="utf-8")
     return summary
 

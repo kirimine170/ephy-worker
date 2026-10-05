@@ -105,6 +105,7 @@ def freeze_generation(repository, pi, identity, batch, gold, directory, token_ar
     task = TASK
     if generation_job:
         job = load(generation_job)
+        c.validate_resource_lock_pins(job["runtime"].get("resource_lock"), job["contract"]["runtime_hashes"])
         c.validate_generation_budget(job)
         c.require(not directory.resolve().is_relative_to(Path(job["worktreePath"]).resolve()),
                   "Private freeze inside generation root")
@@ -582,6 +583,7 @@ class IsolatedStrataRunner(StrataRunner):
         self.isolation = frozen(freeze_path, expected)
         super().__init__(job_file)
         c = helpers()
+        c.validate_resource_lock_pins(self.runtime["resource_lock"], self.isolation["pins"])
         binding = self.isolation["generation_binding"]
         c.require(binding is not None and binding == {
             "job_id": self.job["id"], "base": self.job["baseRevision"],

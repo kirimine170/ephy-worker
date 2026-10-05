@@ -147,6 +147,25 @@ def snapshot_hash(root: Path) -> str:
     return digest(encode(snapshot(root)))
 
 
+def validate_resource_lock_pins(resource_lock, pins) -> None:
+    """A coordination path is runtime identity, never immutable file content."""
+    if resource_lock is None:
+        return
+    lock = Path(resource_lock).resolve()
+    for name in pins:
+        artifact = Path(name).resolve()
+        if artifact == lock or (artifact.is_file() and lock.is_file() and artifact.samefile(lock)):
+            raise GateFailure("Resource lock is a coordination path, not an immutable content pin")
+
+
+def runtime_artifact_paths(runtime: dict) -> list[Path]:
+    """Classify the one coordination field before constructing content pins."""
+    paths = [Path(value) for key, value in runtime.items()
+             if key != "resource_lock" and isinstance(value, str) and Path(value).is_file()]
+    validate_resource_lock_pins(runtime.get("resource_lock"), paths)
+    return paths
+
+
 @contextmanager
 def exclusive_lock(path: Path):
     """Kernel-held singleton lock; crash releases it, metadata never grants ownership."""
@@ -634,6 +653,8 @@ class FormalRunner:
         self.candidate = Path(self.job["worktreePath"]).resolve()
         self.repository = Path(self.job["repoRoot"]).resolve()
         self.runtime = self.job["runtime"]
+        if "resource_lock" in self.runtime:
+            validate_resource_lock_pins(self.runtime["resource_lock"], self.contract["runtime_hashes"])
         self.events: list[dict] = []
         self.provenance: list[dict] = []
         self.transcripts: list[dict] = []
@@ -1546,6 +1567,7 @@ def freeze_submission_identity(draft: dict, *, observation: dict | None = None) 
         raise GateFailure("Verifier identity freeze requires an unfrozen submission draft")
     spec = copy.deepcopy(draft)
     validate_contract(spec["contract"])
+    validate_resource_lock_pins(spec["runtime"].get("resource_lock"), spec["contract"]["runtime_hashes"])
     spec["verifier_identity"] = observed_verifier_identity(
         spec["runtime"], spec["contract"], observation=observation
     )
@@ -1565,6 +1587,7 @@ def submit(spec: dict, root: Path) -> Path:
         "verifier_identity",
     }:
         raise GateFailure("Unexpected/missing formal submission fields")
+    validate_resource_lock_pins(spec["runtime"].get("resource_lock"), spec["contract"]["runtime_hashes"])
     root.mkdir(parents=True, exist_ok=True)
     identifier = "bg-" + time.strftime("%Y%m%d%H%M%S", time.gmtime()) + "-" + uuid.uuid4().hex[:6]
     directory = root / "jobs" / identifier

@@ -28,6 +28,7 @@ from .formal_runtime import (
     final_assistant_text,
     stage_evidence,
     stop_tree,
+    validate_resource_lock_pins,
 )
 from .strata_runtime import verify_external_proposal, verify_identity
 from .verifier_triage_evaluation import (
@@ -120,6 +121,7 @@ def snapshot(root):
 
 
 def intact(contract):
+    validate_resource_lock_pins(contract.get("resource_lock"), contract["pins"])
     for name, expected in contract["pins"].items():
         path = Path(name)
         require(not path.is_symlink() and not path.is_junction() and path.is_file(), "Missing/linked frozen artifact")

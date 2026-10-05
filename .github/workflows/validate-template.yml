@@ -69,6 +69,7 @@ jobs:
           uv run ruff check src/ephy_worker/formal_artifacts.py
           src/ephy_worker/formal_runtime.py src/ephy_worker/formal_campaign.py
           tests/test_formal_runtime.py src/ephy_worker/coding_executor.py
+          tests/test_resource_lock.py
           tests/test_coding_executor.py
           src/ephy_worker/strata_runtime.py tests/test_strata_runtime.py
           scripts/verify_pi_request_boundary.py

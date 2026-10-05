@@ -270,3 +270,9 @@ verify_live_binding rejects the fake deployment; verify_native_binding verifies
 its same-job provenance before native consumer
 admission. Native result flags retain live execution/isolation authorization
 as false. These fixtures establish composed infrastructure behavior only.
+
+## Shared resource lock identity
+
+The existing resource lock is a coordination path bound by the canonical job runtime and generation binding, then copied unchanged into the consumer contract. Its bytes do not represent executable or configuration identity and are not immutable content pins. Build runtime content pins with `formal_runtime.runtime_artifact_paths`; only the `resource_lock` field is excluded. All executable, configuration, governance and capture pins retain their existing hash checks. A contract that includes the lock path or a hard-link alias in its content pins is rejected before lock acquisition; existing contracts are never silently rewritten.
+
+Windows mandatory byte locking denies content reads through a second file handle even in the owning process. The actual adapter fixture therefore creates the shared lock before collecting runtime pins, matching an existing deployment. It checks a successful generation and four consumers, contention with zero requests, changed runtime lock binding, and modified non-lock artifacts. The kernel exclusive lock still spans the full authoring workflow and all four consumer sessions. This change does not authorize a retry of a stopped trial; any later live trial needs a new ID, new freeze and admission.
