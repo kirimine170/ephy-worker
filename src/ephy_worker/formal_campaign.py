@@ -228,9 +228,10 @@ def run_campaign(plan_file: Path, state_root: Path, *, resume: bool = False) -> 
                 state["consecutive_failures"] = 0 if valid else state["consecutive_failures"] + 1
                 state["next_index"] += 1
                 state["active_job"] = None
-                save()
                 if job["status"] == "planner_stopped":
                     state.update(status="stopped", reason=PLANNER_STOP_REASON)
+                save()
+                if job["status"] == "planner_stopped":
                     break
                 if (
                     spec["runtime"].get("backend") == "external_strata"

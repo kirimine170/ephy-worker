@@ -274,3 +274,66 @@ def test_campaign_stops_at_plan_and_resume_preserves_it(tmp_path, monkeypatch):
     assert resumed["status"] == "stopped"
     assert resumed["reason"] == "Planner-only boundary reached; no next job is authorized"
     assert len(calls) == 1 and calls[0].read_bytes() == job_bytes
+
+def test_later_planner_stop_survives_termination_after_checkpoint(tmp_path, monkeypatch):
+    spec = verifier_draft(verifier_runner(tmp_path))
+    spec["runtime"]["resource_lock"] = str(tmp_path / "lock")
+    spec["contract"].update(planner_only=False, max_repairs=0)
+    specs = [copy.deepcopy(spec) for _ in range(3)]
+    specs[1]["contract"]["planner_only"] = True
+    plan = {
+        "specs": specs, "max_consecutive_failures": 3, "timeout_seconds": 600,
+        "resource_lock": str(tmp_path / "lock"),
+    }
+    plan_file = tmp_path / "campaign-plan.json"
+    state_root = tmp_path / "campaign"
+    state_path = state_root / "campaign.json"
+    write_json(plan_file, plan)
+    calls = []
+
+    def make_runner(job_file):
+        def run():
+            job = read_json(job_file)
+            calls.append(job_file)
+            if job["contract"]["planner_only"]:
+                job.update(status="planner_stopped", outcome="planned_only")
+            else:
+                job.update(status="review_ready")
+            write_json(job_file, job, exclusive=False)
+        return SimpleNamespace(run=run)
+
+    monkeypatch.setattr(formal_campaign, "FormalRunner", make_runner)
+    monkeypatch.setattr(
+        formal_campaign, "proposal_valid",
+        lambda job_file: read_json(job_file)["status"] == "review_ready",
+    )
+    writer = formal_campaign.write_json
+    checkpointed = False
+
+    def terminate_after_checkpoint(path, value, *args, **kwargs):
+        nonlocal checkpointed
+        if path == state_path and value["next_index"] == 2 and value["active_job"] is None:
+            if not checkpointed:
+                writer(path, value, *args, **kwargs)
+                checkpointed = True
+            # An abrupt process exit cannot run a successful finally checkpoint.
+            raise SystemExit("Simulated termination immediately after planner checkpoint")
+        return writer(path, value, *args, **kwargs)
+
+    monkeypatch.setattr(formal_campaign, "write_json", terminate_after_checkpoint)
+    with pytest.raises(SystemExit, match="immediately after planner checkpoint"):
+        formal_campaign.run_campaign(plan_file, state_root)
+    assert checkpointed and len(calls) == 2
+    checkpoint = read_json(state_path)
+    retained_jobs = [job_file.read_bytes() for job_file in calls]
+    monkeypatch.setattr(formal_campaign, "write_json", writer)
+    resumed = formal_campaign.run_campaign(plan_file, state_root, resume=True)
+
+    assert checkpoint["status"] == "stopped"
+    assert checkpoint["reason"] == formal_campaign.PLANNER_STOP_REASON
+    assert checkpoint["next_index"] == 2 and checkpoint["active_job"] is None
+    assert [r["status"] for r in checkpoint["results"]] == ["review_ready", "planner_stopped"]
+    assert resumed["status"] == "stopped" and resumed["reason"] == formal_campaign.PLANNER_STOP_REASON
+    assert resumed["next_index"] == 2 and len(resumed["results"]) == 2
+    assert len(calls) == 2
+    assert [job_file.read_bytes() for job_file in calls] == retained_jobs
