@@ -24,6 +24,7 @@ from .formal_runtime import (
     command_environment,
     exclusive_lock,
     final_assistant_text,
+    snapshot_hash,
     stage_evidence,
     stop_tree,
 )
@@ -58,6 +59,12 @@ def load(path):
             obj[key] = value
         return obj
     return json.loads(Path(path).read_bytes(), object_pairs_hook=unique)
+
+
+def planner_only_mode(contract):
+    value = contract.get("planner_only", False)
+    helpers().require(type(value) is bool, "planner_only must be a frozen boolean")
+    return value
 
 
 def freeze_generation(repository, pi, identity, batch, gold, directory, token_argv, *, generation_job=None):
@@ -103,10 +110,12 @@ def freeze_generation(repository, pi, identity, batch, gold, directory, token_ar
     binding = None
     log_root = None
     task = TASK
+    planner_only = False
     if generation_job:
         job = load(generation_job)
         c.validate_resource_lock_pins(job["runtime"].get("resource_lock"), job["contract"]["runtime_hashes"])
         c.validate_generation_budget(job)
+        planner_only = planner_only_mode(job["contract"])
         c.require(not directory.resolve().is_relative_to(Path(job["worktreePath"]).resolve()),
                   "Private freeze inside generation root")
         binding = {"job_id": job["id"], "base": job["baseRevision"],
@@ -123,6 +132,7 @@ def freeze_generation(repository, pi, identity, batch, gold, directory, token_ar
         pins += list(job["contract"]["runtime_hashes"])
     freeze = {
         "schema": "ephy.triage-generation-freeze.v1", "job_id": str(uuid.uuid4()),
+        "planner_only": planner_only,
         "created_at": time.time(), "plan": PLAN, "caps": CAPS,
         "evaluator_sha256": evaluator_sha256(), "task": task,
         "batch_sha256": sha256(batch_bytes), "gold_sha256": sha256(gold_bytes),
@@ -134,6 +144,7 @@ def freeze_generation(repository, pi, identity, batch, gold, directory, token_ar
         "max_log_bytes": 8388608, "max_process_rss_bytes": 4294967296,
         "minimum_free_ram_bytes": 4294967296, "minimum_free_disk_bytes": 2147483648,
         "purpose": "generation_capture", "generation_binding": binding,
+        "generation_job_path": str(generation_job.resolve()) if generation_job else None,
         "dependency_versions": {n: version(n) for n in ("httpx", "psutil", "jsonschema")},
         "controller": {"executable": str(Path(sys.executable).resolve()), "python_version": sys.version},
         "pins": {p: sha256(Path(p).read_bytes()) for p in pins},
@@ -151,6 +162,8 @@ def frozen(path, expected):
     c.require(value["schema"] == "ephy.triage-generation-freeze.v1"
               and value["plan"] == PLAN and value["caps"] == CAPS,
               "Unfrozen plan/scope/budgets")
+    c.require(not planner_only_mode(value) or value["generation_binding"] is not None,
+              "Planner-only capture requires a bound external job")
     c.intact(value)
     private = Path(value["private_root"])
     batch, gold = (private/"batch.json").read_bytes(), (private/"gold.json").read_bytes()
@@ -556,10 +569,116 @@ def run_native_generation(freeze_path, expected):
     return result
 
 
+def planner_capture_result(contract, expected):
+    """Derive planner completion from bound saved evidence, never a report flag."""
+    c = helpers()
+    c.require(planner_only_mode(contract), "Planner-only capture requires its frozen mode")
+    binding = contract["generation_binding"]
+    c.require(binding is not None, "Planner-only capture requires a bound external job")
+    job_dir = Path(binding["job_dir"])
+    job = load(Path(contract.get("generation_job_path") or job_dir / "job.json"))
+    c.validate_generation_budget(job)
+    c.require(planner_only_mode(job["contract"]) and binding == {
+        "job_id": job["id"], "base": job["baseRevision"],
+        "contract_sha256": sha256(encode(job["contract"])),
+        "runtime_sha256": sha256(encode(job["runtime"])),
+        "job_dir": job["jobDir"], "worktree": job["worktreePath"],
+    }, "Planner-only frozen job/flag changed")
+    directory = Path(contract["directory"])
+    c.require(not (directory / "implementer").exists()
+              and not any((job_dir / name).exists() for name in
+                          ("audit-bundle", "audit-result.json", "candidate.patch")),
+              "Planner-only capture contains implementation or audit evidence")
+    planner = directory / "planner"
+    receipt = verify_session(Path(contract["directory"]) / "freeze.json", expected, planner)
+    c.require(receipt["role"] == "planner"
+              and type(receipt["elapsed_seconds"]) in (int, float)
+              and 0 <= receipt["elapsed_seconds"] <= job["contract"]["stage_seconds"],
+              "Planner-only session role/deadline changed")
+    candidate = Path(binding["worktree"])
+    c.require(receipt["input_before"] == receipt["input_after"] == c.snapshot(candidate),
+              "Planner-only candidate changed")
+    plan = (job_dir / "lead-plan.txt").read_text(encoding="utf-8")
+    c.require(plan.strip()
+              and (planner / "output.txt").read_bytes() == plan.encode("utf-8")
+              and final_assistant_text(planner / "session.jsonl", session=True) == plan,
+              "Planner-only final plan missing or substituted")
+    stop_path = job_dir / "planner-stop.json"
+    stop = load(stop_path)
+    c.require(stop == {
+        "job_id": job["id"], "contract_sha256": binding["contract_sha256"],
+        "plan_sha256": sha256(plan.encode("utf-8")), "snapshot_sha256": snapshot_hash(candidate),
+        "implementation_started": False, "formal_audit_executed": False, "automatic_adoption": False,
+    } and all(stop[name] is False for name in
+              ("implementation_started", "formal_audit_executed", "automatic_adoption")),
+              "Planner-only stop binding changed")
+    c.require(job["status"] == "planner_stopped"
+              and job["outcome"] == ("no_hypothesis" if plan.strip() == "NO_HYPOTHESIS" else "planned_only"),
+              "Planner-only job did not stop successfully")
+    events = events_at(planner)
+    observed = stage_evidence(events, contract["identity"]["model_id"], "planner")
+    c.require(type(observed["requests"]) is int
+              and 1 <= observed["requests"] <= job["contract"]["max_requests"]
+              and type(observed["output_tokens"]) is int
+              and 0 <= observed["output_tokens"] <= job["contract"]["output_token_budget"],
+              "Planner-only usage unknown or over budget")
+    responses = [event for event in events if event.get("kind") == "assistant"]
+    for number, response in enumerate(responses, 1):
+        raw = load(planner / f"http-{number}.json")
+        cap = raw.get("max_tokens")
+        lines = [line[5:].strip() for line in (planner / f"http-{number}.response").read_bytes().splitlines()
+                 if line.startswith(b"data:")]
+        reports = [load_line["usage"] for line in lines if line != b"[DONE]"
+                   and isinstance((load_line := json.loads(line)), dict) and load_line.get("usage")]
+        c.require(lines and lines[-1] == b"[DONE]" and lines.count(b"[DONE]") == 1
+                  and len(reports) == 1 and isinstance(reports[0], dict),
+                  "Planner-only HTTP usage incomplete")
+        usage = reports[0]
+        c.require(type(cap) is int and 0 < cap <= job["contract"]["max_response_tokens"]
+                  and cap == response["responseTokenCap"]
+                  and all(type(usage.get(key)) is int for key in
+                          ("prompt_tokens", "completion_tokens", "total_tokens"))
+                  and 0 <= usage["completion_tokens"] == response["responseTokens"] <= cap
+                  and usage["prompt_tokens"] >= 0
+                  and usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"],
+                  "Planner-only HTTP/trace usage unknown or changed")
+        if number == len(responses):
+            choices = [choice for line in lines if line != b"[DONE]"
+                       for choice in json.loads(line).get("choices", [])]
+            contents = [choice.get("delta", {}).get("content") for choice in choices]
+            c.require(all(content is None or isinstance(content, str) for content in contents)
+                      and "".join(content for content in contents if content is not None) == plan
+                      and [choice["finish_reason"] for choice in choices
+                           if choice.get("finish_reason") is not None] == ["stop"],
+                      "Planner-only HTTP final plan differs or did not stop")
+    return {
+        "schema": "ephy.triage-planner-capture.v1", "freeze_sha256": expected,
+        "job_id": job["id"], "contract_sha256": binding["contract_sha256"], "sessions": ["planner"],
+        "synthetic_only": contract["identity"]["model_id"] == FAKE_MODEL,
+        "real_model_generations": (0 if contract["identity"]["model_id"] == FAKE_MODEL else observed["requests"]),
+        "implementation_requests": 0, "requests": observed["requests"], "output_tokens": observed["output_tokens"],
+        "plan_sha256": stop["plan_sha256"], "stop_sha256": sha256(stop_path.read_bytes()),
+        "candidate_snapshot_sha256": stop["snapshot_sha256"],
+    }
+
+
 def verify_capture(freeze_path, expected):
     contract = frozen(freeze_path, expected)
     result = load(Path(contract["directory"]) / "capture.json")
     c = helpers()
+    if contract["generation_binding"] is not None:
+        binding = contract["generation_binding"]
+        job = load(Path(contract.get("generation_job_path") or Path(binding["job_dir"]) / "job.json"))
+        c.require(planner_only_mode(job["contract"]) == planner_only_mode(contract)
+                  and sha256(encode(job["contract"])) == binding["contract_sha256"],
+                  "Generation capture frozen job/flag changed")
+    if planner_only_mode(contract):
+        c.require(type(result.get("synthetic_only")) is bool
+                  and all(type(result.get(name)) is int for name in
+                          ("real_model_generations", "implementation_requests", "requests", "output_tokens"))
+                  and result == planner_capture_result(contract, expected),
+                  "Planner-only capture report differs from saved evidence")
+        return result
     c.require(result["schema"] == "ephy.triage-generation-capture.v1"
               and result["freeze_sha256"] == expected and result["sessions"] == ["planner", "implementer"],
               "Incomplete generation capture")
@@ -593,6 +712,12 @@ class IsolatedStrataRunner(StrataRunner):
             "Generation freeze belongs to another external job")
         c.require(self.identity == self.isolation["identity"], "Generation deployment differs")
         c.validate_generation_budget(self.job)
+        if self.isolation.get("generation_job_path") is not None:
+            c.require(Path(self.isolation["generation_job_path"]).resolve() == self.job_file,
+                      "Generation freeze belongs to another job file")
+        self._planner_only = planner_only_mode(self.contract)
+        c.require(self._planner_only == planner_only_mode(self.isolation),
+                  "Generation freeze planner_only differs from job")
         c.require(all(self.runtime.get("thinking", {}).get(role) == "off" for role in ("planner", "implementer")),
                   "Isolated generation requires planner/implementer thinking=off")
         required = [str(Path(__file__).resolve()), self.isolation["runtime"]["extra_guard"],
@@ -608,6 +733,7 @@ class IsolatedStrataRunner(StrataRunner):
 
     def stage(self, role, prompt, label, root, envelope=None):
         c = helpers()
+        c.require(not self._planner_only or role == "planner", "Planner-only forbids non-planner capture")
         c.require(len(self.isolation_stages) < 2
                   and role == ("planner", "implementer")[len(self.isolation_stages)], "Generation stage replay/order")
         directory = Path(self.isolation["directory"]) / role
@@ -706,6 +832,12 @@ class IsolatedStrataRunner(StrataRunner):
     def _run_isolated(self):
         super().run()
         c = helpers()
+        if self._planner_only:
+            c.require(self.isolation_stages == ["planner"], "Planner-only external capture incomplete")
+            result = planner_capture_result(frozen(self.isolation_path, self.isolation_expected),
+                                            self.isolation_expected)
+            write_capture(self.isolation, Path(self.isolation["directory"]) / "capture.json", c.json_bytes(result))
+            return verify_capture(self.isolation_path, self.isolation_expected)
         c.require(self.isolation_stages == ["planner", "implementer"]
                   and self.job["status"] == "external_review_pending", "External proposal incomplete")
         result = {"schema": "ephy.triage-generation-capture.v1",
@@ -728,6 +860,7 @@ def _verify_job_binding(job_path, freeze_path, expected, batch_sha, gold_sha, sk
     """Shared complete binding; caller separately enforces live/native domain."""
     c = helpers()
     contract = frozen(freeze_path, expected)
+    c.require(not planner_only_mode(contract), "Planner-only capture cannot authorize consumer evaluation")
     result = verify_capture(freeze_path, expected)
     job = load(job_path)
     binding = contract["generation_binding"]
