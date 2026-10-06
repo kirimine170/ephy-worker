@@ -14,7 +14,6 @@ type JobStatus =
 	| "cancelling"
 	| "audit_pending"
 	| "review_ready"
-	| "external_review_pending"
 	| "verification_failed"
 	| "failed"
 	| "cancelled"
@@ -46,25 +45,12 @@ interface BackgroundJob {
 	appliedAt?: string;
 	message?: string;
 	verificationResults: Array<{ command: string; exitCode: number; log: string }>;
-	submitting_process?: Record<string, unknown>;
 	verificationHistory?: Array<{ attempt: number; verificationResults: Array<{ command: string; exitCode: number; log: string }>; patchSha256: string }>;
 }
 
-interface UnreadableJob {
-	id: string;
-	title: string;
-	status: "unreadable";
-	jobDir: string;
-	createdAt: "";
-	updatedAt: "";
-	message: string;
-}
-type LoadedJob = BackgroundJob | UnreadableJob;
-
 const ACTIVE = new Set<JobStatus>(["queued", "preparing", "running", "repairing", "verifying", "cancelling"]);
-function isActive(job: LoadedJob): boolean { return job.status === "unreadable" || ACTIVE.has(job.status) || (job.schemaVersion === 2 && job.status === "audit_pending"); }
+function isActive(job: BackgroundJob): boolean { return ACTIVE.has(job.status) || (job.schemaVersion === 2 && job.status === "audit_pending"); }
 const TERMINAL = new Set<JobStatus>([
-	"external_review_pending",
 	"audit_pending",
 	"review_ready",
 	"verification_failed",
@@ -134,77 +120,18 @@ export function selectAuditedPatch(job: BackgroundJob): string {
 	return patch;
 }
 
-function verifyFormalDetachedRunner(job: BackgroundJob, configuredRunner: string): string {
-	const formal = job as BackgroundJob & { runtime: { runner: string }; contract: { runtime_hashes: Record<string, string> } };
-	if (typeof formal.runtime.runner !== "string" || !path.isAbsolute(formal.runtime.runner)) throw new Error("Frozen detached runner path is missing");
-	const frozen = path.resolve(formal.runtime.runner);
-	if (path.resolve(configuredRunner) !== frozen) throw new Error("Detached runner differs from the frozen path");
-	const expected = formal.contract.runtime_hashes[frozen] ?? Object.entries(formal.contract.runtime_hashes).find(([key]) => path.resolve(key) === frozen)?.[1];
-	if (!expected || createHash("sha256").update(fs.readFileSync(frozen)).digest("hex") !== expected) throw new Error("Detached runner frozen pin mismatch");
-	return frozen;
-}
-
-
-function verifyFormalShell(job: BackgroundJob, configuredShell: string): string {
-	const formal = job as BackgroundJob & { runtime: { powershell: string }; contract: { runtime_hashes: Record<string, string> } };
-	if (typeof formal.runtime.powershell !== "string" || !path.isAbsolute(formal.runtime.powershell)) throw new Error("Frozen PowerShell path is missing");
-	const frozen = path.resolve(formal.runtime.powershell);
-	if (!path.isAbsolute(configuredShell) || path.resolve(configuredShell) !== frozen) throw new Error("PowerShell differs from the frozen path");
-	const expected = formal.contract.runtime_hashes[frozen] ?? Object.entries(formal.contract.runtime_hashes).find(([key]) => path.resolve(key) === frozen)?.[1];
-	if (!expected || createHash("sha256").update(fs.readFileSync(frozen)).digest("hex") !== expected) throw new Error("PowerShell frozen pin mismatch");
-	return frozen;
-}
-
-function verifyFormalRuntimePins(job: BackgroundJob): void {
+async function verifyFormalIntegration(pi: ExtensionAPI, job: BackgroundJob): Promise<void> {
+	if (job.schemaVersion !== 2) return;
 	const formal = job as BackgroundJob & { runtime: { python: string; controller_source: string }; contract: { runtime_hashes: Record<string, string> } };
-	const files = [formal.runtime.python, ...["__init__.py", "formal_runtime.py", "formal_artifacts.py", "formal_campaign.py", "strata_runtime.py"].map(name => path.join(formal.runtime.controller_source, "ephy_worker", name))];
+	const files = [formal.runtime.python, ...["formal_runtime.py", "formal_artifacts.py", "formal_campaign.py"].map(name => path.join(formal.runtime.controller_source, "ephy_worker", name))];
 	for (const file of files) {
 		const expected = formal.contract.runtime_hashes[file] ?? Object.entries(formal.contract.runtime_hashes).find(([key]) => path.resolve(key) === path.resolve(file))?.[1];
 		if (!expected || createHash("sha256").update(fs.readFileSync(file)).digest("hex") !== expected) throw new Error("Integration verifier runtime pin mismatch");
 	}
-}
-
-function formalControllerArguments(job: BackgroundJob, body: string, args: string[]): string[] {
-	const formal = job as BackgroundJob & { runtime: { python: string; controller_source: string }; contract: { runtime_hashes: Record<string, string> } };
-	const modules: Record<string, { path: string; sha256: string }> = {};
-	for (const name of ["__init__.py", "formal_runtime.py", "formal_artifacts.py", "formal_campaign.py", "strata_runtime.py"]) {
-		const file = path.resolve(formal.runtime.controller_source, "ephy_worker", name);
-		const expected = formal.contract.runtime_hashes[file] ?? Object.entries(formal.contract.runtime_hashes).find(([key]) => path.resolve(key) === file)?.[1];
-		if (!expected) throw new Error("Frozen helper controller pin missing");
-		modules[name === "__init__.py" ? "ephy_worker" : "ephy_worker." + name.slice(0, -3)] = { path: file, sha256: expected };
-	}
-	const bootstrap = "import hashlib, importlib.abc, importlib.util, json, sys\nfrom pathlib import Path\n\ncontext = json.loads(sys.argv.pop(1))\nif Path(sys.executable).resolve(strict=True) != Path(context[\"python\"]).resolve(strict=True):\n    raise SystemExit(\"Frozen helper interpreter mismatch\")\nmodules = {}\nfor name, pin in context[\"modules\"].items():\n    file = Path(pin[\"path\"])\n    data = file.read_bytes()\n    if hashlib.sha256(data).hexdigest() != pin[\"sha256\"]:\n        raise SystemExit(\"Frozen helper controller pin mismatch: \" + str(file))\n    modules[name] = (file, data)\nif any(name == \"ephy_worker\" or name.startswith(\"ephy_worker.\") for name in sys.modules):\n    raise SystemExit(\"Controller package was imported before frozen helper bootstrap\")\n\nclass FrozenController(importlib.abc.MetaPathFinder, importlib.abc.Loader):\n    def find_spec(self, fullname, path=None, target=None):\n        if fullname in modules:\n            file, _ = modules[fullname]\n            return importlib.util.spec_from_loader(fullname, self, origin=str(file), is_package=fullname == \"ephy_worker\")\n        if fullname.startswith(\"ephy_worker.\"):\n            raise ImportError(\"Controller module lacks a frozen helper pin: \" + fullname)\n        return None\n\n    def create_module(self, spec):\n        return None\n\n    def exec_module(self, module):\n        file, data = modules[module.__name__]\n        module.__file__ = str(file)\n        if module.__name__ == \"ephy_worker\":\n            module.__path__ = [str(file.parent)]\n        exec(compile(data, str(file), \"exec\"), module.__dict__)\n\nsys.meta_path.insert(0, FrozenController())\n";
-	return ["-I", "-c", bootstrap + "\n" + body, JSON.stringify({ python: path.resolve(formal.runtime.python), modules }), ...args];
-}
-
-async function verifyFormalIntegration(pi: ExtensionAPI, job: BackgroundJob): Promise<void> {
-	if (job.schemaVersion !== 2) return;
-	verifyFormalRuntimePins(job);
-	const formal = job as BackgroundJob & { runtime: { python: string; controller_source: string } };
-	const check = await pi.exec(formal.runtime.python, formalControllerArguments(job,
-		"from ephy_worker.formal_runtime import main; main()",
-		["--job", path.join(job.jobDir, "job.json"), "--verify-proposal-only"]), { cwd: job.repoRoot, timeout: 30_000 });
+	const check = await pi.exec(formal.runtime.python, ["-c",
+		"import sys; sys.path.insert(0,sys.argv.pop(1)); from ephy_worker.formal_runtime import main; main()",
+		formal.runtime.controller_source, "--job", path.join(job.jobDir, "job.json"), "--verify-proposal-only"], { cwd: job.repoRoot, timeout: 30_000 });
 	if (check.code !== 0) throw new Error(`Formal integration verification failed: ${check.stderr || check.stdout}`);
-}
-
-
-async function captureSubmittingProcess(pi: ExtensionAPI, job: BackgroundJob): Promise<Record<string, unknown>> {
-	verifyFormalRuntimePins(job);
-	const formal = job as BackgroundJob & { runtime: { python: string; controller_source: string; pi: string }; contract: { runtime_hashes: Record<string, string> } };
-	const executable = path.resolve(formal.runtime.pi);
-	const expected = formal.contract.runtime_hashes[executable] ?? Object.entries(formal.contract.runtime_hashes).find(([file]) => path.resolve(file) === executable)?.[1];
-	if (!expected) throw new Error("Submitting Pi runtime pin missing");
-	const observed = await pi.exec(formal.runtime.python, formalControllerArguments(job,
-		"from ephy_worker.formal_runtime import observe_submitting_process; print(json.dumps(observe_submitting_process(int(sys.argv[1]),sys.argv[2],sys.argv[3])))",
-		[String(process.pid), executable, expected]), { cwd: job.repoRoot, timeout: 30_000 });
-	if (observed.code !== 0) throw new Error(`Submitting Pi observation failed: ${observed.stderr || observed.stdout}`);
-	const identity = JSON.parse(observed.stdout);
-	if (!identity || Object.keys(identity).sort().join() !== ["pid", "created_at", "executable", "executable_sha256"].sort().join() ||
-		identity.pid !== process.pid || !Number.isFinite(identity.created_at) || identity.created_at <= 0 ||
-		identity.executable !== executable || identity.executable_sha256 !== expected) {
-		throw new Error("Submitting Pi observation identity mismatch");
-	}
-	return identity;
 }
 
 function getStateDir(): string {
@@ -215,11 +142,10 @@ function getJobsDir(): string {
 	return path.join(getStateDir(), "jobs");
 }
 
-function atomicWriteJson(filePath: string, value: unknown): string {
+function atomicWriteJson(filePath: string, value: unknown): void {
 	fs.mkdirSync(path.dirname(filePath), { recursive: true });
 	const temporary = `${filePath}.${process.pid}.tmp`;
-	const serialized = `${JSON.stringify(value, null, 2)}\n`;
-	fs.writeFileSync(temporary, serialized, "utf8");
+	fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 	try {
 		fs.renameSync(temporary, filePath);
 	} catch {
@@ -227,36 +153,24 @@ function atomicWriteJson(filePath: string, value: unknown): string {
 		fs.copyFileSync(temporary, filePath);
 		fs.unlinkSync(temporary);
 	}
-	return serialized;
 }
 
-function loadJobFile(filePath: string): LoadedJob {
-	const jobDir = path.dirname(filePath);
+function loadJobFile(filePath: string): BackgroundJob | undefined {
 	try {
-		const job = JSON.parse(fs.readFileSync(filePath, "utf8")) as BackgroundJob;
-		if (!job || typeof job !== "object" || Array.isArray(job) ||
-			(job.schemaVersion !== 1 && job.schemaVersion !== 2) ||
-			job.id !== path.basename(jobDir) || typeof job.jobDir !== "string" || path.resolve(job.jobDir) !== path.resolve(jobDir) ||
-			(!ACTIVE.has(job.status) && !TERMINAL.has(job.status)) ||
-			typeof job.title !== "string" || typeof job.createdAt !== "string" || typeof job.updatedAt !== "string" ||
-			!Number.isFinite(Date.parse(job.createdAt)) || !Number.isFinite(Date.parse(job.updatedAt)) ||
-			(job.runnerPid !== undefined && (!Number.isSafeInteger(job.runnerPid) || job.runnerPid <= 0))) {
-			throw new Error("Invalid job record");
-		}
-		return job;
+		return JSON.parse(fs.readFileSync(filePath, "utf8")) as BackgroundJob;
 	} catch {
-		return { id: path.basename(jobDir), title: "Unreadable job record", status: "unreadable", jobDir,
-			createdAt: "", updatedAt: "", message: "Job state cannot be read or validated; new submissions are blocked until it is restored." };
+		return undefined;
 	}
 }
 
-function loadJobs(): LoadedJob[] {
+function loadJobs(): BackgroundJob[] {
 	const jobsDir = getJobsDir();
 	if (!fs.existsSync(jobsDir)) return [];
 	return fs
 		.readdirSync(jobsDir, { withFileTypes: true })
 		.filter((entry) => entry.isDirectory())
 		.map((entry) => loadJobFile(path.join(jobsDir, entry.name, "job.json")))
+		.filter((job): job is BackgroundJob => Boolean(job))
 		.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
@@ -270,11 +184,11 @@ function isProcessAlive(processId: number | undefined): boolean {
 	}
 }
 
-function recoverStaleJobs(): LoadedJob[] {
+function recoverStaleJobs(): BackgroundJob[] {
 	const jobs = loadJobs();
 	const currentTime = Date.now();
 	for (const job of jobs) {
-		if (job.status === "unreadable" || !isActive(job)) continue;
+		if (!isActive(job)) continue;
 		const ageMs = currentTime - Date.parse(job.updatedAt);
 		const staleWithoutPid = !job.runnerPid && ageMs > 60_000;
 		const staleDeadRunner = Boolean(job.runnerPid) && !isProcessAlive(job.runnerPid) && ageMs > 15_000;
@@ -288,7 +202,7 @@ function recoverStaleJobs(): LoadedJob[] {
 	return loadJobs();
 }
 
-function summarize(job: LoadedJob): string {
+function summarize(job: BackgroundJob): string {
 	const suffix = job.message ? ` — ${job.message}` : "";
 	return `${job.id} [${job.status}] ${job.title}${suffix}`;
 }
@@ -301,10 +215,9 @@ function ageLabel(milliseconds: number): string {
 	return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }
 
-function progressLines(jobs: LoadedJob[]): string[] {
+function progressLines(jobs: BackgroundJob[]): string[] {
 	const job = jobs.find((candidate) => isActive(candidate)) ?? jobs[0];
 	if (!job) return ["BG: no jobs. Use /bg to start one."];
-	if (job.status === "unreadable") return [summarize(job), job.message];
 	const currentTime = Date.now();
 	let lastActivity = Date.parse(job.updatedAt);
 	try {
@@ -336,10 +249,8 @@ async function startDetachedRunner(
 	shell: string,
 	runner: string,
 	jobFile: string,
-	jobSha256?: string,
-	launchHashes?: { runner: string; powershell: string },
 ): Promise<{ code: number; pid?: number; stdout: string; stderr: string }> {
-	const command = buildDetachedRunnerCommand(shell, runner, jobFile, jobSha256, launchHashes);
+	const command = buildDetachedRunnerCommand(shell, runner, jobFile);
 	const encoded = Buffer.from(command, "utf16le").toString("base64");
 	const result = await pi.exec(shell, ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], { timeout: 10_000 });
 	const pid = Number.parseInt(result.stdout.trim(), 10);
@@ -414,193 +325,152 @@ export default function (pi: ExtensionAPI): void {
 				}
 			}
 			const runner = process.env.DUAL_JOB_RUNNER;
-			const shell = process.env.DUAL_POWERSHELL_EXE ?? formalSpec?.runtime.powershell ?? "powershell.exe";
+			const shell = process.env.DUAL_POWERSHELL_EXE ?? "powershell.exe";
 			if (!runner || !fs.existsSync(runner)) {
 				return { content: [{ type: "text", text: "Background runner is not configured." }], details: {} };
 			}
 
-			fs.mkdirSync(getStateDir(), { recursive: true });
-			const admissionFile = path.join(getStateDir(), "background-admission.lock");
-			let admissionFd: number;
-			try {
-				admissionFd = fs.openSync(admissionFile, "wx");
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-				return { content: [{ type: "text", text: "Background admission is already in progress; retry when it completes. An abandoned claim requires explicit recovery." }], details: { admissionBlocked: true } };
-			}
-			try {
-				fs.writeFileSync(admissionFd, JSON.stringify({ pid: process.pid, createdAt: now() }));
-				const active = recoverStaleJobs().filter((job) => isActive(job));
-				if (active.length > 0) {
-					return {
-						content: [{ type: "text", text: `A background job is already active:\n${active.map(summarize).join("\n")}` }],
-						details: { active },
-					};
-				}
-
-				const repoResult = await pi.exec("git", ["rev-parse", "--show-toplevel"], { cwd: ctx.cwd, timeout: 10_000 });
-				if (repoResult.code !== 0) {
-					return {
-						content: [{ type: "text", text: "Background jobs require a Git repository so work can be isolated in a worktree." }],
-						details: { stderr: repoResult.stderr },
-					};
-				}
-				const rawRepoRoot = repoResult.stdout.trim();
-				const repoRoot = normalizeGitRoot(rawRepoRoot);
-				if (!repoRoot || !path.isAbsolute(repoRoot)) {
-					return {
-						content: [{ type: "text", text: "Git returned a repository root that is not an absolute native path." }],
-						details: { rawRepoRoot, repoRoot },
-					};
-				}
-				const headResult = await pi.exec("git", ["rev-parse", "HEAD"], { cwd: repoRoot, timeout: 10_000 });
-				if (headResult.code !== 0) {
-					return {
-						content: [{ type: "text", text: "The repository has no resolvable HEAD commit." }],
-						details: { rawRepoRoot, repoRoot, stderr: headResult.stderr, stdout: headResult.stdout },
-					};
-				}
-				const statusResult = await pi.exec("git", ["status", "--porcelain"], { cwd: repoRoot, timeout: 10_000 });
-				const dirty = statusResult.stdout.trim().length > 0;
-				const timeoutMinutes = params.timeoutMinutes ?? 60;
-				const maxRepairAttempts = params.maxRepairAttempts ?? 2;
-				const commands = (params.verificationCommands ?? []).map((command) => command.trim()).filter(Boolean);
-				if (formalSpec && (formalSpec.repoRoot !== repoRoot || formalSpec.baseRevision !== headResult.stdout.trim())) {
-					throw new Error("Formal spec repository/base differs from submission context");
-				}
-				const confirmation = formalSpec ? [
-					`Formal spec SHA-256: ${params.formalSpecSha256}`,
-					`Repository: ${repoRoot}`,
-					`Base: ${formalSpec.baseRevision}`,
-					`Task: ${formalSpec.contract.task}`,
-					`Semantic scope: ${formalSpec.contract.semantic_scope}`,
-					`Allowed files: ${JSON.stringify(formalSpec.contract.allowed_files)}`,
-					`Whole-job timeout: ${formalSpec.contract.timeout_seconds} seconds`,
-					`Stage timeout: ${formalSpec.contract.stage_seconds} seconds`,
-					`Repair limit: ${formalSpec.contract.max_repairs}`,
-					`Output tokens per stage: ${formalSpec.contract.output_token_budget}`,
-					`Models: ${JSON.stringify(formalSpec.model_identities)}`,
-					`Frozen checks: ${JSON.stringify(formalSpec.contract.checks)}`,
-					"Fresh isolated proposal only. No automatic apply, commit, push or merge.",
-				].join("\n") : [
-					`Title: ${params.title}`,
-					`Repository: ${repoRoot}`,
-					`Base: ${headResult.stdout.trim().slice(0, 12)}`,
-					`Timeout: ${timeoutMinutes} minutes`,
-					`Automatic repair attempts: ${maxRepairAttempts} (bounded, same isolated worktree)`,
-					commands.length > 0 ? `Verification: ${commands.join(" ; ")}` : "Verification: agent checks + git diff --check",
-					dirty ? "WARNING: uncommitted changes in the current checkout are NOT included." : "Current checkout is clean.",
-					"The job will use an isolated worktree and will not merge or push automatically.",
-				].join("\n");
-
-				if (!ctx.hasUI) {
-					return {
-						content: [{ type: "text", text: "Background submission requires an interactive confirmation." }],
-						details: {},
-					};
-				}
-				const confirmed = await ctx.ui.confirm("Start background implementation?", confirmation);
-				if (!confirmed) {
-					return { content: [{ type: "text", text: "Background job submission cancelled by the user." }], details: {} };
-				}
-
-				const id = makeJobId();
-				if (formalSpec && (formalSpec.repoRoot !== repoRoot || formalSpec.baseRevision !== headResult.stdout.trim())) {
-					throw new Error("Formal spec repository/base differs from submission context");
-				}
-				const jobDir = path.join(getJobsDir(), id);
-				const worktreePath = path.join(getStateDir(), "worktrees", id);
-				const job: BackgroundJob = {
-					schemaVersion: 1,
-					id,
-					title: params.title.trim(),
-					status: "queued",
-					createdAt: now(),
-					updatedAt: now(),
-					sourceCwd: ctx.cwd,
-					repoRoot,
-					baseRevision: headResult.stdout.trim(),
-					dirtyAtSubmit: dirty,
-					task: params.task.trim(),
-					doneWhen: params.doneWhen.map((item) => item.trim()).filter(Boolean),
-					verificationCommands: commands,
-					timeoutMinutes,
-					maxRepairAttempts,
-					executionProfile: "dual-local-coding",
-					worktreePath,
-					jobDir,
-					verificationResults: [],
-				};
-				if (formalSpec) {
-					Object.assign(job, formalSpec, { schemaVersion: 2, humanAuthorization: "explicit-execute-proposal-only" });
-					job.task = formalSpec.contract.task;
-					job.timeoutMinutes = formalSpec.contract.timeout_seconds / 60;
-					job.maxRepairAttempts = formalSpec.contract.max_repairs;
-					verifyFormalDetachedRunner(job, runner);
-					verifyFormalShell(job, shell);
-					job.submitting_process = await captureSubmittingProcess(pi, job);
-				}
-				fs.mkdirSync(jobDir, { recursive: true });
-				fs.writeFileSync(path.join(jobDir, "TASK.md"), renderTask(job), "utf8");
-				const jobFile = path.join(jobDir, "job.json");
-				const launchDocument = atomicWriteJson(jobFile, job);
-				const launchSha256 = job.schemaVersion === 2 ? createHash("sha256").update(launchDocument, "utf8").digest("hex") : undefined;
-
-				let verifiedRunner = runner;
-				let verifiedShell = shell;
-				let launchHashes: { runner: string; powershell: string } | undefined;
-				if (job.schemaVersion === 2) {
-					try {
-						verifiedRunner = verifyFormalDetachedRunner(job, runner);
-						verifiedShell = verifyFormalShell(job, shell);
-						const pins = (job as BackgroundJob & { contract: { runtime_hashes: Record<string, string> } }).contract.runtime_hashes;
-						const expected = (file: string): string => {
-							const pin = pins[file] ?? Object.entries(pins).find(([key]) => path.resolve(key) === file)?.[1];
-							if (!pin) throw new Error("Frozen detached launch hash missing");
-							return pin;
-						};
-						launchHashes = { runner: expected(verifiedRunner), powershell: expected(verifiedShell) };
-					} catch (error) {
-						job.status = "failed";
-						job.updatedAt = now();
-						job.message = String(error);
-						atomicWriteJson(jobFile, job);
-						throw error;
-					}
-				}
-				const launch = await startDetachedRunner(pi, verifiedShell, verifiedRunner, jobFile, launchSha256, launchHashes);
-				if (launch.code !== 0 || !launch.pid) {
-					job.status = "failed";
-					job.updatedAt = now();
-					job.message = `Background runner failed to launch: ${launch.stderr || launch.stdout || `exit ${launch.code}`}`;
-					atomicWriteJson(jobFile, job);
-					return {
-						content: [{ type: "text", text: job.message }],
-						details: { job, launch },
-					};
-				}
-				const currentJob = loadJobFile(jobFile);
-				if (job.schemaVersion === 1 && currentJob.status === "queued") {
-					currentJob.runnerPid = launch.pid;
-					currentJob.updatedAt = now();
-					currentJob.message = "Background runner process launched";
-					atomicWriteJson(jobFile, currentJob);
-				}
-				if (uiMode !== "off") ctx.ui.notify(`Background job ${id} started`, "info");
-
+			const active = recoverStaleJobs().filter((job) => isActive(job));
+			if (active.length > 0) {
 				return {
-					content: [
-						{
-							type: "text",
-							text: `Background job submitted: ${id}\nWorktree: ${worktreePath}\nUse background_job_status or /bg-status to inspect it.`,
-						},
-					],
-					details: loadJobFile(jobFile),
+					content: [{ type: "text", text: `A background job is already active:\n${active.map(summarize).join("\n")}` }],
+					details: { active },
 				};
-			} finally {
-				fs.closeSync(admissionFd);
-				fs.unlinkSync(admissionFile);
 			}
+
+			const repoResult = await pi.exec("git", ["rev-parse", "--show-toplevel"], { cwd: ctx.cwd, timeout: 10_000 });
+			if (repoResult.code !== 0) {
+				return {
+					content: [{ type: "text", text: "Background jobs require a Git repository so work can be isolated in a worktree." }],
+					details: { stderr: repoResult.stderr },
+				};
+			}
+			const rawRepoRoot = repoResult.stdout.trim();
+			const repoRoot = normalizeGitRoot(rawRepoRoot);
+			if (!repoRoot || !path.isAbsolute(repoRoot)) {
+				return {
+					content: [{ type: "text", text: "Git returned a repository root that is not an absolute native path." }],
+					details: { rawRepoRoot, repoRoot },
+				};
+			}
+			const headResult = await pi.exec("git", ["rev-parse", "HEAD"], { cwd: repoRoot, timeout: 10_000 });
+			if (headResult.code !== 0) {
+				return {
+					content: [{ type: "text", text: "The repository has no resolvable HEAD commit." }],
+					details: { rawRepoRoot, repoRoot, stderr: headResult.stderr, stdout: headResult.stdout },
+				};
+			}
+			const statusResult = await pi.exec("git", ["status", "--porcelain"], { cwd: repoRoot, timeout: 10_000 });
+			const dirty = statusResult.stdout.trim().length > 0;
+			const timeoutMinutes = params.timeoutMinutes ?? 60;
+			const maxRepairAttempts = params.maxRepairAttempts ?? 2;
+			const commands = (params.verificationCommands ?? []).map((command) => command.trim()).filter(Boolean);
+			if (formalSpec && (formalSpec.repoRoot !== repoRoot || formalSpec.baseRevision !== headResult.stdout.trim())) {
+				throw new Error("Formal spec repository/base differs from submission context");
+			}
+			const confirmation = formalSpec ? [
+				`Formal spec SHA-256: ${params.formalSpecSha256}`,
+				`Repository: ${repoRoot}`,
+				`Base: ${formalSpec.baseRevision}`,
+				`Task: ${formalSpec.contract.task}`,
+				`Semantic scope: ${formalSpec.contract.semantic_scope}`,
+				`Allowed files: ${JSON.stringify(formalSpec.contract.allowed_files)}`,
+				`Whole-job timeout: ${formalSpec.contract.timeout_seconds} seconds`,
+				`Stage timeout: ${formalSpec.contract.stage_seconds} seconds`,
+				`Repair limit: ${formalSpec.contract.max_repairs}`,
+				`Output tokens per stage: ${formalSpec.contract.output_token_budget}`,
+				`Models: ${JSON.stringify(formalSpec.model_identities)}`,
+				`Frozen checks: ${JSON.stringify(formalSpec.contract.checks)}`,
+				"Fresh isolated proposal only. No automatic apply, commit, push or merge.",
+			].join("\n") : [
+				`Title: ${params.title}`,
+				`Repository: ${repoRoot}`,
+				`Base: ${headResult.stdout.trim().slice(0, 12)}`,
+				`Timeout: ${timeoutMinutes} minutes`,
+				`Automatic repair attempts: ${maxRepairAttempts} (bounded, same isolated worktree)`,
+				commands.length > 0 ? `Verification: ${commands.join(" ; ")}` : "Verification: agent checks + git diff --check",
+				dirty ? "WARNING: uncommitted changes in the current checkout are NOT included." : "Current checkout is clean.",
+				"The job will use an isolated worktree and will not merge or push automatically.",
+			].join("\n");
+
+			if (!ctx.hasUI) {
+				return {
+					content: [{ type: "text", text: "Background submission requires an interactive confirmation." }],
+					details: {},
+				};
+			}
+			const confirmed = await ctx.ui.confirm("Start background implementation?", confirmation);
+			if (!confirmed) {
+				return { content: [{ type: "text", text: "Background job submission cancelled by the user." }], details: {} };
+			}
+
+			const id = makeJobId();
+			if (formalSpec && (formalSpec.repoRoot !== repoRoot || formalSpec.baseRevision !== headResult.stdout.trim())) {
+				throw new Error("Formal spec repository/base differs from submission context");
+			}
+			const jobDir = path.join(getJobsDir(), id);
+			const worktreePath = path.join(getStateDir(), "worktrees", id);
+			const job: BackgroundJob = {
+				schemaVersion: 1,
+				id,
+				title: params.title.trim(),
+				status: "queued",
+				createdAt: now(),
+				updatedAt: now(),
+				sourceCwd: ctx.cwd,
+				repoRoot,
+				baseRevision: headResult.stdout.trim(),
+				dirtyAtSubmit: dirty,
+				task: params.task.trim(),
+				doneWhen: params.doneWhen.map((item) => item.trim()).filter(Boolean),
+				verificationCommands: commands,
+				timeoutMinutes,
+				maxRepairAttempts,
+				executionProfile: "dual-local-coding",
+				worktreePath,
+				jobDir,
+				verificationResults: [],
+			};
+			if (formalSpec) {
+				Object.assign(job, formalSpec, { schemaVersion: 2, humanAuthorization: "explicit-execute-proposal-only" });
+				job.task = formalSpec.contract.task;
+				job.timeoutMinutes = formalSpec.contract.timeout_seconds / 60;
+				job.maxRepairAttempts = formalSpec.contract.max_repairs;
+			}
+			fs.mkdirSync(jobDir, { recursive: true });
+			fs.writeFileSync(path.join(jobDir, "TASK.md"), renderTask(job), "utf8");
+			const jobFile = path.join(jobDir, "job.json");
+			atomicWriteJson(jobFile, job);
+
+			const launch = await startDetachedRunner(pi, shell, runner, jobFile);
+			if (launch.code !== 0 || !launch.pid) {
+				job.status = "failed";
+				job.updatedAt = now();
+				job.message = `Background runner failed to launch: ${launch.stderr || launch.stdout || `exit ${launch.code}`}`;
+				atomicWriteJson(jobFile, job);
+				return {
+					content: [{ type: "text", text: job.message }],
+					details: { job, launch },
+				};
+			}
+			const currentJob = loadJobFile(jobFile) ?? job;
+			if (currentJob.status === "queued") {
+				currentJob.runnerPid = launch.pid;
+				currentJob.updatedAt = now();
+				currentJob.message = "Background runner process launched";
+				atomicWriteJson(jobFile, currentJob);
+			}
+			if (uiMode !== "off") ctx.ui.notify(`Background job ${id} started`, "info");
+
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Background job submitted: ${id}\nWorktree: ${worktreePath}\nUse background_job_status or /bg-status to inspect it.`,
+					},
+				],
+				details: loadJobFile(jobFile) ?? currentJob,
+			};
 		},
 	});
 
@@ -627,7 +497,6 @@ export default function (pi: ExtensionAPI): void {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const job = loadJobs().find((candidate) => candidate.id === params.jobId);
 			if (!job) return { content: [{ type: "text", text: `Unknown job: ${params.jobId}` }], details: {} };
-			if (job.status === "unreadable") return { content: [{ type: "text", text: summarize(job) }], details: job };
 			if (!isActive(job)) {
 				return { content: [{ type: "text", text: `Job ${job.id} is already ${job.status}.` }], details: job };
 			}
@@ -688,9 +557,8 @@ export default function (pi: ExtensionAPI): void {
 			if (!ctx.hasUI || !(await ctx.ui.confirm("Apply background changes?", `${summarize(job)}\n\nTarget: ${job.repoRoot}\nNo commit, merge, push, or deploy will be performed.`))) {
 				return { content: [{ type: "text", text: "Patch application was not confirmed." }], details: job };
 			}
-			// Complete the slow verifier before the final checkout and patch checks.
-			await verifyFormalIntegration(pi, job);
-			// Revalidate any changes during confirmation or integration verification.
+			// The checkout may have changed while the confirmation dialog was open.
+			// Revalidate the base, cleanliness, and patch immediately before applying.
 			const finalHead = await pi.exec("git", ["rev-parse", "HEAD"], { cwd: job.repoRoot, timeout: 10_000 });
 			const finalStatus = await pi.exec(
 				"git",
@@ -715,7 +583,8 @@ export default function (pi: ExtensionAPI): void {
 					details: job,
 				};
 			}
-			selectAuditedPatch(job); // Recheck bound bytes after the verifier and final git check.
+			selectAuditedPatch(job); // Recheck bound bytes after the confirmation and final git check.
+			await verifyFormalIntegration(pi, job);
 			const applied = await pi.exec("git", ["apply", patchFile], { cwd: job.repoRoot, timeout: 30_000 });
 			if (applied.code !== 0) {
 				return { content: [{ type: "text", text: `Patch application failed:\n${applied.stderr || applied.stdout}` }], details: job };
@@ -829,7 +698,7 @@ export default function (pi: ExtensionAPI): void {
 			for (const job of jobs) {
 				const previous = seen.get(job.id);
 				seen.set(job.id, job.status);
-				if (uiMode !== "off" && previous && previous !== job.status && job.status !== "unreadable" && TERMINAL.has(job.status)) {
+				if (uiMode !== "off" && previous && previous !== job.status && TERMINAL.has(job.status)) {
 					ctx.ui.notify(summarize(job), job.status === "review_ready" ? "info" : "warning");
 					pi.sendMessage(
 						{
