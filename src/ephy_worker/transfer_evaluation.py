@@ -73,7 +73,9 @@ def fixture_repository(fixture: CodingFixture):
         baseline = _FixtureGitBaseline(
             _json_digest(fixture.model_dump(mode="json")),
             (allocation.st_dev, allocation.st_ino),
-            MappingProxyType({path: entry for path, entry in snapshot.items() if _is_git_path(path)}),
+            MappingProxyType(
+                {path: entry for path, entry in snapshot.items() if path == "." or _is_git_path(path)}
+            ),
         )
         _FIXTURE_GIT_BASELINES[owned_root] = baseline
         yield repository, revision
@@ -335,11 +337,16 @@ def comparison_plan(
 
 
 def _is_git_path(path: str) -> bool:
-    return Path(path).parts[0].casefold() == ".git"
+    parts = Path(path).parts
+    return bool(parts) and parts[0].casefold() == ".git"
 
 
 def _candidate_files(root: Path) -> dict[str, _CandidateEntry]:
-    if not root.is_dir():
+    try:
+        root_metadata = root.lstat()
+    except FileNotFoundError as exc:
+        raise ValueError("candidate must be a real directory") from exc
+    if not stat.S_ISDIR(root_metadata.st_mode):
         raise ValueError("candidate must be a real directory")
     for parent in (root, *root.parents):
         metadata = parent.lstat()
@@ -348,7 +355,17 @@ def _candidate_files(root: Path) -> dict[str, _CandidateEntry]:
             or getattr(metadata, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
         ):
             raise ValueError("candidate contains symbolic link or reparse point")
-    files = {}
+    # The allocated root can be replaced while every child stays unchanged.
+    # Bind it alongside Git metadata so validation detects that replacement.
+    files = {
+        ".": _CandidateEntry(
+            b"",
+            stat.S_IMODE(root_metadata.st_mode),
+            "directory",
+            (root_metadata.st_dev, root_metadata.st_ino),
+            getattr(root_metadata, "st_file_attributes", 0) & ~stat.FILE_ATTRIBUTE_ARCHIVE,
+        )
+    }
 
     def visit(directory: Path) -> None:
         for path in sorted(directory.iterdir()):

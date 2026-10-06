@@ -468,6 +468,176 @@ class TransferEvaluationTests(unittest.TestCase):
         self.assertFalse(repository.exists())
         self.assertEqual(foreign.read_text(encoding="utf-8"), "keep")
 
+    def test_root_replacement_with_identical_children_during_checker_fails_integrity(self):
+        task_id, repository = self.candidate()
+        baseline = validate_candidate(self.frozen, task_id, repository)
+        self.assertTrue(baseline["passed"])
+        before = transfer._candidate_files(repository)
+        saved = self.root / "original-root"
+        real_run = subprocess.run
+
+        def replace_root(command, **kwargs):
+            result = real_run(command, **kwargs)
+            repository.rename(saved)
+            repository.mkdir()
+            for child in list(saved.iterdir()):
+                child.rename(repository / child.name)
+            return result
+
+        try:
+            with patch("ephy_worker.transfer_evaluation.subprocess.run", side_effect=replace_root):
+                verdict = validate_candidate(self.frozen, task_id, repository)
+            after = transfer._candidate_files(repository)
+            self.assertEqual(
+                {path: entry for path, entry in before.items() if path != "."},
+                {path: entry for path, entry in after.items() if path != "."},
+            )
+            self.assertNotEqual(before["."].identity, after["."].identity)
+            self.assertNotEqual(transfer._candidate_digest(before), transfer._candidate_digest(after))
+            self.assertTrue(verdict["scope_passed"])
+            self.assertTrue(verdict["correctness_passed"])
+            self.assertFalse(verdict["candidate_unchanged"])
+            self.assertFalse(verdict["passed"])
+            self.assertEqual(verdict["status"], "integrity_failure")
+            with patch("ephy_worker.transfer_evaluation.subprocess.run") as run:
+                rejected = validate_candidate(self.frozen, task_id, repository)
+            run.assert_not_called()
+            self.assertFalse(rejected["passed"])
+            self.assertIn(".", rejected["outside_scope"])
+            self.assertNotEqual(baseline["candidate_sha256"], rejected["candidate_sha256"])
+        finally:
+            if saved.exists():
+                for child in list(repository.iterdir()):
+                    child.rename(saved / child.name)
+                repository.rmdir()
+                saved.rename(repository)
+        self.assertEqual(before["."].identity, transfer._candidate_files(repository)["."].identity)
+
+    def test_root_permissions_fail_scope_and_bind_candidate_hash(self):
+        task_id, repository = self.candidate()
+        baseline = validate_candidate(self.frozen, task_id, repository)
+        self.assertTrue(baseline["passed"])
+        mode = repository.stat().st_mode
+        try:
+            repository.chmod(mode & ~stat.S_IWRITE)
+            with patch("ephy_worker.transfer_evaluation.subprocess.run") as run:
+                verdict = validate_candidate(self.frozen, task_id, repository)
+            run.assert_not_called()
+            self.assertFalse(verdict["passed"])
+            self.assertEqual(verdict["status"], "scope_failure")
+            self.assertIn(".", verdict["outside_scope"])
+            self.assertNotEqual(baseline["candidate_sha256"], verdict["candidate_sha256"])
+        finally:
+            repository.chmod(mode)
+
+    def test_root_permissions_during_checker_fail_integrity(self):
+        task_id, repository = self.candidate()
+        mode = repository.stat().st_mode
+        real_run = subprocess.run
+
+        def mutate(command, **kwargs):
+            result = real_run(command, **kwargs)
+            repository.chmod(mode & ~stat.S_IWRITE)
+            return result
+
+        try:
+            with patch("ephy_worker.transfer_evaluation.subprocess.run", side_effect=mutate):
+                verdict = validate_candidate(self.frozen, task_id, repository)
+            self.assertTrue(verdict["correctness_passed"])
+            self.assertFalse(verdict["candidate_unchanged"])
+            self.assertFalse(verdict["passed"])
+            self.assertEqual(verdict["status"], "integrity_failure")
+        finally:
+            repository.chmod(mode)
+
+    def test_root_removal_during_checker_fails_integrity(self):
+        task_id, repository = self.candidate()
+        saved = self.root / "removed-root"
+        real_run = subprocess.run
+
+        def remove_root(command, **kwargs):
+            result = real_run(command, **kwargs)
+            repository.rename(saved)
+            return result
+
+        try:
+            with patch("ephy_worker.transfer_evaluation.subprocess.run", side_effect=remove_root):
+                verdict = validate_candidate(self.frozen, task_id, repository)
+            self.assertTrue(verdict["correctness_passed"])
+            self.assertFalse(verdict["candidate_unchanged"])
+            self.assertFalse(verdict["passed"])
+            self.assertEqual(verdict["status"], "integrity_failure")
+            self.assertIn("real directory", verdict["candidate_error"])
+        finally:
+            if saved.exists():
+                saved.rename(repository)
+
+    def test_root_link_and_file_rejected_before_descendant_traversal(self):
+        task_id, repository = self.candidate()
+        alias = self.root / "root-link"
+        alias.symlink_to(repository, target_is_directory=True)
+        file = self.root / "root-file"
+        file.write_text("must not read", encoding="utf-8")
+        real_iterdir = Path.iterdir
+
+        def no_traversal(path):
+            if path in (alias, file):
+                self.fail("traversed invalid candidate root")
+            return real_iterdir(path)
+
+        for root in (alias, file):
+            with (
+                self.subTest(root=root.name),
+                patch.object(Path, "iterdir", no_traversal),
+                patch("ephy_worker.transfer_evaluation.subprocess.run") as run,
+                self.assertRaisesRegex(ValueError, "real directory|symbolic link"),
+            ):
+                validate_candidate(self.frozen, task_id, root)
+            run.assert_not_called()
+
+    def test_root_reparse_point_rejected_before_descendant_traversal(self):
+        task_id, repository = self.candidate()
+        real_lstat = Path.lstat
+        real_iterdir = Path.iterdir
+
+        def reparse_metadata(path):
+            metadata = real_lstat(path)
+            if path == repository:
+                return SimpleNamespace(
+                    st_mode=metadata.st_mode, st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT
+                )
+            return metadata
+
+        def no_traversal(path):
+            if path == repository:
+                self.fail("traversed candidate root reparse point")
+            return real_iterdir(path)
+
+        with (
+            patch.object(Path, "lstat", reparse_metadata),
+            patch.object(Path, "iterdir", no_traversal),
+            patch("ephy_worker.transfer_evaluation.subprocess.run") as run,
+            self.assertRaisesRegex(ValueError, "reparse point"),
+        ):
+            validate_candidate(self.frozen, task_id, repository)
+        run.assert_not_called()
+
+    def test_unmanaged_candidate_root_is_outside_scope_even_without_git(self):
+        task = self.frozen.suite.tasks[0]
+        repository = self.root / "unmanaged-root"
+        for relative, content in task.fixture.files.items():
+            target = repository / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        for change in task.fixture.mock_changes:
+            (repository / change.path).write_text(change.content, encoding="utf-8")
+        with patch("ephy_worker.transfer_evaluation.subprocess.run") as run:
+            verdict = validate_candidate(self.frozen, task.fixture.task_id, repository)
+        run.assert_not_called()
+        self.assertFalse(verdict["passed"])
+        self.assertEqual(verdict["status"], "scope_failure")
+        self.assertIn(".", verdict["outside_scope"])
+
     def plan(self, **changes):
         args = {
             "split": "development",
