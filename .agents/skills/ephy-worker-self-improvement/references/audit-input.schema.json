@@ -186,16 +186,16 @@
               "const": "preflight"
             },
             {
-              "const": "designated model plan"
+              "const": "gpt-oss lead plan"
             },
             {
-              "const": "pi attempt loop"
+              "const": "qwen attempt loop"
             },
             {
               "const": "freeze final candidate and audit bundle"
             },
             {
-              "const": "fresh designated-model audit"
+              "const": "fresh gpt-oss audit"
             },
             {
               "const": "proposal stop"
