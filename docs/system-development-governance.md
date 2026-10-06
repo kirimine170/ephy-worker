@@ -1,7 +1,7 @@
 # ephy-worker システム開発ガバナンス
 
 - Policy ID：`ephy.system-development-governance.v1`
-- Version：`1.4.0`
+- Version：`1.2.1`
 - Status：active
 
 この文書は，ephy-worker自身の変更，評価基盤，実行runner，prompt，skill，checkerを含むシステム開発の正本です．個別の作業指示より優先し，上位のsystem／developer指示とユーザーが明示した権限境界には従います．
@@ -67,7 +67,8 @@ agentの「完了した」「問題ない」「tests passed」という説明は
 ### Implementer
 
 - 指定されたcleanな隔離worktreeだけを変更します．
-- 自己checkはできますが，独立検証や自分の成果の承認を代行しません．
+- 汎用shellは持たず，workspace-rootへ限定されたfile toolだけを使用します．canonicalなPi設定の変更もcandidate worktree内でproposalとして行い，稼働中runtimeへ直接反映しません．
+- 許可されたtoolで自己checkできる場合だけ実行します．未実行のcheckは明記し，独立検証や自分の成果の承認を代行しません．
 
 ### Independent verifier
 
@@ -88,17 +89,7 @@ agentの「完了した」「問題ない」「tests passed」という説明は
 - `review transport`では，元candidateのpatch SHA-256，PR head commit，対象scope，検証結果をPRへ結び付けます．現在のPR headに対する必須CIとCodex Reviewが完了し，未解決のblocking findingがない場合だけ`external_pr_review_ready`候補にできます．新しいpushは以前のCIとreviewを無効にします．
 - 承認された操作，対象repository／branch／remote，実行結果を記録し，監査済みpatchから差分が生じた場合は，その監査を採用根拠として流用しません．
 
-自己改善Jobのmodelはcontrollerがroleごとに実行前の契約へ固定します．gpt-oss／Coder-Nextは既存profileの既定値であり，固定model名自体を独立性の根拠にしません．同じ稼働modelを使う場合もplannerとimplementerは別process／sessionとし，独立verifierはモデルの外側の固定checkerを実行します．formal auditorはfreshなread-only process／sessionとし，外部レビュー経路では別のCodex Reviewを必須とします．leadが小さな修正を直接編集して代替してはなりません．Integration／release operatorはproposal stop後の別roleであり，formal stageへ採用権限を追加して代用しません．
-
-ユーザーが事前にmodel役割の見直しとCodexによる基盤変更を明示承認した場合，その限定scopeのbootstrapはCodexが担当できます．実modelによる候補実装とは区別して記録し，旧Jobを遡って合格にしません．今回承認された既存Strata profileは，loopback endpoint，listener／engine PIDと開始時刻，実行binary／設定hash，APIが返すloaded modelとcontextを固定し，起動・停止・unload・設定変更を行いません．これは稼働中weight bytesの暗号学的証明ではなく，ユーザーが許可した既存serviceのdeployment identityです．このprofileはMarkdown候補と外部Codex Review待ちの未適用proposalに限定し，実行コードのverifier隔離がない状態でcode／tool／MCP候補を許可しません．
-
-### 今回のCodex bootstrapの限定採用（Accepted）
-
-ユーザーは2026-10-04，不足した旧Pi実装／formal pre-audit来歴を開示して今回の基盤だけを採用し，P0／P1解消後にPR17をmergeする方針を明示承認しました．対象と条件は[限定採用経路のADR](adr/0004-authorized-codex-bootstrap-adoption.md)に固定します．対象はPR15／PR16をまとめたmain向け40ファイルと6文書の整合からなる全42ファイルであり，PR17の独立レビュー済みhead `2d4c175d82e116ef340b6565f0e71f02601c70ff`を基盤の参照点とします．今回の6文書の確定後は，新しい完全patch／tree／headを記録し，最終headの必須CIとmain向け全範囲の独立Codex Reviewを確認してからmergeします．新しいpushは以前のCI／reviewを無効にします．
-
-対象コードは従来のpre-audit workflowを実施していないCodex bootstrapです．実PiのMarkdown候補，基盤のunit test，CI，独立Codex Reviewは元のsource／policy／candidate bindingを保持して評価し，対象コードのPi実装来歴やformal auditへ読み替えません．今回の採用はADRの限定条件を別roleのIntegration／release operatorが確認して記録する手動の判断であり，runnerの新しい合格状態や一般candidateの採用権限を追加しません．
-
-通常のformal／external Jobの完了式，review transportのpre-audit前提，正式runnerのintegration拒否，role，scope，監査，予算，停止条件，CI／review要件を維持します．今回の採用経路を将来の自己改善Jobや別sourceへ転用せず，不足した旧来歴や停止した旧Jobを遡って合格にしません．PR15／PR16の整理と新規実験はこの承認範囲に含めません．
+正式な自己改善Jobでは，plannerとauditorをgpt-oss，implementerをQwenに固定します．leadが小さな修正を直接編集して代替してはなりません．Integration／release operatorはこのJobのstageや兼任roleではなく，proposal stop後に別の明示的な承認がある場合だけ開始できます．formal lead，implementer，verifier，auditorへ承認後操作の権限を追加して代用してはなりません．
 
 ## 3．実行順序をrunnerが保証する
 
@@ -106,18 +97,18 @@ agentの「完了した」「問題ない」「tests passed」という説明は
 
 ```text
 preflight
-→ designated model plan
+→ gpt-oss lead plan
 → attempt 1..N {
-    designated Pi implementation or repair
+    Qwen implementation or repair
     → independent verification
     → candidate-origin failureかつ残回数ありなら次のattempt
   }
 → freeze final candidate and audit bundle
-→ fresh designated-model audit
+→ fresh gpt-oss audit
 → proposal stop
 ```
 
-各attemptの中で指定Pi実装より前に独立検証を実行したり，独立検証後に指定implementer以外がrepairしたり，最終attempt後に検証せず監査へ進んだりすることは`workflow_failed`です．基盤不具合，環境不一致，wrong model，invalid command，証拠欠落はattemptを増やさず停止します．auditorが見るpatch SHA-256と，最終独立検証が測定したpatch SHA-256は一致しなければなりません．監査後にcandidateが1 byteでも変われば，検証と監査は無効です．
+各attemptの中でQwenより前に独立検証を実行したり，独立検証後にQwen以外がrepairしたり，最終attempt後に検証せず監査へ進んだりすることは`workflow_failed`です．基盤不具合，環境不一致，wrong model，invalid command，証拠欠落はattemptを増やさず停止します．auditorが見るpatch SHA-256と，最終独立検証が測定したpatch SHA-256は一致しなければなりません．監査後にcandidateが1 byteでも変われば，検証と監査は無効です．
 
 ## 4．隔離とscopeを守る
 
@@ -167,7 +158,7 @@ candidate由来と機械的に判定できる失敗だけを，固定回数のre
 3. 初期toolを`governance_ack`だけに制限し，ack前にはfile readを含む他のtoolを公開しません．policy本文はtoolで取得させるのではなく，system payloadへ完全な形で注入します．初回provider callでは元のユーザー依頼と過去会話を非破壊的に退避し，system messageとack専用の最小messageだけを渡します．元の依頼はack結果の検証後に復元します．
 4. agentがPolicy ID，SHA-256，末尾marker，nonce，roleを構造化して`governance_ack`へ返した場合だけ受領候補とします．ack messageに含まれた文章，thinking，兄弟tool callは保存前に除去し，exactなack tool call一つだけを実行します．文章によるack，値違い，追加field，ackなしの回答は，安定したfailure markerへ置換し，そのsessionを恒久停止します．
 5. lead／plannerでは，ack実行時にrunner指定のskill，evaluation contract，audit contract，audit prompt，実装境界文書をraw bytesから再読込し，開始時のbyte数とSHA-256に一致することを確認します．これらは切り詰めず，一つのmodel-visible tool resultとして配送します．50 KiBまたは2000行を超える場合，truncationせず停止します．最終`tool_result` hookがそのcontentの完全一致を確認するまで，他のtoolを公開しません．
-6. ackと必須contextの検証後だけ，そのroleに許可されたtoolを公開し，`governance_ack`自体は非公開に戻します．auditor roleではack後に`read`，`grep`，`find`，`ls`だけを公開します．managed runtimeがrepository外にある場合は，runnerとsmoke testの実在path，byte数，SHA-256をsystem-controlled metadataとして渡し，架空のrepository内pathで代替させません．
+6. ackと必須contextの検証後だけ，そのroleに許可されたtoolを公開し，`governance_ack`自体は非公開に戻します．implementer roleでは汎用`bash`／`powershell`を公開せず，file toolの対象pathをcanonicalなcandidate workspace-root内へ限定します．auditor roleではack後に`read`，`grep`，`find`，`ls`だけを公開します．managed runtimeがrepository外にある場合は，runnerとsmoke testの実在path，byte数，SHA-256をsystem-controlled metadataとして渡し，架空のrepository内pathで代替させません．
 7. ack前，必須context検証中，role ceiling外のtool callを`tool_call` gateでも遮断します．gateは他のfeature extensionより後に読み込み，最終provider payloadと最終tool resultを検査します．
 8. system delivery，ack，必須context配送，解禁tool，最初の変更可能toolの順序をrunnerの証跡へ残します．
 
@@ -177,7 +168,7 @@ policy，prompt，skill，contractの欠落，hash不一致，policy／audit con
 
 ## 8．監査を独立したread-only判定にする
 
-監査は，freshな指定auditor processで，freeze済みaudit bundleだけを対象にします．監査promptは[独立監査契約](../.agents/skills/ephy-worker-self-improvement/references/audit-contract.md)に従い，[audit input schema](../.agents/skills/ephy-worker-self-improvement/references/audit-input.schema.json)と[evidence manifest schema](../.agents/skills/ephy-worker-self-improvement/references/evidence-manifest.schema.json)に適合したbundleを受け取り，結果を[audit result schema](../.agents/skills/ephy-worker-self-improvement/references/audit-result.schema.json)へ適合させます．
+監査は，freshなgpt-oss processで，freeze済みaudit bundleだけを対象にします．監査promptは[独立監査契約](../.agents/skills/ephy-worker-self-improvement/references/audit-contract.md)に従い，[audit input schema](../.agents/skills/ephy-worker-self-improvement/references/audit-input.schema.json)と[evidence manifest schema](../.agents/skills/ephy-worker-self-improvement/references/evidence-manifest.schema.json)に適合したbundleを受け取り，結果を[audit result schema](../.agents/skills/ephy-worker-self-improvement/references/audit-result.schema.json)へ適合させます．
 
 runnerは監査processのack前には`governance_ack`だけを与え，ack後には`read`，`grep`，`find`，`ls`だけを与えます．特に`bash`／`powershell`，`edit`，`write`，network，subagentを与えません．
 
@@ -191,7 +182,7 @@ artifactの実byte数，SHA-256，bundle-relative pathの正規化，path escape
 
 必須証拠が読めない場合は`INCONCLUSIVE`です．確認済みの違反があれば`REJECT_PROPOSAL`です．すべての必須checkがPASSの場合だけ`ACCEPT_PROPOSAL`を返せます．`ACCEPT_PROPOSAL`は未適用proposalとしてレビュー可能という意味であり，commit，push，PR，mergeの許可ではありません．
 
-指定auditorのmodel identity，tool制限，無変更性，JSON Schema適合は，監査後にrunnerが外側からexecution attestationとして固定します．bundle integrity attestationは監査前，execution attestationは監査後に作成し，両者を代用しません．invalid JSONを同じ監査runで修正させません．
+gpt-oss自身のmodel identity，tool制限，無変更性，JSON Schema適合は，監査後にrunnerが外側からexecution attestationとして固定します．bundle integrity attestationは監査前，execution attestationは監査後に作成し，両者を代用しません．invalid JSONを同じ監査runで修正させません．
 
 ## 9．proposal-onlyの境界
 
@@ -224,9 +215,7 @@ proposal-onlyで許される変更は，隔離candidate内の未適用差分と�
 
 ## 完了式
 
-次の式は通常のformal／external proposal Jobに適用します．今回の名前付き基盤の手動採用だけは，前節とADR0004に固定した別の条件と明示承認に従います．この限定判断によって，対象コードのpre_audit_workflow_gateやformal auditを成立済みとは記録しません．
-
-ここで`pre_audit_workflow_gate`は，固定済み契約に従ってpreflight，designated-model plan，指定Pi実装，独立検証，final candidate freezeまでのrole，model，順序，hash bindingが成立した状態を表す．formal audit，audit execution attestation，`review_ready`は含まない．
+ここで`pre_audit_workflow_gate`は，固定済み契約に従ってpreflight，gpt-oss plan，Qwen実装，独立検証，final candidate freezeまでのrole，model，順序，hash bindingが成立した状態を表す．formal audit，audit execution attestation，`review_ready`は含まない．
 
 ```text
 review_ready =
@@ -250,6 +239,6 @@ merge_ready =
   AND (review_ready OR external_pr_review_ready)
 ```
 
-`external_pr_review_ready`は，formal designated-model auditや`review_ready`を実行済みと見なす状態ではありません．Codex Reviewはtest，branch protection，required approvalを代替せず，merge権限も持ちません．いずれの経路でも自動適用は行わず，採用とmergeには対象を指定した明示的な人間の判断が必要です．
+`external_pr_review_ready`は，formal gpt-oss auditや`review_ready`を実行済みと見なす状態ではありません．Codex Reviewはtest，branch protection，required approvalを代替せず，merge権限も持ちません．いずれの経路でも自動適用は行わず，採用とmergeには対象を指定した明示的な人間の判断が必要です．
 
 END-OF-EPHY-SYSTEM-DEVELOPMENT-GOVERNANCE-V1

@@ -139,5 +139,9 @@ for (const script of ["run.sh", "run.ps1"]) {
   assert.match(content, /ephy-model-router\.ts/);
   assert.match(content, /EPHY_PI_MODEL_ROUTER/);
 }
+const windowsScript = await readFile(join(repositoryRoot, "tools", "pi-local", "run.ps1"), "utf8");
+assert.match(windowsScript, /EPHY_PI_PROVIDER_EXTENSION/);
+assert.match(windowsScript, /EPHY_PI_READ_ONLY/);
+assert.match(windowsScript, /DUAL_GOVERNANCE_ROLE/);
 
 console.log("PASS: Pi model router opt-in, governance isolation, switch, audit, and launch contract");

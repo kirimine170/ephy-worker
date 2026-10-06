@@ -6,7 +6,7 @@
 
 現行のWindows runnerが接続済みなのは，gpt-ossによる調整，Qwen実装，既存の独立check，証拠保存，`audit_pending`停止までである．agent起動前に全契約をfreezeして環境不備を分離するformal preflightと，freshかつread-onlyのgpt-oss auditor起動，audit bundle検証，result schema検証，監査後execution attestation，`review_ready`判定は未接続である．したがって，次は実装済みの実行結果ではなく，接続後にrunnerが保証する完成形の順序である．
 
-また，現行Qwen processの`cwd`は隔離worktreeへ固定されるが，汎用`bash`／`powershell`／`edit`／`write`はOS-levelのpath jailではない．絶対pathや`..`によるworktree外アクセスを機械的に遮断できるworkspace-root限定toolまたはsandboxが接続されるまでは，scope制約を完全に強制済みとは扱わず，正式な自己改善経路の完成を宣言しない．現在のgovernance gateが保証するのは，policy全文とidentityのsystem配送，ack前の元依頼隔離，exactなack，lead／planner用必須文書bytesの再hash・一括配送・最終tool result照合，違反sessionの恒久停止，role別tool ceilingである．配送内容に従った計画の正しさ，workspace-root confinement，formal preflight，formal audit接続は未保証である．
+また，現行Qwen processの`cwd`は隔離worktreeへ固定し，governance gateはimplementerへ汎用`bash`／`powershell`を公開しない．`read`／`grep`／`find`／`ls`／`edit`／`write`はtool callごとにworkspace-root内へ限定し，絶対path，`..`，既存ancestorのsymlink／junctionによるescapeを恒久停止する．これはOS-level sandboxではなく，tool検査後のTOCTOUや将来追加されるtoolを自動的に保護するものでもないため，runnerの独立scope検査は引き続き必須である．Qwen自身のshell self-checkは行わず，未実行として報告し，固定checkはrunnerが実行する．現在のgovernance gateが保証するのは，policy全文とidentityのsystem配送，ack前の元依頼隔離，exactなack，lead／planner用必須文書bytesの再hash・一括配送・最終tool result照合，違反sessionの恒久停止，role別tool ceiling，implementerのtool-level workspace-root confinementである．配送内容に従った計画の正しさ，OS-level confinement，formal preflight，formal audit接続は未保証である．
 
 1. gpt-oss leadが改善仮説を1件だけ定義し，対象fileと受入条件を固定する．
 2. 変更前のbaselineを，固定したcommandとfixtureで記録する．

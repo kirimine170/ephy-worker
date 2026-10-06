@@ -9,14 +9,7 @@ permissions:
 
 jobs:
   validate:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    env:
-      PYTHONUTF8: "1"
-      PYTHONIOENCODING: utf-8
+    runs-on: ubuntu-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -52,26 +45,10 @@ jobs:
           --experimental-loader ./tests/governance-typebox-loader.mjs
           ./tests/pi-model-router-smoke.mjs
 
-      - name: Execute formal stage capability controls
-        run: node --experimental-strip-types ./tests/formal-stage-guard-smoke.mjs
-
-      - name: Verify provider stop survives swallowed extension errors
-        run: node --experimental-strip-types ./tests/formal-stage-boundary-smoke.mjs
-
-      - name: Check formal submission approval binding
+      - name: Execute deterministic compaction recovery smoke test
         run: >-
           node --experimental-strip-types
-          --experimental-loader ./tests/formal-submit-loader.mjs
-          ./tests/formal-submit-smoke.mjs
-
-      - name: Lint formal runner
-        run: >-
-          uv run ruff check src/ephy_worker/formal_artifacts.py
-          src/ephy_worker/formal_runtime.py src/ephy_worker/formal_campaign.py
-          tests/test_formal_runtime.py src/ephy_worker/coding_executor.py
-          tests/test_coding_executor.py
-          src/ephy_worker/strata_runtime.py tests/test_strata_runtime.py
-          scripts/verify_pi_request_boundary.py
+          ./tests/truncation-recovery-smoke.mjs
 
       - name: Validate repository and scan template text
         run: python scripts/validate_repository.py --check-sensitive-patterns

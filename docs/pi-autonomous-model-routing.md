@@ -59,6 +59,19 @@ Copy-Item configs\pi-autonomous-settings.example.json (Join-Path $env:PI_CODING_
 .\tools\pi-local\run.ps1
 ```
 
+既存のWindows `dual-local` providerと，起動済みのllama.cpp routerを再利用する場合は，専用catalogの代わりにprovider extensionを明示できます．これは対話用経路であり，managed自己改善Jobには使用しません．最初は`EPHY_PI_READ_ONLY=1`で起動し，書込みを許可する対話runは利用者が別途判断します．
+
+```powershell
+$env:EPHY_PI_EXECUTABLE = 'C:\path\to\pi.exe'
+$env:EPHY_PI_PROVIDER_EXTENSION = 'C:\path\to\dual-provider.ts'
+$env:DUAL_LLAMA_BASE_URL = 'http://127.0.0.1:18080'
+$env:EPHY_PI_MODEL_PROVIDER = 'dual-local'
+$env:EPHY_PI_REASONING_MODEL = 'gpt-oss-20b-MXFP4'
+$env:EPHY_PI_CODER_MODEL = 'Qwen3-Coder-Next-Q4_K_M'
+$env:EPHY_PI_READ_ONLY = '1'
+.\tools\pi-local\run.ps1
+```
+
 Pi executableが`PATH`にない場合は，`EPHY_PI_EXECUTABLE`へbinary pathを設定する．provider名やmodel IDを変えた場合は，次の環境変数をPi catalogと一致させる．
 
 ```text
@@ -84,4 +97,4 @@ Piは次のsubstantial phaseに別modelが適する場合だけ`ephy_select_mode
 
 2026-09-24にmacOS／Apple Metal／llama.cppの`--models-max 1`構成で確認した．Reasoningから開始したPiへ，未実装のPython集計関数と2件のunittestを渡した．Piは実装phaseでCoderへ切り替え，fileを編集して2件を成功させた後，最終確認でReasoningへ戻った．外部processから同じ2件を再実行して成功を確認し，JSONLには両方向の`model_switch`，model ID，thinking，理由，作業directoryが記録された．
 
-Windows用起動scriptのargument contractとrouterのmanaged-session無効化はoffline smoke testで検査する．WindowsでのGGUF load，GPU inference，実modelによる自律切替は未検証である．model載せ替えには待ち時間が発生するため，短いphaseごとの切替には向かない．
+Windows用起動scriptのargument contractとrouterのmanaged-session無効化はoffline smoke testで検査する．2026-09-24にはWindows／Pi 0.86.1／既存`dual-local` providerで，loaded済みの`gpt-oss-20b-MXFP4`から`Qwen3-Coder-Next-Q4_K_M`へtoolで切り替え，次のinferenceがQwenから`ROUTER_OK`を返すbounded read-only probeを確認した．これはmodel切替の接続確認であり，coding品質，長時間安定性，formal自己改善workflowを合格にするものではない．model載せ替え構成では待ち時間が発生するため，短いphaseごとの切替には向かない．

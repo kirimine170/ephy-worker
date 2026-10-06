@@ -43,6 +43,25 @@ MAX_SNAPSHOT_BYTES = 20 * 1024**2
 MAX_SNAPSHOT_FILES = 2000
 
 
+def _remove_tree(path: Path) -> None:
+    """Remove a worker-owned tree, tolerating short-lived Windows file locks．"""
+
+    def clear_readonly(function, name, _error):
+        os.chmod(name, stat.S_IWRITE)
+        function(name)
+
+    for attempt in range(5):
+        try:
+            shutil.rmtree(path, onexc=clear_readonly)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if attempt == 4:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+
+
 def _macos_write_guard(command: list[str], job: CodingJob, worktree: Path | None = None) -> list[str]:
     """Confine child writes while retaining local model-server connectivity．"""
 
@@ -124,12 +143,19 @@ def resolve_repository(repository_path: Path, revision: str) -> tuple[Path, str]
     root_result = _git(requested, "rev-parse", "--show-toplevel", check=False)
     if root_result.returncode:
         raise CodingExecutionError("repository_unavailable", "repository", "path is not a Git worktree")
-    root = Path(root_result.stdout.strip()).resolve()
-    if root != requested:
+    # Do not parse --show-toplevel back into a Path here. Git distributions
+    # backed by MSYS may emit /c/... even when invoked from native Python,
+    # which pathlib interprets as a different Windows path. --show-prefix is
+    # empty exactly at the worktree root and avoids that representation issue.
+    prefix_result = _git(requested, "rev-parse", "--show-prefix", check=False)
+    if prefix_result.returncode or prefix_result.stdout.strip():
         raise CodingExecutionError(
             "repository_unavailable", "repository", "repository_path must name the Git worktree root"
         )
-    revision_result = _git(root, "rev-parse", "--verify", f"{revision}^{{commit}}", check=False)
+    root = requested
+    # ^0 verifies and peels to a commit like ^{commit}, without MSYS argument
+    # conversion stripping braces when this module runs under native Python.
+    revision_result = _git(root, "rev-parse", "--verify", f"{revision}^0", check=False)
     if revision_result.returncode:
         raise CodingExecutionError("invalid_revision", "repository", "base revision does not resolve")
     return root, revision_result.stdout.strip()
@@ -143,7 +169,6 @@ class WorkingTreeSnapshot:
         self.source_revision = source_revision
         self.untracked_paths = untracked_paths
         self.temporary_root: Path | None = None
-        self._owned_root: Path | None = None
         self.repository: Path | None = None
         self.manifest: dict | None = None
 
@@ -175,7 +200,6 @@ class WorkingTreeSnapshot:
     def create(self) -> tuple[Path, str, dict]:
         files = self.files()
         self.temporary_root = Path(tempfile.mkdtemp(prefix="ephy-worker-source-"))
-        self._owned_root = self.temporary_root.resolve(strict=True)
         self.repository = self.temporary_root / "repository"
         self.repository.mkdir()
         copied: list[dict] = []
@@ -234,31 +258,8 @@ class WorkingTreeSnapshot:
 
     def cleanup(self) -> None:
         if self.temporary_root is not None:
-            root = self.temporary_root
-            if root.is_symlink() or root.resolve(strict=True) != self._owned_root:
-                raise OSError("Snapshot cleanup target is not the allocated directory")
-
-            def remove_readonly_object(function, path, exception):
-                target = Path(path)
-                metadata = target.lstat()
-                # Git marks its own objects read-only on Windows. Clear only that
-                # file attribute inside this allocation; ACL failures stay errors.
-                if (
-                    os.name != "nt"
-                    or not isinstance(exception, PermissionError)
-                    or function is not os.unlink
-                    or not stat.S_ISREG(metadata.st_mode)
-                    or metadata.st_nlink != 1
-                    or not getattr(metadata, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_READONLY
-                    or not target.resolve(strict=True).is_relative_to(self._owned_root)
-                ):
-                    raise exception
-                target.chmod(metadata.st_mode | stat.S_IWRITE)
-                function(path)
-
-            shutil.rmtree(root, onexc=remove_readonly_object)
+            _remove_tree(self.temporary_root)
             self.temporary_root = None
-            self._owned_root = None
             self.repository = None
 
 
@@ -564,7 +565,20 @@ class PiRpcRunner:
         if not resolved or not Path(resolved).is_file():
             raise CodingExecutionError("pi_executable_unavailable", "agent", "Pi executable was not found")
         await _check_endpoint(profile)
-        command = _macos_write_guard(self.invocation(profile), job, worktree)
+        invocation = self.invocation(profile)
+        invocation[0] = str(resolved)
+        if os.name == "nt" and not Path(resolved).suffix:
+            # Native Windows cannot execute a Unix-style, extensionless script.
+            # Honor a direct, absolute shebang so deterministic Pi fixtures and
+            # locally wrapped runners behave the same way on both platforms.
+            try:
+                shebang = Path(resolved).read_text(encoding="utf-8").splitlines()[0]
+            except (OSError, UnicodeError, IndexError):
+                shebang = ""
+            interpreter = Path(shebang[2:].strip()) if shebang.startswith("#!") else None
+            if interpreter is not None and interpreter.is_absolute() and interpreter.is_file():
+                invocation = [str(interpreter), str(resolved), *invocation[1:]]
+        command = _macos_write_guard(invocation, job, worktree)
         environment = os.environ.copy()
         environment["EPHY_NETWORK_POLICY"] = job.network_policy
         kwargs = {"start_new_session": True} if os.name == "posix" else {}

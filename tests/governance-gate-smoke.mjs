@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { copyFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -39,6 +39,7 @@ const leadTools = [
   "background_job_status",
   "background_job_cancel",
 ];
+const implementerTools = ["read", "grep", "find", "ls", "edit", "write"];
 
 class FakePi {
   constructor() {
@@ -174,6 +175,18 @@ async function completeAcknowledgement(pi, input) {
   return acknowledgement;
 }
 
+async function completeImmediateAcknowledgement(pi, input) {
+  const callDecision = await pi.emit("tool_call", {
+    toolName: "governance_ack",
+    toolCallId: "ack-1",
+    input,
+  });
+  assert.equal(callDecision, undefined);
+  const acknowledgement = await pi.tools.get("governance_ack").execute("ack-1", input);
+  assert.equal(acknowledgement.details.phase, "ready");
+  return acknowledgement;
+}
+
 async function testHappyPathAndToolCeiling(governanceGate) {
   const contextRoot = await makeContextRoot();
   try {
@@ -271,10 +284,77 @@ async function testUnsupportedRoleFailsClosed(governanceGate) {
   }
 }
 
+async function testImplementerWorkspaceConfinement(governanceGate) {
+  const contextRoot = await makeContextRoot();
+  const isolatedWorkspace = await mkdtemp(join(tmpdir(), "ephy-implementer-workspace-"));
+  const outsideRoot = await mkdtemp(join(tmpdir(), "ephy-implementer-outside-"));
+  const originalCwd = process.cwd();
+  try {
+    const first = await startGate(governanceGate, contextRoot, "implementer");
+    const firstAck = await prepareAcknowledgement(first.pi, first.section);
+    await completeImmediateAcknowledgement(first.pi, firstAck.input);
+    assert.deepEqual(first.pi.getActiveTools(), implementerTools);
+
+    const allowed = await first.pi.emit("tool_call", {
+      toolName: "edit",
+      toolCallId: "edit-inside",
+      input: { path: "docs/self-improvement-mvp.md" },
+    });
+    assert.equal(allowed, undefined);
+
+    const escaped = await first.pi.emit("tool_call", {
+      toolName: "write",
+      toolCallId: "write-outside",
+      input: { path: "../outside.txt" },
+    });
+    assert.equal(escaped.block, true);
+    assert.equal(escaped.terminate, true);
+    assert.match(escaped.reason, /escapes the governed workspace root/);
+    assert.deepEqual(first.pi.getActiveTools(), []);
+
+    const second = await startGate(governanceGate, contextRoot, "implementer");
+    const secondAck = await prepareAcknowledgement(second.pi, second.section);
+    await completeImmediateAcknowledgement(second.pi, secondAck.input);
+    const shell = await second.pi.emit("tool_call", {
+      toolName: "powershell",
+      toolCallId: "shell-forbidden",
+      input: { command: "Set-Content ../outside.txt forbidden" },
+    });
+    assert.equal(shell.block, true);
+    assert.equal(shell.terminate, true);
+    assert.match(shell.reason, /exceeds the enforced tool ceiling/);
+
+    await writeFile(join(outsideRoot, "target.txt"), "outside\n", "utf8");
+    await symlink(
+      outsideRoot,
+      join(isolatedWorkspace, "escape"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    process.chdir(isolatedWorkspace);
+    const third = await startGate(governanceGate, contextRoot, "implementer");
+    const thirdAck = await prepareAcknowledgement(third.pi, third.section);
+    await completeImmediateAcknowledgement(third.pi, thirdAck.input);
+    const symlinkEscape = await third.pi.emit("tool_call", {
+      toolName: "read",
+      toolCallId: "read-symlink-escape",
+      input: { path: "escape/target.txt" },
+    });
+    assert.equal(symlinkEscape.block, true);
+    assert.equal(symlinkEscape.terminate, true);
+    assert.match(symlinkEscape.reason, /symlink or junction/);
+  } finally {
+    process.chdir(originalCwd);
+    await rm(contextRoot, { recursive: true, force: true });
+    await rm(isolatedWorkspace, { recursive: true, force: true });
+    await rm(outsideRoot, { recursive: true, force: true });
+  }
+}
+
 process.chdir(repositoryRoot);
 const { default: governanceGate } = await import(pathToFileURL(gatePath).href);
 await testHappyPathAndToolCeiling(governanceGate);
 await testInvalidAcknowledgementLatches(governanceGate);
 await testContextHashMutationLatches(governanceGate);
 await testUnsupportedRoleFailsClosed(governanceGate);
-console.log("PASS: governance gate executable lifecycle smoke test (4 scenarios)");
+await testImplementerWorkspaceConfinement(governanceGate);
+console.log("PASS: governance gate executable lifecycle smoke test (5 scenarios)");
