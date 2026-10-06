@@ -32,7 +32,6 @@ SCHEMA = "ephy.karte-consumer-job.v1"
 STOPPED = {
     "external_review_pending",
     "review_ready",
-    "audit_pending",
     "verification_failed",
     "failed",
     "cancelled",
@@ -225,7 +224,23 @@ def record_result(
             record["error_type"] = type(exc).__name__
             transitions.append({"state": "verification_failed", "at": now()})
             _retain(sidecar, "status-" + digest(status_raw) + ".json", status_raw)
-            write_json(safe_path(sidecar, "state.json", missing=True), record, exclusive=False)
+            if previous is None:
+                write_json(safe_path(sidecar, "state.json", missing=True), record, exclusive=False)
+            else:
+                failure = encode(
+                    {
+                        "schema_version": "ephy.karte-consumer-verification-failure.v1",
+                        "state": "verification_failed",
+                        "job_sha256": job_pin,
+                        "status_sha256": digest(status_raw),
+                        "previous_state_sha256": digest(_read(state_file)),
+                        "error_type": type(exc).__name__,
+                        "at": now(),
+                        "adopted": False,
+                        "review_ready": False,
+                    }
+                )
+                _retain(sidecar, "verification-failure-" + digest(failure) + ".json", failure)
             raise GateFailure("Karte result verification failed; see consumer sidecar") from exc
         _retain(sidecar, "status-" + digest(status_raw) + ".json", status_raw)
         write_json(safe_path(sidecar, "state.json", missing=True), record, exclusive=False)

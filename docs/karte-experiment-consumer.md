@@ -17,7 +17,9 @@ raw receipt file is insufficient because receipt v1.1 has no proposal digest．
 
 The consumer checks the candidate and payload pins，supported schema versions，
 all imported byte counts and hashes，the complete ordered Worker inventory，
-manifest/adapter identities，record evidence and candidate patch hash．Inputs
+manifest/adapter identities，all shared record/adapter provenance fields，record
+evidence and candidate patch hash．The observations must match the producer's
+Worker result prefix followed by the original metadata observations．Inputs
 must be bounded immutable bytes．Artifact paths in the Worker manifest are
 never opened by this library．Malformed JSON，duplicate keys，missing evidence，
 modified bytes，unknown phases and authority claims fail closed．This does not
@@ -71,7 +73,8 @@ python scripts/validate_repository.py --check-sensitive-patterns
 entrypoint for an existing Worker Job schemaVersion 2．It checks the Job ID，base，
 contract and original `audit-bundle` artifact bytes against the same consumer
 binding．The frozen task artifact must contain the Job's exact contract，and the
-standalone `candidate.patch` must match the bundle patch．Queued or running Jobs
+standalone `candidate.patch` must match the bundle patch．Queued，running or
+`audit_pending` Jobs
 are refused．The canonical `job.json`，frozen
 bundle，model runner and adoption gates are unchanged．The adapter never launches
 Pi，contacts a model，or calls an integration operation．
@@ -80,8 +83,13 @@ The separate `JOB_DIR/karte-consumer/state.json` records `received → verified 
 review_pending` with the immutable review target．This sidecar is consumer
 progress，not formal workflow completion or a positive review decision．Rejected，
 conflict，invalid，halted or failed Worker results end at `result_failed`；cancellation
-latches at `cancelled`．Missing or changed evidence records `verification_failed`
-and raises an error．Every state retains `adopted=false` and `review_ready=false`．
+latches at `cancelled`．Missing or changed evidence raises an error．An initial
+invalid result records `verification_failed`；a failed retry preserves the last
+validated `state.json` and records a separate content-addressed
+`verification-failure-SHA256.json` diagnostic，bound to the raw status and prior
+state hashes．Restoring evidence allows the original duplicate receipt to remain
+idempotent without losing cancellation or prior review progress．Every state
+retains `adopted=false` and `review_ready=false`．
 Identical retries revalidate evidence and leave saved files unchanged．
 
 Payload，adapter metadata and raw status snapshots are retained without replacing

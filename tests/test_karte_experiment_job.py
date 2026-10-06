@@ -203,7 +203,7 @@ def test_wrong_job_base_or_live_metadata_refused_before_sidecar_write(connected_
     assert snapshot(job_file.parent) == before
 
 
-@pytest.mark.parametrize("state", ["queued", "running", "preparing"])
+@pytest.mark.parametrize("state", ["queued", "running", "preparing", "audit_pending"])
 def test_active_job_is_not_touched(connected_job, state):
     job_file, fixture = connected_job
     job = read_json(job_file)
@@ -213,6 +213,57 @@ def test_active_job_is_not_touched(connected_job, state):
     with pytest.raises(GateFailure):
         receive(job_file, fixture)
     assert snapshot(job_file.parent) == before
+
+
+@pytest.mark.parametrize(
+    "phase,cancelled", [("pending", True), ("report_accepted", False), ("rejected", False)]
+)
+@pytest.mark.parametrize("mutation", ["missing", "malformed"])
+def test_invalid_retry_preserves_verified_state_and_recovers_idempotently(
+    connected_job, phase, cancelled, mutation
+):
+    job_file, fixture = connected_job
+    first = receive(job_file, fixture, phase, cancelled=cancelled)
+    sidecar = job_file.parent / "karte-consumer"
+    state_raw = (sidecar / "state.json").read_bytes()
+    job_raw = job_file.read_bytes()
+    bundle = job_file.parent / "audit-bundle"
+    artifact = bundle / "artifacts/candidate_patch.txt"
+    original_artifact = artifact.read_bytes()
+    status_raw = encode(fixture.status(phase))
+    if mutation == "missing":
+        artifact.unlink()
+    else:
+        status_raw = b"{malformed retry"
+    before_bundle = snapshot(bundle)
+    with pytest.raises(GateFailure):
+        record_result(
+            job_file,
+            status_raw,
+            fixture.payload,
+            fixture.artifacts["adapter/metadata.json"],
+            candidate_id=fixture.candidate,
+            payload_sha256=fixture.pin,
+        )
+    assert (sidecar / "state.json").read_bytes() == state_raw
+    failures = list(sidecar.glob("verification-failure-*.json"))
+    assert len(failures) == 1
+    failure = read_json(failures[0])
+    assert failure["state"] == "verification_failed"
+    assert failure["previous_state_sha256"] == digest(state_raw)
+    assert failure["status_sha256"] == digest(status_raw)
+    assert failure["adopted"] is False and failure["review_ready"] is False
+    assert job_file.read_bytes() == job_raw
+    assert snapshot(bundle) == before_bundle
+    if mutation == "missing":
+        artifact.write_bytes(original_artifact)
+    before_retry = snapshot(job_file.parent)
+    retry = receive(job_file, fixture, phase)
+    assert retry["duplicate"]
+    assert retry["state"] == first["state"]
+    assert retry["observation"]["cancelled"] == cancelled
+    assert (sidecar / "state.json").read_bytes() == state_raw
+    assert snapshot(job_file.parent) == before_retry
 
 
 def test_changed_payload_cannot_overwrite_immutable_snapshot(connected_job):

@@ -335,11 +335,6 @@ def consume_result(
         or metadata.get("synthetic_only") is not True
     ):
         raise ConsumerFailure("Only the synthetic Worker adapter v1 is supported")
-    if any(
-        metadata.get(field) != getattr(target, field)
-        for field in ("candidate_id", "experiment_id", "run_id", "attempt_id", "target_commit")
-    ):
-        raise ConsumerFailure("Adapter identity mismatch")
     worker_result = metadata.get("worker_result")
     if not isinstance(worker_result, str) or worker_result not in {
         "strict_pass",
@@ -347,6 +342,18 @@ def consume_result(
         "external_review_pending",
     }:
         raise ConsumerFailure("Unsupported Worker result")
+    record = _decode(payload_raw)["record"]
+    shared = metadata.keys() & record.keys() - {"observations"}
+    if any(not isinstance(metadata[field], str) or metadata[field] != record[field] for field in shared):
+        raise ConsumerFailure("Adapter metadata differs from the bound experiment record")
+    observations = metadata["observations"]
+    if (
+        not isinstance(observations, list)
+        or not observations
+        or any(not isinstance(value, str) or not value.strip() for value in observations)
+        or record["observations"] != ["Worker result (unverified): " + worker_result, *observations]
+    ):
+        raise ConsumerFailure("Experiment observations differ from the producer metadata transform")
     status = _object(
         _decode(status_raw),
         {"candidate_id", "phase", "payload_sha256", "state", "verification", "adopted"},

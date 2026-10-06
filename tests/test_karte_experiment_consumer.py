@@ -81,6 +81,10 @@ class KarteExperimentConsumerTests(unittest.TestCase):
             "verification": "unverified",
             "patch_sha256": sha(self.artifacts["worker/artifacts/candidate_patch"]),
         }
+        self.record["observations"] = [
+            "Worker result (unverified): " + self.metadata["worker_result"],
+            *self.metadata["observations"],
+        ]
         self.proposal = {
             "schema_version": "1.1",
             "candidate_id": self.candidate,
@@ -204,6 +208,10 @@ class KarteExperimentConsumerTests(unittest.TestCase):
     def test_failed_and_strict_worker_results_never_grant_adoption(self) -> None:
         for label in ("external_review_pending", "halted", "strict_pass"):
             self.metadata["worker_result"] = label
+            self.record["observations"] = [
+                "Worker result (unverified): " + label,
+                *self.metadata["observations"],
+            ]
             self.artifacts[METADATA_REF] = encode(self.metadata)
             self.rebind()
             for phase in ("prepared", "pending", "report_accepted", "rejected", "conflict", "invalid"):
@@ -300,6 +308,44 @@ class KarteExperimentConsumerTests(unittest.TestCase):
         self.rebind()
         with self.assertRaises(ConsumerFailure):
             self.consume(previous=previous)
+
+    def test_record_and_metadata_shared_provenance_must_agree_even_with_valid_hashes(self) -> None:
+        metadata = copy.deepcopy(self.metadata)
+        record = copy.deepcopy(self.record)
+        shared = sorted(self.metadata.keys() & self.record.keys())
+        for field in shared:
+            for side in ("metadata", "record"):
+                self.metadata = copy.deepcopy(metadata)
+                self.record = copy.deepcopy(record)
+                target = self.metadata if side == "metadata" else self.record
+                target[field] = ["different observation"] if field == "observations" else "other-" + field
+                self.artifacts[METADATA_REF] = encode(self.metadata)
+                self.rebind()
+                with self.subTest(field=field, side=side), self.assertRaises(ConsumerFailure):
+                    self.consume()
+        self.metadata = metadata
+        self.record = record
+        self.artifacts[METADATA_REF] = encode(metadata)
+        self.rebind()
+        self.assertEqual(self.consume().observation.worker_result, metadata["worker_result"])
+
+    def test_observations_retain_the_producer_worker_result_prefix_and_facts(self) -> None:
+        for mutation in ("label", "empty", "non-list", "missing-prefix", "extra"):
+            self.setUp()
+            if mutation == "label":
+                self.metadata["worker_result"] = "strict_pass"
+            elif mutation == "empty":
+                self.metadata["observations"] = []
+            elif mutation == "non-list":
+                self.metadata["observations"] = "synthetic evidence"
+            elif mutation == "missing-prefix":
+                self.record["observations"] = self.metadata["observations"]
+            else:
+                self.record["observations"].append("substituted extra fact")
+            self.artifacts[METADATA_REF] = encode(self.metadata)
+            self.rebind()
+            with self.subTest(mutation=mutation), self.assertRaises(ConsumerFailure):
+                self.consume()
 
     def test_terminal_receipt_cannot_be_substituted_or_regressed(self) -> None:
         for phase in ("report_accepted", "rejected", "conflict", "invalid"):
