@@ -310,7 +310,8 @@ async def test_complete_report_provenance_and_fresh_job(tmp_path):
     assert len(w.search.calls) == 3 and len(report.sources) == 5
     assert report.claims[0].checked
     assert report.evidence[0].page == 8
-    saved = json.loads((w.store.directory / "report.json").read_text())
+    report_text = (w.store.directory / "report.json").read_text(encoding="utf-8", errors="ignore")
+    saved = json.loads(report_text)
     assert saved["state"] == report.state
     assert (w.store.directory / "report.md").exists()
     assert w.model.closed

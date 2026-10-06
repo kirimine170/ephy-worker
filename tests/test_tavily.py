@@ -309,7 +309,7 @@ def test_real_cli_missing_key_creates_no_job(monkeypatch, tmp_path):
 
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
     path = fixture_config(tmp_path)
-    data = yaml.safe_load(path.read_text())
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
     data["search"] = {"provider": "tavily"}
     path.write_text(yaml.safe_dump(data), encoding="utf-8")
     proc = subprocess.run(
@@ -393,7 +393,8 @@ async def test_full_workflow_uses_tavily_candidates_not_snippet_evidence(
     assert "INCORRECT" not in report.evidence[0].quote
     assert report.metrics["search"]["credits_reported"] == 3
     assert report.metrics["requests"]["search_requests"] == 6
-    assert key not in (store.directory / "report.json").read_text()
+    report_text = (store.directory / "report.json").read_text(encoding="utf-8", errors="ignore")
+    assert key not in report_text
 
 
 async def test_unexpected_usage_halts_and_unknown_usage_is_not_echoed(key):
@@ -568,7 +569,7 @@ def test_cli_usage_only_missing_key_does_not_probe_any_service(monkeypatch, tmp_
 
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
     path = fixture_config(tmp_path)
-    data = yaml.safe_load(path.read_text())
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
     data["search"] = {"provider": "tavily"}
     path.write_text(yaml.safe_dump(data), encoding="utf-8")
     assert main(["doctor", "--config", str(path), "--usage-only"]) == 1
