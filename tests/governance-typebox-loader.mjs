@@ -1,25 +1,31 @@
 const typeboxStub = `
 export const Type = {
+	Array(items, options = {}) {
+		return { type: "array", items, ...options };
+	},
+	Integer(options = {}) {
+		return { type: "integer", ...options };
+	},
   Literal(value) {
     return { const: value };
   },
-  Optional(schema) {
-    return { ...schema, optional: true };
-  },
+	Optional(schema) {
+		return { ...schema, optional: true };
+	},
   Object(properties, options = {}) {
     return {
       type: "object",
       properties,
-      required: Object.keys(properties),
+			required: Object.keys(properties).filter((key) => properties[key]?.optional !== true),
       ...options,
     };
   },
   String(options = {}) {
     return { type: "string", ...options };
   },
-  Union(items, options = {}) {
-    return { anyOf: items, ...options };
-  },
+	Union(items) {
+		return { anyOf: items };
+	},
 };
 `;
 
