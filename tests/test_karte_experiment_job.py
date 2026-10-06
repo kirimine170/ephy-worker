@@ -664,3 +664,300 @@ def test_saved_json_cannot_be_malformed_nonobject_empty_or_unbounded(connected_j
     with pytest.raises(GateFailure):
         receive(job_file, fixture)
     assert snapshot(job_file.parent) == before
+
+
+class SimulatedConsumerExit(BaseException):
+    """Interrupt only this synthetic call without stopping any host process."""
+
+
+@pytest.mark.parametrize("latch", ["terminal", "cancelled"])
+@pytest.mark.parametrize("failure", [SimulatedConsumerExit, OSError], ids=["exit", "io"])
+def test_latch_ahead_interruption_recovers_without_deleting_evidence(
+    connected_job, monkeypatch, latch, failure
+):
+    import ephy_worker.karte_experiment_job as adapter
+
+    job_file, fixture = connected_job
+    receive(job_file, fixture, "pending")
+    original_job = job_file.read_bytes()
+    original_bundle = snapshot(job_file.parent / "audit-bundle")
+    old_state = (job_file.parent / "karte-consumer/state.json").read_bytes()
+    phase = "report_accepted" if latch == "terminal" else "pending"
+    cancelled = latch == "cancelled"
+    retain = adapter._retain
+
+    def interrupt(directory, name, raw):
+        retain(directory, name, raw)
+        if name == latch + ".json":
+            raise failure("synthetic interruption after durable latch")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(adapter, "_retain", interrupt)
+        with pytest.raises((SimulatedConsumerExit, GateFailure, OSError)):
+            receive(job_file, fixture, phase, cancelled=cancelled)
+    recovered = receive(job_file, fixture, phase, cancelled=cancelled)
+    assert recovered["state"] == ("cancelled" if cancelled else "review_pending")
+    assert recovered["observation"]["producer_phase"] == phase
+    assert recovered["observation"]["cancelled"] is cancelled
+    assert recovered["adopted"] is False and recovered["review_ready"] is False
+    assert job_file.read_bytes() == original_job
+    assert snapshot(job_file.parent / "audit-bundle") == original_bundle
+    before = snapshot(job_file.parent)
+    assert receive(job_file, fixture, phase)["duplicate"]
+    assert snapshot(job_file.parent) == before
+    (job_file.parent / "karte-consumer/state.json").write_bytes(old_state)
+    before = snapshot(job_file.parent)
+    with pytest.raises(GateFailure):
+        receive(job_file, fixture, "pending")
+    assert snapshot(job_file.parent) == before
+
+
+COMMIT_INTERRUPTS = [
+    (phase, cancelled, stage, position, failure)
+    for phase, cancelled in [("report_accepted", False), ("pending", True), ("report_accepted", True)]
+    for stage in ["status", "checkpoint", "journal", "terminal", "cancelled", "state", "cleanup"]
+    if (stage != "terminal" or phase == "report_accepted") and (stage != "cancelled" or cancelled)
+    for position in ["before", "after"]
+    for failure in ["exit", "io"]
+]
+
+
+@pytest.mark.parametrize("phase,cancelled,stage,position,failure", COMMIT_INTERRUPTS)
+def test_every_commit_boundary_recovers_and_preserves_latches(
+    connected_job, monkeypatch, phase, cancelled, stage, position, failure
+):
+    import ephy_worker.karte_experiment_job as adapter
+
+    job_file, fixture = connected_job
+    receive(job_file, fixture, "pending")
+    state_file = job_file.parent / "karte-consumer/state.json"
+    old_state = state_file.read_bytes()
+    original_job = job_file.read_bytes()
+    original_bundle = snapshot(job_file.parent / "audit-bundle")
+    retain, replace, unlink = adapter._retain, adapter._replace, Path.unlink
+    fired = False
+
+    def fail():
+        nonlocal fired
+        fired = True
+        exception = SimulatedConsumerExit if failure == "exit" else OSError
+        raise exception("synthetic commit boundary interruption")
+
+    def retained(directory, name, raw):
+        selected = (
+            (stage == "status" and name.startswith("status-"))
+            or (stage == "checkpoint" and name.startswith("state-") and digest(raw) != digest(old_state))
+            or (stage == "journal" and name == "transaction.json")
+            or (stage == "terminal" and name == "terminal.json")
+            or (stage == "cancelled" and name == "cancelled.json")
+        ) and not fired
+        if selected and position == "before":
+            fail()
+        retain(directory, name, raw)
+        if selected and position == "after":
+            fail()
+
+    def replaced(path, raw):
+        selected = stage == "state" and path.name == "state.json" and not fired
+        if selected and position == "before":
+            fail()
+        replace(path, raw)
+        if selected and position == "after":
+            fail()
+
+    def unlinked(path, *args, **kwargs):
+        selected = stage == "cleanup" and path.name == "transaction.json" and not fired
+        if selected and position == "before":
+            fail()
+        unlink(path, *args, **kwargs)
+        if selected and position == "after":
+            fail()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(adapter, "_retain", retained)
+        patch.setattr(adapter, "_replace", replaced)
+        patch.setattr(Path, "unlink", unlinked)
+        with pytest.raises((SimulatedConsumerExit, GateFailure, OSError)):
+            receive(job_file, fixture, phase, cancelled=cancelled)
+    assert fired
+    recovered = receive(job_file, fixture, phase, cancelled=cancelled)
+    assert recovered["state"] == ("cancelled" if cancelled else "review_pending")
+    assert recovered["observation"]["producer_phase"] == phase
+    assert recovered["observation"]["cancelled"] is cancelled
+    assert recovered["adopted"] is False and recovered["review_ready"] is False
+    assert not (state_file.parent / "transaction.json").exists()
+    assert job_file.read_bytes() == original_job
+    assert snapshot(job_file.parent / "audit-bundle") == original_bundle
+    before = snapshot(job_file.parent)
+    assert receive(job_file, fixture, phase)["duplicate"]
+    assert snapshot(job_file.parent) == before
+    state_file.write_bytes(old_state)
+    before = snapshot(job_file.parent)
+    with pytest.raises(GateFailure):
+        receive(job_file, fixture, "pending")
+    assert snapshot(job_file.parent) == before
+
+
+@pytest.mark.parametrize(
+    "stage",
+    ["payload", "metadata", "status", "checkpoint", "journal", "terminal", "cancelled", "state", "cleanup"],
+)
+def test_first_commit_interruption_can_recover(connected_job, monkeypatch, stage):
+    import ephy_worker.karte_experiment_job as adapter
+
+    job_file, fixture = connected_job
+    retain, replace, unlink = adapter._retain, adapter._replace, Path.unlink
+    fired = False
+
+    def retained(directory, name, raw):
+        nonlocal fired
+        retain(directory, name, raw)
+        if not fired and (
+            (
+                stage in {"payload", "metadata", "journal", "terminal", "cancelled"}
+                and name == ({"journal": "transaction"}.get(stage, stage) + ".json")
+            )
+            or (stage == "status" and name.startswith("status-"))
+            or (stage == "checkpoint" and name.startswith("state-"))
+        ):
+            fired = True
+            raise SimulatedConsumerExit("synthetic first-commit interruption")
+
+    def replaced(path, raw):
+        nonlocal fired
+        replace(path, raw)
+        if stage == "state" and path.name == "state.json" and not fired:
+            fired = True
+            raise SimulatedConsumerExit("synthetic first-state interruption")
+
+    def unlinked(path, *args, **kwargs):
+        nonlocal fired
+        unlink(path, *args, **kwargs)
+        if stage == "cleanup" and path.name == "transaction.json" and not fired:
+            fired = True
+            raise SimulatedConsumerExit("synthetic journal-cleanup interruption")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(adapter, "_retain", retained)
+        patch.setattr(adapter, "_replace", replaced)
+        patch.setattr(Path, "unlink", unlinked)
+        with pytest.raises(SimulatedConsumerExit):
+            receive(job_file, fixture, cancelled=True)
+    assert fired
+    committed = stage in {"journal", "terminal", "cancelled", "state", "cleanup"}
+    # Repeat uncommitted arguments; a committed journal keeps cancellation by itself.
+    recovered = receive(job_file, fixture, cancelled=not committed)
+    assert recovered["state"] == "cancelled"
+    assert recovered["observation"]["cancelled"] is True
+    assert recovered["adopted"] is False and recovered["review_ready"] is False
+    before = snapshot(job_file.parent)
+    assert receive(job_file, fixture)["duplicate"]
+    assert snapshot(job_file.parent) == before
+
+
+@pytest.mark.parametrize("name", ["payload.json", "metadata.json", "status.json", "state.json"])
+def test_snapshot_io_failure_never_publishes_partial_bytes(tmp_path, monkeypatch, name):
+    import ephy_worker.karte_experiment_job as adapter
+
+    raw = b'{"complete":true}\n'
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            adapter.os, "fsync", lambda descriptor: (_ for _ in ()).throw(OSError("synthetic flush failure"))
+        )
+        with pytest.raises(OSError):
+            adapter._retain(tmp_path, name, raw)
+    assert not (tmp_path / name).exists()
+    assert not list(tmp_path.glob(".consumer-*.tmp"))
+    adapter._retain(tmp_path, name, raw)
+    assert (tmp_path / name).read_bytes() == raw
+
+
+def unfinished_commit(job_file, fixture, monkeypatch):
+    import ephy_worker.karte_experiment_job as adapter
+
+    receive(job_file, fixture, "pending")
+    retain = adapter._retain
+
+    def interrupt(directory, name, raw):
+        retain(directory, name, raw)
+        if name == "transaction.json":
+            raise SimulatedConsumerExit("synthetic durable journal interruption")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(adapter, "_retain", interrupt)
+        with pytest.raises(SimulatedConsumerExit):
+            receive(job_file, fixture, cancelled=True)
+    return job_file.parent / "karte-consumer"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "schema",
+        "job",
+        "previous",
+        "target",
+        "null-target",
+        "extra",
+        "malformed",
+        "checkpoint",
+        "rehash-target",
+        "status",
+    ],
+)
+def test_corrupt_transaction_is_rejected_before_recovery_writes(connected_job, monkeypatch, mutation):
+    job_file, fixture = connected_job
+    sidecar = unfinished_commit(job_file, fixture, monkeypatch)
+    journal_file = sidecar / "transaction.json"
+    journal = read_json(journal_file)
+    if mutation == "malformed":
+        journal_file.write_bytes(b"{")
+    elif mutation in {"checkpoint", "rehash-target", "status"}:
+        checkpoint = sidecar / ("state-" + journal["state_sha256"] + ".json")
+        record = read_json(checkpoint)
+        if mutation == "checkpoint":
+            checkpoint.write_bytes(checkpoint.read_bytes() + b" ")
+        elif mutation == "status":
+            (sidecar / ("status-" + record["status_sha256"] + ".json")).write_bytes(b"{}")
+        else:
+            record["observation"]["review_target"]["candidate_id"] = "other"
+            raw = encode(record)
+            (sidecar / ("state-" + digest(raw) + ".json")).write_bytes(raw)
+            journal["state_sha256"] = digest(raw)
+            write_json(journal_file, journal, exclusive=False)
+    else:
+        key, value = {
+            "schema": ("schema_version", "other"),
+            "job": ("job_sha256", "f" * 64),
+            "previous": ("previous_state_sha256", "f" * 64),
+            "target": ("state_sha256", "f" * 64),
+            "null-target": ("state_sha256", None),
+            "extra": ("unexpected", True),
+        }[mutation]
+        journal[key] = value
+        write_json(journal_file, journal, exclusive=False)
+    before = snapshot(job_file.parent)
+    with pytest.raises(GateFailure):
+        receive(job_file, fixture)
+    assert snapshot(job_file.parent) == before
+
+
+def test_transaction_recovery_revalidates_frozen_evidence_and_can_retry(connected_job, monkeypatch):
+    job_file, fixture = connected_job
+    sidecar = unfinished_commit(job_file, fixture, monkeypatch)
+    artifact = job_file.parent / "audit-bundle/candidate_patch.txt"
+    original = artifact.read_bytes()
+    artifact.write_bytes(original + b"substitution")
+    before = snapshot(job_file.parent)
+    with pytest.raises(GateFailure):
+        receive(job_file, fixture)
+    assert snapshot(job_file.parent) == before
+    artifact.write_bytes(original)
+    recovered = receive(job_file, fixture)
+    assert recovered["state"] == "cancelled"
+    assert recovered["observation"]["producer_phase"] == "report_accepted"
+    assert recovered["adopted"] is False and recovered["review_ready"] is False
+    assert not (sidecar / "transaction.json").exists()
+    before = snapshot(job_file.parent)
+    assert receive(job_file, fixture)["duplicate"]
+    assert snapshot(job_file.parent) == before

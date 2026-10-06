@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import stat
+import uuid
 from dataclasses import asdict
 from pathlib import Path
 
@@ -22,7 +23,6 @@ from .formal_artifacts import (
     now,
     read_json,
     safe_path,
-    write_json,
 )
 from .formal_runtime import exclusive_lock, validate_contract
 from .karte_experiment_consumer import (
@@ -66,14 +66,25 @@ def _read(path: Path, limit: int = MAX_JSON) -> bytes:
 
 def _retain(directory: Path, name: str, raw: bytes) -> None:
     path = safe_path(directory, name, missing=True)
+    if path.exists():
+        if _read(path) != raw:
+            raise GateFailure("Consumer immutable snapshot cannot be replaced") from None
+        return
+    # The consumer lock and stable controller-owned directory serialize these writes.
+    # Publish only complete bytes; a crash must not leave a partial immutable snapshot.
+    _replace(path, raw)
+
+
+def _replace(path: Path, raw: bytes) -> None:
+    temp = safe_path(path.parent, ".consumer-" + uuid.uuid4().hex + ".tmp", missing=True)
     try:
-        with path.open("xb") as stream:
+        with temp.open("xb") as stream:
             stream.write(raw)
             stream.flush()
             os.fsync(stream.fileno())
-    except FileExistsError:
-        if _read(path) != raw:
-            raise GateFailure("Consumer immutable snapshot cannot be replaced") from None
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def _state(observation: Observation, job: dict) -> str:
@@ -119,6 +130,8 @@ def _previous(
     payload_sha256: str,
     payload_raw: bytes,
     metadata_raw: bytes,
+    state_raw: bytes | None = None,
+    check_latches: bool = True,
 ) -> Observation | None:
     """Revalidate every saved field, status semantics and immutable latch."""
     try:
@@ -181,7 +194,8 @@ def _previous(
         else:
             if "error_type" in record:
                 raise GateFailure("Verified saved state cannot contain a failure claim")
-            state_raw = _read(safe_path(sidecar, "state.json"))
+            if state_raw is None:
+                state_raw = _read(safe_path(sidecar, "state.json"))
             if _read(safe_path(sidecar, "state-" + digest(state_raw) + ".json")) != state_raw:
                 raise GateFailure("Saved verified state differs from its immutable snapshot")
             metadata = read_json(sidecar / "metadata.json")
@@ -215,14 +229,20 @@ def _previous(
             if observation != reconstructed or record["state"] != _state(reconstructed, job):
                 raise GateFailure("Saved state or observation contradicts retained evidence")
             terminal = safe_path(sidecar, "terminal.json", missing=True)
-            if terminal.exists() and (
-                observation.producer_phase not in TERMINAL_PHASES
-                or _read(terminal) != _terminal(observation, job_pin)
+            if (
+                check_latches
+                and terminal.exists()
+                and (
+                    observation.producer_phase not in TERMINAL_PHASES
+                    or _read(terminal) != _terminal(observation, job_pin)
+                )
             ):
                 raise GateFailure("Saved terminal observation regressed")
             cancellation = safe_path(sidecar, "cancelled.json", missing=True)
-            if cancellation.exists() and (
-                not observation.cancelled or _read(cancellation) != _cancellation(target, job_pin)
+            if (
+                check_latches
+                and cancellation.exists()
+                and (not observation.cancelled or _read(cancellation) != _cancellation(target, job_pin))
             ):
                 raise GateFailure("Saved cancellation observation regressed")
             expected_states = ["received", "verified", record["state"]]
@@ -239,6 +259,113 @@ def _previous(
         return observation
     except (ConsumerFailure, OSError, KeyError, TypeError, ValueError) as exc:
         raise GateFailure("Invalid saved consumer state or immutable snapshot") from exc
+
+
+def _finish_transaction(sidecar: Path, record: dict, observation: Observation, job_pin: str) -> None:
+    terminal = safe_path(sidecar, "terminal.json", missing=True)
+    if terminal.exists() or observation.producer_phase in TERMINAL_PHASES:
+        _retain(sidecar, "terminal.json", _terminal(observation, job_pin))
+    if observation.cancelled:
+        _retain(sidecar, "cancelled.json", _cancellation(observation.review_target, job_pin))
+    _replace(safe_path(sidecar, "state.json", missing=True), encode(record))
+    safe_path(sidecar, "transaction.json").unlink()
+
+
+def _commit_state(sidecar: Path, record: dict, observation: Observation, previous_raw: bytes | None) -> None:
+    raw = encode(record)
+    if previous_raw is not None:
+        _retain(sidecar, "state-" + digest(previous_raw) + ".json", previous_raw)
+    _retain(sidecar, "state-" + digest(raw) + ".json", raw)
+    _retain(
+        sidecar,
+        "transaction.json",
+        encode(
+            {
+                "schema_version": "ephy.karte-consumer-transaction.v1",
+                "job_sha256": record["job_sha256"],
+                "previous_state_sha256": digest(previous_raw) if previous_raw is not None else None,
+                "state_sha256": digest(raw),
+            }
+        ),
+    )
+    _finish_transaction(sidecar, record, observation, record["job_sha256"])
+
+
+def _recover_transaction(
+    sidecar: Path,
+    current_raw: bytes | None,
+    *,
+    job_file: Path,
+    job: dict,
+    job_pin: str,
+    candidate_id: str,
+    payload_sha256: str,
+    payload_raw: bytes,
+    metadata_raw: bytes,
+) -> dict:
+    """Finish only a fully revalidated journal, never relax a committed latch."""
+    try:
+        journal_file = safe_path(sidecar, "transaction.json")
+        _read(journal_file)
+        journal = read_json(journal_file)
+        if (
+            not isinstance(journal, dict)
+            or journal.keys() != {"schema_version", "job_sha256", "previous_state_sha256", "state_sha256"}
+            or journal["schema_version"] != "ephy.karte-consumer-transaction.v1"
+            or journal["job_sha256"] != job_pin
+        ):
+            raise GateFailure("Invalid consumer transaction identity")
+        for pin in (journal["state_sha256"], journal["previous_state_sha256"]):
+            if pin is not None and (
+                not isinstance(pin, str) or len(pin) != 64 or any(c not in "0123456789abcdef" for c in pin)
+            ):
+                raise GateFailure("Invalid consumer transaction state pin")
+        next_pin = journal["state_sha256"]
+        prior_pin = journal["previous_state_sha256"]
+        if next_pin is None or next_pin == prior_pin:
+            raise GateFailure("Invalid consumer transaction progression")
+        if (digest(current_raw) if current_raw is not None else None) not in {prior_pin, next_pin}:
+            raise GateFailure("Consumer state differs from the journal predecessor and target")
+        options = {
+            "sidecar": sidecar,
+            "job": job,
+            "candidate_id": candidate_id,
+            "payload_sha256": payload_sha256,
+            "payload_raw": payload_raw,
+            "metadata_raw": metadata_raw,
+        }
+
+        def checkpoint(pin: str) -> tuple[dict, bytes]:
+            path = safe_path(sidecar, "state-" + pin + ".json")
+            raw = _read(path)
+            if digest(raw) != pin:
+                raise GateFailure("Consumer transaction checkpoint changed")
+            return read_json(path), raw
+
+        previous = None
+        if prior_pin is not None:
+            prior, prior_raw = checkpoint(prior_pin)
+            previous = _previous(prior, job_pin, state_raw=prior_raw, check_latches=False, **options)
+        record, next_raw = checkpoint(next_pin)
+        observation = _previous(record, job_pin, state_raw=next_raw, **options)
+        if observation is None or encode(record) != next_raw:
+            raise GateFailure("Consumer journal must bind a canonical verified state")
+        status_raw = _read(safe_path(sidecar, "status-" + record["status_sha256"] + ".json"))
+        verified = consume_result(
+            status_raw,
+            payload_raw,
+            _artifacts(job_file.parent, metadata_raw, job),
+            candidate_id=candidate_id,
+            payload_sha256=payload_sha256,
+            previous=previous,
+            cancelled=observation.cancelled,
+        )
+        if verified.observation != observation or digest(_read(job_file)) != job_pin:
+            raise GateFailure("Consumer transaction no longer matches the Job or evidence")
+        _finish_transaction(sidecar, record, observation, job_pin)
+        return record
+    except (ConsumerFailure, OSError, KeyError, TypeError, ValueError, RecursionError) as exc:
+        raise GateFailure("Consumer transaction could not be verified or completed") from exc
 
 
 def _frozen_bindings(directory: Path, bundle: Path, job: dict, artifacts: dict[str, bytes]) -> None:
@@ -440,14 +567,28 @@ def record_result(
         job_pin = digest(job_raw)
         state_file = safe_path(sidecar, "state.json", missing=True)
         saved = None
+        saved_raw = None
         if state_file.exists():
             try:
-                _read(state_file)
+                saved_raw = _read(state_file)
                 saved = read_json(state_file)
             except (OSError, ValueError, RecursionError) as exc:
                 raise GateFailure("Invalid saved consumer JSON") from exc
             if not isinstance(saved, dict):
                 raise GateFailure("Saved consumer state must be an object")
+        if safe_path(sidecar, "transaction.json", missing=True).exists():
+            saved = _recover_transaction(
+                sidecar,
+                saved_raw,
+                job_file=job_file,
+                job=job,
+                job_pin=job_pin,
+                candidate_id=candidate_id,
+                payload_sha256=payload_sha256,
+                payload_raw=payload_raw,
+                metadata_raw=metadata_raw,
+            )
+            saved_raw = _read(state_file)
         previous = (
             _previous(
                 saved,
@@ -496,11 +637,6 @@ def record_result(
             )
             if _read(job_file) != job_raw:
                 raise GateFailure("Job changed while consuming its result")
-            terminal = safe_path(sidecar, "terminal.json", missing=True)
-            if terminal.exists() or result.observation.producer_phase in TERMINAL_PHASES:
-                _retain(sidecar, "terminal.json", _terminal(result.observation, job_pin))
-            if result.observation.cancelled:
-                _retain(sidecar, "cancelled.json", _cancellation(result.observation.review_target, job_pin))
             if result.duplicate:
                 return {**saved, "duplicate": True}
             observation = result.observation
@@ -515,7 +651,7 @@ def record_result(
             transitions.append({"state": "verification_failed", "at": now()})
             _retain(sidecar, "status-" + digest(status_raw) + ".json", status_raw)
             if previous is None:
-                write_json(safe_path(sidecar, "state.json", missing=True), record, exclusive=False)
+                _replace(safe_path(sidecar, "state.json", missing=True), encode(record))
             else:
                 failure = encode(
                     {
@@ -533,9 +669,10 @@ def record_result(
                 _retain(sidecar, "verification-failure-" + digest(failure) + ".json", failure)
             raise GateFailure("Karte result verification failed; see consumer sidecar") from exc
         _retain(sidecar, "status-" + digest(status_raw) + ".json", status_raw)
-        snapshot = encode(record)
-        _retain(sidecar, "state-" + digest(snapshot) + ".json", snapshot)
-        write_json(safe_path(sidecar, "state.json", missing=True), record, exclusive=False)
+        try:
+            _commit_state(sidecar, record, observation, saved_raw)
+        except OSError as exc:
+            raise GateFailure("Consumer state commit interrupted; retry to recover its journal") from exc
         return {**record, "duplicate": False}
 
 

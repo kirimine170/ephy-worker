@@ -116,6 +116,19 @@ to an older pending state from erasing either latch．A Job already marked
 cancelled is also passed to the Observation as cancellation．These records convey
 no audit or adoption authority．
 
+Verified state updates use a recoverable transaction．Complete raw status and
+old/new state checkpoints are retained before an immutable `transaction.json`
+binds the predecessor and next state hashes to the Job．Only then are terminal
+and cancellation records installed and `state.json` atomically replaced；the
+journal is removed last．A retry revalidates both checkpoints，receipt semantics
+and the Job's original frozen evidence before completing an interrupted update．
+A journal cannot authorize a changed target or erase an existing latch．Without
+an outstanding valid journal，an older-state rollback still fails．Snapshots are
+published atomically from unique temporary files so an interrupted write does
+not leave truncated immutable evidence．This covers process interruptions and
+reported I/O failures；it does not claim transactional durability across host
+power loss or protection against concurrent host path replacement．
+
 Payload，adapter metadata and raw status snapshots are retained without replacing
 existing bytes．A separate nonblocking kernel lock serializes only this adapter's
 calls．The existing model resource lock and any process are untouched．Links and
