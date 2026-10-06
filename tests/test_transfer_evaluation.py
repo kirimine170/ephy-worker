@@ -7,14 +7,17 @@ import ctypes
 import io
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import ephy_worker.transfer_evaluation as transfer
 from ephy_worker.coding_profiles import load_coding_profiles
 from ephy_worker.evaluation import create_fixture_repository, load_suite
 from ephy_worker.transfer_evaluation import (
@@ -157,6 +160,313 @@ class TransferEvaluationTests(unittest.TestCase):
         finally:
             if repository.is_symlink():
                 repository.unlink()
+
+    def mutate_git_metadata(self, repository, mutation):
+        git = repository / ".git"
+        target = git / "config"
+        if mutation == "hook":
+            target = git / "hooks" / "pre-commit"
+            target.write_text("# unrelated hook\n", encoding="utf-8")
+        elif mutation == "config":
+            target.write_bytes(target.read_bytes() + b"\n# unrelated config\n")
+        elif mutation == "delete_file":
+            target = git / "HEAD"
+            target.unlink()
+        elif mutation == "add_directory":
+            target = git / "empty-extra"
+            target.mkdir()
+        elif mutation == "readonly":
+            target.chmod(target.stat().st_mode & ~stat.S_IWRITE)
+        elif mutation == "replace_file":
+            replacement = git / "replacement"
+            replacement.write_bytes(target.read_bytes())
+            replacement.replace(target)
+        elif mutation == "file_directory":
+            target.unlink()
+            target.mkdir()
+        elif mutation in {"replace_directory", "delete_directory", "root_file"}:
+            target = git
+            saved = self.root / (repository.name + "-saved-git")
+            git.rename(saved)
+            if mutation == "replace_directory":
+                shutil.copytree(saved, git)
+            elif mutation == "root_file":
+                git.write_text("replacement", encoding="utf-8")
+        else:
+            raise ValueError(mutation)
+        return target.relative_to(repository).as_posix()
+
+    def test_git_metadata_mutations_fail_scope_before_checker(self):
+        for mutation in (
+            "hook",
+            "config",
+            "delete_file",
+            "add_directory",
+            "readonly",
+            "replace_file",
+            "file_directory",
+            "replace_directory",
+            "delete_directory",
+            "root_file",
+        ):
+            with self.subTest(mutation=mutation):
+                task_id, repository = self.candidate()
+                good = validate_candidate(self.frozen, task_id, repository)
+                self.assertTrue(good["passed"])
+                target = self.mutate_git_metadata(repository, mutation)
+                try:
+                    with patch("ephy_worker.transfer_evaluation.subprocess.run") as run:
+                        verdict = validate_candidate(self.frozen, task_id, repository)
+                    run.assert_not_called()
+                    self.assertFalse(verdict["passed"])
+                    self.assertEqual(verdict["status"], "scope_failure")
+                    self.assertIn(target, verdict["outside_scope"])
+                    self.assertNotEqual(good["candidate_sha256"], verdict["candidate_sha256"])
+                finally:
+                    if mutation == "readonly":
+                        path = repository / target
+                        path.chmod(path.stat().st_mode | stat.S_IWRITE)
+
+    def test_git_metadata_mutations_during_checker_fail_integrity(self):
+        real_run = subprocess.run
+        for mutation in ("hook", "config", "delete_file", "add_directory", "replace_file", "root_file"):
+            with self.subTest(mutation=mutation):
+                task_id, repository = self.candidate()
+
+                def mutate(command, *, repository=repository, mutation=mutation, **kwargs):
+                    result = real_run(command, **kwargs)
+                    self.mutate_git_metadata(repository, mutation)
+                    return result
+
+                with patch("ephy_worker.transfer_evaluation.subprocess.run", side_effect=mutate):
+                    verdict = validate_candidate(self.frozen, task_id, repository)
+                self.assertTrue(verdict["correctness_passed"])
+                self.assertFalse(verdict["candidate_unchanged"])
+                self.assertFalse(verdict["passed"])
+                self.assertEqual(verdict["status"], "integrity_failure")
+
+    def test_unknown_git_baseline_including_empty_directory_fails_closed(self):
+        task = self.frozen.suite.tasks[0]
+        for with_config in (False, True):
+            with self.subTest(with_config=with_config):
+                repository = self.root / ("external-config" if with_config else "external-empty")
+                for relative, content in task.fixture.files.items():
+                    target = repository / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(content, encoding="utf-8")
+                for change in task.fixture.mock_changes:
+                    (repository / change.path).write_text(change.content, encoding="utf-8")
+                (repository / ".git").mkdir()
+                if with_config:
+                    (repository / ".git" / "config").write_text("config", encoding="utf-8")
+                with patch("ephy_worker.transfer_evaluation.subprocess.run") as run:
+                    verdict = validate_candidate(self.frozen, task.fixture.task_id, repository)
+                run.assert_not_called()
+                self.assertFalse(verdict["passed"])
+                self.assertIn(".git", verdict["outside_scope"])
+
+    def test_git_baseline_is_bound_to_the_fixture_identity(self):
+        _, repository = self.candidate()
+        original = self.frozen.suite.tasks[0]
+        other = self.frozen.suite.tasks[1]
+        for relative in original.fixture.files:
+            (repository / relative).unlink()
+        for relative, content in other.fixture.files.items():
+            target = repository / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        for change in other.fixture.mock_changes:
+            (repository / change.path).write_text(change.content, encoding="utf-8")
+        with patch("ephy_worker.transfer_evaluation.subprocess.run") as run:
+            verdict = validate_candidate(self.frozen, other.fixture.task_id, repository)
+        run.assert_not_called()
+        self.assertFalse(verdict["passed"])
+        self.assertIn(".git", verdict["outside_scope"])
+
+    def test_git_baseline_is_bound_to_the_owned_root_allocation(self):
+        task = self.frozen.suite.tasks[0]
+        with fixture_repository(task.fixture) as (repository, _):
+            for change in task.fixture.mock_changes:
+                (repository / change.path).write_text(change.content, encoding="utf-8")
+            original_identity = (repository.stat().st_dev, repository.stat().st_ino)
+            saved = self.root / "original-allocation"
+            repository.rename(saved)
+            try:
+                shutil.copytree(saved, repository)
+                self.assertNotEqual(original_identity, (repository.stat().st_dev, repository.stat().st_ino))
+                with patch("ephy_worker.transfer_evaluation.subprocess.run") as run:
+                    verdict = validate_candidate(self.frozen, task.fixture.task_id, repository)
+                run.assert_not_called()
+                self.assertFalse(verdict["passed"])
+                self.assertIn(".git", verdict["outside_scope"])
+            finally:
+                if repository.exists():
+                    repository.rename(self.root / "replacement-allocation")
+                saved.rename(repository)
+
+    def test_git_links_rejected_without_reading_foreign_bytes(self):
+        foreign = self.root / "foreign.txt"
+        foreign.write_text("must not read", encoding="utf-8")
+        real_read = Path.read_bytes
+        for kind in ("symbolic", "hardlink"):
+            with self.subTest(kind=kind):
+                task_id, repository = self.candidate()
+                target = repository / ".git" / "config"
+                target.unlink()
+                if kind == "symbolic":
+                    target.symlink_to(foreign)
+                else:
+                    target.hardlink_to(foreign)
+
+                def no_foreign_read(path, *, target=target):
+                    if path == target:
+                        self.fail("read foreign bytes through Git metadata")
+                    return real_read(path)
+
+                with (
+                    patch.object(Path, "read_bytes", no_foreign_read),
+                    patch("ephy_worker.transfer_evaluation.subprocess.run") as run,
+                    self.assertRaisesRegex(ValueError, "symbolic link|hardlinked"),
+                ):
+                    validate_candidate(self.frozen, task_id, repository)
+                run.assert_not_called()
+                target.unlink()
+        self.assertEqual(foreign.read_text(encoding="utf-8"), "must not read")
+
+    def test_git_reparse_point_rejected_before_directory_traversal(self):
+        task_id, repository = self.candidate()
+        target = repository / ".git" / "objects"
+        real_lstat = Path.lstat
+        real_iterdir = Path.iterdir
+
+        def reparse_metadata(path):
+            metadata = real_lstat(path)
+            if path == target:
+                return SimpleNamespace(
+                    st_mode=metadata.st_mode,
+                    st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT,
+                )
+            return metadata
+
+        def no_reparse_traversal(path):
+            if path == target:
+                self.fail("traversed a Git reparse point")
+            return real_iterdir(path)
+
+        with (
+            patch.object(Path, "lstat", reparse_metadata),
+            patch.object(Path, "iterdir", no_reparse_traversal),
+            self.assertRaisesRegex(ValueError, "reparse point"),
+        ):
+            validate_candidate(self.frozen, task_id, repository)
+
+    def test_git_structural_change_during_checker_is_integrity_failure(self):
+        task_id, repository = self.candidate()
+        foreign = self.root / "foreign-after.txt"
+        foreign.write_text("keep", encoding="utf-8")
+        real_run = subprocess.run
+
+        def mutate(command, **kwargs):
+            result = real_run(command, **kwargs)
+            target = repository / ".git" / "config"
+            target.unlink()
+            target.symlink_to(foreign)
+            return result
+
+        with patch("ephy_worker.transfer_evaluation.subprocess.run", side_effect=mutate):
+            verdict = validate_candidate(self.frozen, task_id, repository)
+        self.assertTrue(verdict["correctness_passed"])
+        self.assertFalse(verdict["candidate_unchanged"])
+        self.assertFalse(verdict["passed"])
+        self.assertEqual(verdict["status"], "integrity_failure")
+        self.assertIn("symbolic link", verdict["candidate_error"])
+        self.assertEqual(foreign.read_text(encoding="utf-8"), "keep")
+
+    def test_git_postcheck_filesystem_errors_propagate(self):
+        task_id, repository = self.candidate()
+        target = repository / ".git" / "config"
+        checking_finished = False
+        real_run = subprocess.run
+        real_read = Path.read_bytes
+        error = PermissionError("unexpected filesystem failure")
+
+        def finish(command, **kwargs):
+            nonlocal checking_finished
+            result = real_run(command, **kwargs)
+            checking_finished = True
+            return result
+
+        def fail_read(path):
+            if checking_finished and path == target:
+                raise error
+            return real_read(path)
+
+        with (
+            patch("ephy_worker.transfer_evaluation.subprocess.run", side_effect=finish),
+            patch.object(Path, "read_bytes", fail_read),
+            self.assertRaises(PermissionError) as raised,
+        ):
+            validate_candidate(self.frozen, task_id, repository)
+        self.assertIs(raised.exception, error)
+
+    def test_git_baseline_is_immutable_and_active_allocation_cannot_refresh(self):
+        task = self.frozen.suite.tasks[0]
+        with fixture_repository(task.fixture) as (repository, revision):
+            key = repository.resolve(strict=True)
+            baseline = transfer._FIXTURE_GIT_BASELINES[key]
+            with self.assertRaises(TypeError):
+                baseline.entries[".git"] = baseline.entries[".git"]
+            with (
+                patch(
+                    "ephy_worker.transfer_evaluation.create_fixture_repository",
+                    return_value=(repository, revision),
+                ),
+                self.assertRaisesRegex(ValueError, "already has an active"),
+                fixture_repository(task.fixture),
+            ):
+                self.fail("refreshed an active allocation")
+            self.assertIs(transfer._FIXTURE_GIT_BASELINES[key], baseline)
+            self.assertTrue(repository.is_dir())
+        self.assertNotIn(key, transfer._FIXTURE_GIT_BASELINES)
+        self.assertFalse(repository.exists())
+
+    def test_git_baseline_removed_when_capture_or_yield_fails(self):
+        task = self.frozen.suite.tasks[0]
+        with (
+            self.assertRaisesRegex(RuntimeError, "caller failure"),
+            fixture_repository(task.fixture) as (repository, _),
+        ):
+            key = repository.resolve(strict=True)
+            raise RuntimeError("caller failure")
+        self.assertNotIn(key, transfer._FIXTURE_GIT_BASELINES)
+        self.assertFalse(repository.exists())
+        repository = self.root / "invalid-capture"
+        target = repository / ".git" / "config"
+        target.parent.mkdir(parents=True)
+        foreign = self.root / "capture-foreign"
+        foreign.write_text("keep", encoding="utf-8")
+        target.symlink_to(foreign)
+        key = repository.resolve(strict=True)
+        real_read = Path.read_bytes
+
+        def no_foreign_read(path):
+            if path == target:
+                self.fail("read foreign bytes while capturing baseline")
+            return real_read(path)
+
+        with (
+            patch(
+                "ephy_worker.transfer_evaluation.create_fixture_repository",
+                return_value=(repository, "unused"),
+            ),
+            patch.object(Path, "read_bytes", no_foreign_read),
+            self.assertRaisesRegex(ValueError, "symbolic link"),
+            fixture_repository(task.fixture),
+        ):
+            self.fail("accepted an invalid metadata baseline")
+        self.assertNotIn(key, transfer._FIXTURE_GIT_BASELINES)
+        self.assertFalse(repository.exists())
+        self.assertEqual(foreign.read_text(encoding="utf-8"), "keep")
 
     def plan(self, **changes):
         args = {

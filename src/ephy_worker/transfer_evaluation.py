@@ -16,8 +16,10 @@ import stat
 import subprocess
 import sys
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal
 
 from pydantic import Field, model_validator
@@ -32,6 +34,27 @@ ASSETS = ("suite.json", "checker.py", "skill.md", "inspect_python.py")
 VARIANTS = ("none", "skill", "tool")
 
 
+@dataclass(frozen=True)
+class _CandidateEntry:
+    content: bytes
+    mode: int
+    kind: Literal["file", "directory"] = "file"
+    identity: tuple[int, int] | None = None
+    attributes: int = 0
+
+
+@dataclass(frozen=True)
+class _FixtureGitBaseline:
+    fixture_sha256: str
+    root_identity: tuple[int, int]
+    entries: Mapping[str, _CandidateEntry]
+
+
+# Only the parent creating a private fixture can establish this baseline.
+# Nothing stored in the candidate or read by its checker can refresh it.
+_FIXTURE_GIT_BASELINES: dict[Path, _FixtureGitBaseline] = {}
+
+
 def _digest(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
@@ -42,9 +65,21 @@ def fixture_repository(fixture: CodingFixture):
     repository, revision = create_fixture_repository(fixture)
     owned_root = repository.resolve(strict=True)
     allocation = repository.lstat()
+    if owned_root in _FIXTURE_GIT_BASELINES:
+        raise ValueError("fixture allocation already has an active Git baseline")
+    baseline = None
     try:
+        snapshot = _candidate_files(repository)
+        baseline = _FixtureGitBaseline(
+            _json_digest(fixture.model_dump(mode="json")),
+            (allocation.st_dev, allocation.st_ino),
+            MappingProxyType({path: entry for path, entry in snapshot.items() if _is_git_path(path)}),
+        )
+        _FIXTURE_GIT_BASELINES[owned_root] = baseline
         yield repository, revision
     finally:
+        if baseline is not None and _FIXTURE_GIT_BASELINES.get(owned_root) is baseline:
+            del _FIXTURE_GIT_BASELINES[owned_root]
         metadata = repository.lstat()
         if (
             not stat.S_ISDIR(metadata.st_mode)
@@ -299,25 +334,68 @@ def comparison_plan(
     }
 
 
-def _candidate_files(root: Path) -> dict[str, tuple[bytes, int]]:
-    if any(path.is_symlink() for path in (root, *root.parents)) or not root.is_dir():
+def _is_git_path(path: str) -> bool:
+    return Path(path).parts[0].casefold() == ".git"
+
+
+def _candidate_files(root: Path) -> dict[str, _CandidateEntry]:
+    if not root.is_dir():
         raise ValueError("candidate must be a real directory")
+    for parent in (root, *root.parents):
+        metadata = parent.lstat()
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or getattr(metadata, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        ):
+            raise ValueError("candidate contains symbolic link or reparse point")
     files = {}
-    for path in sorted(root.rglob("*")):
-        relative = path.relative_to(root)
-        if relative.parts[0] == ".git":
-            continue
-        info = path.lstat()
-        if stat.S_ISLNK(info.st_mode):
-            raise ValueError(f"candidate contains symbolic link: {relative}")
-        if stat.S_ISDIR(info.st_mode):
-            continue
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-            raise ValueError(f"candidate contains non-regular or hardlinked file: {relative}")
-        # Preserve executable state as well as bytes: chmod-only edits are
-        # candidate changes even when an implementation still passes tests.
-        files[relative.as_posix()] = (path.read_bytes(), info.st_mode & 0o111)
+
+    def visit(directory: Path) -> None:
+        for path in sorted(directory.iterdir()):
+            relative = path.relative_to(root).as_posix()
+            info = path.lstat()
+            if (
+                stat.S_ISLNK(info.st_mode)
+                or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+            ):
+                raise ValueError(f"candidate contains symbolic link or reparse point: {relative}")
+            git_metadata = _is_git_path(relative)
+            is_directory = stat.S_ISDIR(info.st_mode)
+            if not is_directory and (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1):
+                raise ValueError(f"candidate contains non-regular or hardlinked file: {relative}")
+            if git_metadata or not is_directory:
+                # Git metadata is immutable for this allocation. Bind topology,
+                # replacements, permissions and attributes, excluding only the
+                # volatile Windows backup ARCHIVE bit and all timestamps.
+                files[relative] = _CandidateEntry(
+                    b"" if is_directory else path.read_bytes(),
+                    stat.S_IMODE(info.st_mode) if git_metadata else info.st_mode & 0o111,
+                    "directory" if is_directory else "file",
+                    (info.st_dev, info.st_ino) if git_metadata else None,
+                    getattr(info, "st_file_attributes", 0) & ~stat.FILE_ATTRIBUTE_ARCHIVE
+                    if git_metadata
+                    else 0,
+                )
+            if is_directory:
+                visit(path)
+
+    visit(root)
     return files
+
+
+def _candidate_digest(snapshot: Mapping[str, _CandidateEntry]) -> str:
+    return _json_digest(
+        {
+            path: {
+                "sha256": _digest(entry.content),
+                "mode": entry.mode,
+                "kind": entry.kind,
+                "identity": entry.identity,
+                "attributes": entry.attributes,
+            }
+            for path, entry in snapshot.items()
+        }
+    )
 
 
 def validate_candidate(frozen: FrozenTransferSuite, task_id: str, candidate: Path) -> dict:
@@ -332,9 +410,17 @@ def validate_candidate(frozen: FrozenTransferSuite, task_id: str, candidate: Pat
         raise ValueError("fixed suite must be outside the candidate")
     expected = {path: content.encode() for path, content in task.fixture.files.items()}
     before = _candidate_files(candidate)
-    # Generated fixtures contain ordinary non-executable files. Keep this
-    # baseline independent of candidate-controlled Git index/configuration.
-    expected_snapshot = {path: (data, 0) for path, data in expected.items()}
+    # Only the allocating parent owns the pre-edit Git baseline. Unknown or
+    # mismatched Git metadata has no expected entries and fails scope checking.
+    expected_snapshot = {path: _CandidateEntry(data, 0) for path, data in expected.items()}
+    baseline = _FIXTURE_GIT_BASELINES.get(candidate.resolve(strict=True))
+    allocation = candidate.lstat()
+    if (
+        baseline is not None
+        and baseline.fixture_sha256 == _json_digest(task.fixture.model_dump(mode="json"))
+        and baseline.root_identity == (allocation.st_dev, allocation.st_ino)
+    ):
+        expected_snapshot.update(baseline.entries)
     changed = sorted(
         path
         for path in set(before) | set(expected_snapshot)
@@ -345,12 +431,7 @@ def validate_candidate(frozen: FrozenTransferSuite, task_id: str, candidate: Pat
         "task_id": task_id,
         "suite_sha256": frozen.suite_sha256,
         "checker_sha256": frozen.checker_sha256,
-        "candidate_sha256": _json_digest(
-            {
-                path: {"sha256": _digest(data), "executable_bits": executable}
-                for path, (data, executable) in before.items()
-            }
-        ),
+        "candidate_sha256": _candidate_digest(before),
         "changed_files": changed,
         "scope_passed": not outside,
         "outside_scope": outside,
@@ -415,7 +496,12 @@ def validate_candidate(frozen: FrozenTransferSuite, task_id: str, candidate: Pat
             for path, data in fixed_files.items()
         )
     frozen.verify()
-    payload["candidate_unchanged"] = _candidate_files(candidate) == before
+    try:
+        payload["candidate_unchanged"] = _candidate_files(candidate) == before
+    except ValueError as exc:
+        # Structural mutations are failed integrity checks, not successful
+        # snapshots. Unexpected filesystem errors deliberately propagate.
+        payload.update(candidate_unchanged=False, candidate_error=str(exc))
     payload["passed"] = all(
         payload[key]
         for key in ("scope_passed", "correctness_passed", "checker_unchanged", "candidate_unchanged")
