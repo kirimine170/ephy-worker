@@ -26,6 +26,7 @@ from .formal_runtime import (
     command_environment,
     exclusive_lock,
     final_assistant_text,
+    observed_process_identity,
     snapshot_hash,
     stage_evidence,
     stop_tree,
@@ -53,14 +54,55 @@ def helpers():
     return c
 
 
-def load(path):
+def strict_json_loads(raw):
+    """One decoder for files, JSONL, wire payloads, arguments and SSE evidence."""
     def unique(pairs):
         obj = {}
         for key, value in pairs:
             helpers().require(key not in obj, "Duplicate JSON key")
             obj[key] = value
         return obj
-    return json.loads(Path(path).read_bytes(), object_pairs_hook=unique)
+    def finite_float(raw_number):
+        value = float(raw_number)
+        helpers().require(math.isfinite(value), "Non-finite JSON number")
+        return value
+    return json.loads(raw, object_pairs_hook=unique, parse_float=finite_float,
+                      parse_constant=lambda _value: helpers().require(False, "Non-finite JSON number"))
+
+
+def load(path):
+    return strict_json_loads(Path(path).read_bytes())
+
+
+def verify_saved_JSON(path):
+    """Prevalidate all bound serialized evidence before downstream consumers parse it."""
+    c = helpers()
+    if path.name.endswith((".jsonl", ".trace-prefix")):
+        for line in path.read_bytes().splitlines():
+            if line.strip():
+                c.require(isinstance(strict_json_loads(line), dict), "Non-object JSON evidence record")
+    elif path.suffix == ".json":
+        load(path)
+    elif path.suffix == ".response":
+        for line in path.read_bytes().splitlines():
+            if line.startswith(b"data:") and line[5:].strip() != b"[DONE]":
+                strict_json_loads(line[5:].strip())
+
+
+def verify_planner_controller_process(contract, owner):
+    c = helpers()
+    c.require(isinstance(owner, dict)
+              and set(owner) == {"pid", "created_at", "executable", "executable_sha256"}
+              and type(owner.get("pid")) is int and owner["pid"] > 0
+              and type(owner.get("created_at")) in (int, float) and math.isfinite(owner["created_at"])
+              and type(contract.get("created_at")) in (int, float) and math.isfinite(contract["created_at"])
+              and 0 < owner["created_at"] <= contract["created_at"]
+              and owner == contract.get("planner_controller_process")
+              and isinstance(owner.get("executable_sha256"), str)
+              and contract["pins"].get(owner["executable"]) == owner["executable_sha256"]
+              and sha256(Path(owner["executable"]).read_bytes()) == owner["executable_sha256"],
+              "Planner-only controller process identity changed or unpinned")
+    return owner
 
 
 def planner_only_mode(contract):
@@ -97,6 +139,8 @@ def freeze_generation(repository, pi, identity, batch, gold, directory, token_ar
     c = helpers()
     c.require(not directory.exists(), "Fresh pre-authoring freeze required")
     batch_bytes, gold_bytes = batch.read_bytes(), gold.read_bytes()
+    strict_json_loads(batch_bytes)
+    strict_json_loads(gold_bytes)
     validate_corpus(batch_bytes, gold_bytes)
     token_argv = [str(Path(arg).resolve()) if Path(arg).is_file() else arg for arg in token_argv]
     c.require(isinstance(identity["model_id"], str) and identity["model_id"], "Invalid model identity")
@@ -155,6 +199,10 @@ def freeze_generation(repository, pi, identity, batch, gold, directory, token_ar
         for p, digest in job["contract"]["runtime_hashes"].items():
             c.require(sha256(Path(p).read_bytes()) == digest, "Generation job runtime pin changed")
         pins += list(job["contract"]["runtime_hashes"])
+    controller_owner = observed_process_identity(os.getpid()) if planner_only else None
+    if controller_owner is not None:
+        # On Windows a venv launcher and the OS-observed Python can differ.
+        pins.append(controller_owner["executable"])
     freeze = {
         "schema": "ephy.triage-generation-freeze.v1", "job_id": str(uuid.uuid4()),
         "planner_only": planner_only,
@@ -171,7 +219,8 @@ def freeze_generation(repository, pi, identity, batch, gold, directory, token_ar
         "purpose": "generation_capture", "generation_binding": binding,
         "generation_job_path": str(generation_job.resolve()) if generation_job else None,
         **({"generation_submission_sha256": generation_submission_sha256(job),
-            "generation_environment_sha256": generation_environment_sha256(job)} if planner_only else {}),
+            "generation_environment_sha256": generation_environment_sha256(job),
+            "planner_controller_process": controller_owner} if planner_only else {}),
         "dependency_versions": {n: version(n) for n in ("httpx", "psutil", "jsonschema")},
         "controller": {"executable": str(Path(sys.executable).resolve()), "python_version": sys.version},
         "pins": {p: sha256(Path(p).read_bytes()) for p in pins},
@@ -200,6 +249,8 @@ def frozen(path, expected):
               and re.fullmatch(r"[0-9a-f]{64}", value["generation_environment_sha256"]),
               "Planner-only frozen environment identity missing")
     c.intact(value)
+    if planner_only_mode(value):
+        verify_planner_controller_process(value, value.get("planner_controller_process"))
     private = Path(value["private_root"])
     batch, gold = (private/"batch.json").read_bytes(), (private/"gold.json").read_bytes()
     c.require((sha256(batch), sha256(gold)) == (value["batch_sha256"], value["gold_sha256"]),
@@ -227,13 +278,13 @@ def events_at(directory):
     path = directory / "trace.jsonl"
     if not path.exists():
         path = Path(load(directory / "config.json")["trace_path"])
-    return [json.loads(line) for line in path.read_bytes().splitlines() if line.strip()]
+    return [strict_json_loads(line) for line in path.read_bytes().splitlines() if line.strip()]
 
 
 def wire_matches(contract, directory, number, raw, config, events):
     """Verify the final body, including every tool result, before forwarding."""
     c = helpers()
-    deny_leak(contract, json.loads(raw))
+    deny_leak(contract, strict_json_loads(raw))
     starts = [e for e in events if e.get("kind") == "generation_start"]
     c.require(len(starts) == 1 and starts[0]["session_id"] == config["session_id"]
               and starts[0]["role"] == config["role"]
@@ -252,7 +303,7 @@ def wire_matches(contract, directory, number, raw, config, events):
         c.require(len(acks) == 1, "Missing exact governance tool")
         expected["tools"] = acks
         expected["tool_choice"] = {"type": "function", "function": {"name": "governance_ack"}}
-    c.require(json.loads(raw) == expected, "Final HTTP input differs from pinned governance transformation")
+    c.require(strict_json_loads(raw) == expected, "Final HTTP input differs from pinned governance transformation")
     messages = expected["messages"]
     context = "\n".join(c.payload_strings(messages[:1]))
     nonce = re.search(r"Acknowledgement-Nonce: ([^\s]+)", context)
@@ -298,7 +349,7 @@ def wire_matches(contract, directory, number, raw, config, events):
     c.require(set(wire_calls) == set(calls), "Model-visible tool-call capture incomplete")
     for identifier, call in calls.items():
         c.require(wire_calls[identifier]["name"] == call["name"]
-                  and json.loads(wire_calls[identifier]["arguments"]) == call["input"], "Tool call substituted")
+                  and strict_json_loads(wire_calls[identifier]["arguments"]) == call["input"], "Tool call substituted")
         name, args = call["name"], call["input"]
         c.require(name == "governance_ack" or name == "read" and set(args) == {"path"}
                   and args["path"] in config["allowed_reads"] or name == "write"
@@ -383,9 +434,17 @@ class GenerationCapture:
             child = psutil.Process(starts[0]["pid"])
             c.require(child.ppid() == os.getpid(), "Generation process is not controller-owned")
             self.write_new(process_path, c.json_bytes({"pid": child.pid, "created_at": child.create_time(),
-                        "executable": str(Path(child.exe()).resolve()), "argv": self.config["argv"]}))
+                          "executable": str(Path(child.exe()).resolve()), "argv": self.config["argv"],
+                          **({"parent_pid": child.ppid(), "controller_process": observed_process_identity(os.getpid())}
+                             if planner_only_mode(self.contract) else {})}))
         process = load(process_path)
         owned = psutil.Process(process["pid"])
+        if planner_only_mode(self.contract):
+            owner = verify_planner_controller_process(self.contract, process.get("controller_process"))
+            c.require(owner == observed_process_identity(os.getpid())
+                      and type(process.get("parent_pid")) is int
+                      and process["parent_pid"] == owned.ppid() == owner["pid"],
+                      "Generation process is not the frozen controller's child")
         c.require(owned.create_time() == process["created_at"]
                   and str(Path(owned.exe()).resolve()) == self.contract["runtime"]["pi"],
                   "Generation process changed")
@@ -541,6 +600,7 @@ def verify_session(freeze_path, expected, directory):
     c.require(set(manifest) == set(receipt["files"]), "Session capture manifest incomplete")
     for name, h in receipt["files"].items():
         c.require(manifest[name]["sha256"] == h, "Session evidence hash changed")
+        verify_saved_JSON(directory / name)
     c.require(receipt["process"]["created_at"] >= contract["created_at"], "Not pre-authoring freeze")
     c.require(receipt["process"]["executable"] == contract["runtime"]["pi"], "Other Pi process")
     events = events_at(directory)
@@ -569,7 +629,7 @@ def verify_session(freeze_path, expected, directory):
         for name, digest in closure["files"].items():
             c.require(sha256((directory / name).read_bytes()) == digest, "Capture member changed")
         admission = load(directory / f"http-{n}.admission.json")
-        prefix = [json.loads(l) for l in (directory / f"http-{n}.trace-prefix").read_bytes().splitlines()]
+        prefix = [strict_json_loads(l) for l in (directory / f"http-{n}.trace-prefix").read_bytes().splitlines()]
         raw = (directory / f"http-{n}.json").read_bytes()
         c.require(admission["number"] == n and admission["freeze_sha256"] == expected
                   and admission["process"] == receipt["process"], "Admission identity changed")
@@ -610,17 +670,37 @@ def planner_completion_evidence(contract, expected, job, receipt, stop, planner)
     timing_path = Path(contract["directory"]) / "planner-completion.json"
     timing = load(timing_path)
     c.require(set(timing) == {"schema", "job_id", "freeze_sha256", "submission_sha256",
-                              "started_at", "finished_at", "elapsed_seconds"}
+                              "started_at", "finished_at", "elapsed_seconds", "controller_process",
+                              "planner_receipt_sha256", "planner_process_sha256"}
               and timing["schema"] == "ephy.triage-planner-completion.v1"
               and timing["job_id"] == job["id"] and timing["freeze_sha256"] == expected
               and timing["submission_sha256"] == contract["generation_submission_sha256"],
-              "Planner-only whole-job timing binding changed")
+              "Planner-only controller completion receipt binding changed")
+    owner = verify_planner_controller_process(contract, timing.get("controller_process"))
+    process_path = planner / "process.json"
+    process = load(process_path)
+    c.require(timing["planner_receipt_sha256"] == sha256((planner / "receipt.json").read_bytes())
+              and timing["planner_process_sha256"] == sha256(process_path.read_bytes())
+              and process == receipt["process"] and process.get("controller_process") == owner
+              and type(process.get("parent_pid")) is int and process["parent_pid"] == owner["pid"]
+              and type(process.get("pid")) is int and process["pid"] > 0 and process["pid"] != owner["pid"]
+              and type(process.get("created_at")) in (int, float) and math.isfinite(process["created_at"])
+              and type(receipt.get("exit_code")) is int and receipt["exit_code"] == 0
+              and type(job.get("runnerPid")) is int and job["runnerPid"] == owner["pid"],
+              "Planner-only controller/child process or successful receipt binding changed")
+    try:
+        child = psutil.Process(process["pid"])
+        c.require(child.create_time() != process["created_at"] or not child.is_running(),
+                  "Planner-only controller child process has not terminated")
+    except psutil.NoSuchProcess:
+        pass  # The recorded child has terminated; PID reuse is checked above.
     c.require(all(type(timing.get(key)) in (int, float) and math.isfinite(timing[key])
                   for key in ("started_at", "finished_at", "elapsed_seconds")),
               "Planner-only whole-job timing unknown")
     start, finish, elapsed = (timing[key] for key in ("started_at", "finished_at", "elapsed_seconds"))
     c.require(type(contract["created_at"]) in (int, float) and math.isfinite(contract["created_at"])
               and 0 < contract["created_at"] <= start <= finish
+              and owner["created_at"] <= start
               and 0 <= elapsed <= job["contract"]["timeout_seconds"]
               and finish - start <= job["contract"]["timeout_seconds"]
               and abs((finish - start) - elapsed) <= 0.5,
@@ -628,7 +708,7 @@ def planner_completion_evidence(contract, expected, job, receipt, stop, planner)
     workflow_path = Path(job["jobDir"]) / "workflow.jsonl"
     raw = workflow_path.read_bytes()
     c.require(raw.endswith(b"\n"), "Planner-only workflow incomplete")
-    workflow = [json.loads(line) for line in raw.splitlines()]
+    workflow = [strict_json_loads(line) for line in raw.splitlines()]
     stages = ["preflight", "model loaded", "planner start", "planner end", "planner stop"]
     c.require(len(workflow) == len(stages)
               and all(isinstance(event, dict) and event.get("stage") == stage
@@ -721,7 +801,7 @@ def planner_capture_result(contract, expected):
         lines = [line[5:].strip() for line in (planner / f"http-{number}.response").read_bytes().splitlines()
                  if line.startswith(b"data:")]
         reports = [load_line["usage"] for line in lines if line != b"[DONE]"
-                   and isinstance((load_line := json.loads(line)), dict) and load_line.get("usage")]
+                   and isinstance((load_line := strict_json_loads(line)), dict) and load_line.get("usage")]
         c.require(lines and lines[-1] == b"[DONE]" and lines.count(b"[DONE]") == 1
                   and len(reports) == 1 and isinstance(reports[0], dict),
                   "Planner-only HTTP usage incomplete")
@@ -736,7 +816,7 @@ def planner_capture_result(contract, expected):
                   "Planner-only HTTP/trace usage unknown or changed")
         if number == len(responses):
             choices = [choice for line in lines if line != b"[DONE]"
-                       for choice in json.loads(line).get("choices", [])]
+                       for choice in strict_json_loads(line).get("choices", [])]
             contents = [choice.get("delta", {}).get("content") for choice in choices]
             c.require(all(content is None or isinstance(content, str) for content in contents)
                       and "".join(content for content in contents if content is not None) == plan
@@ -817,6 +897,9 @@ class IsolatedStrataRunner(StrataRunner):
         c.require(not self._planner_only or generation_submission_sha256(self.job)
                   == self.isolation.get("generation_submission_sha256"),
                   "Planner-only submission identity differs from freeze")
+        if self._planner_only:
+            c.require(verify_planner_controller_process(self.isolation, observed_process_identity(os.getpid()))
+                      == self.isolation["planner_controller_process"], "Planner-only controller ownership changed")
         c.require(all(self.runtime.get("thinking", {}).get(role) == "off" for role in ("planner", "implementer")),
                   "Isolated generation requires planner/implementer thinking=off")
         required = [str(Path(__file__).resolve()), self.isolation["runtime"]["extra_guard"],
@@ -939,7 +1022,10 @@ class IsolatedStrataRunner(StrataRunner):
                           "freeze_sha256": self.isolation_expected,
                           "submission_sha256": self.isolation["generation_submission_sha256"],
                           "started_at": self._isolation_started_at, "finished_at": time.time(),
-                          "elapsed_seconds": elapsed}
+                          "elapsed_seconds": elapsed,
+                          "controller_process": observed_process_identity(os.getpid()),
+                          "planner_receipt_sha256": sha256((Path(self.isolation["directory"]) / "planner/receipt.json").read_bytes()),
+                          "planner_process_sha256": sha256((Path(self.isolation["directory"]) / "planner/process.json").read_bytes())}
             write_capture(self.isolation, Path(self.isolation["directory"]) / "planner-completion.json",
                           c.json_bytes(completion))
             result = planner_capture_result(frozen(self.isolation_path, self.isolation_expected),

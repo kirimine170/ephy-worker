@@ -12,7 +12,7 @@ import pytest
 
 from ephy_worker import verifier_triage_consumer as consumer
 from ephy_worker import verifier_triage_isolation as isolation
-from ephy_worker.formal_runtime import GateFailure, snapshot_hash
+from ephy_worker.formal_runtime import GateFailure, observed_process_identity, snapshot_hash
 from ephy_worker.verifier_triage_evaluation import BASE_REVISION, SKILL_PATH, InvalidEvaluation, sha256
 
 PLAN = "Read measured evidence, preserve STOP, and return one scoped plan."
@@ -52,6 +52,8 @@ def sealed(tmp_path, monkeypatch):
                controls={"policy_sha256": "a" * 64}, model_identities={"planner": {"model_id": isolation.FAKE_MODEL}},
                repoRoot=str(candidate), verifier_identity={"executor_id": "synthetic"},
                environment_sha256="b" * 64)
+    controller = observed_process_identity(os.getpid())
+    job["runnerPid"] = controller["pid"]
     save(job_dir / "job.json", job)
     (job_dir / "lead-plan.txt").write_text(PLAN, encoding="utf-8")
     stop = {"job_id": job["id"], "contract_sha256": sha256(isolation.encode(value)),
@@ -66,8 +68,12 @@ def sealed(tmp_path, monkeypatch):
         "runtime_sha256": sha256(isolation.encode(job["runtime"])), "job_dir": str(job_dir),
         "worktree": str(candidate)},
         "planner_only": True, "identity": {"model_id": isolation.FAKE_MODEL},
-        "runtime": {"pi": str(Path(sys.executable).resolve())}, "created_at": time.time() - 10,
+        "runtime": {"pi": str(Path(sys.executable).resolve())}, "created_at": controller["created_at"],
         "frozen": {"policy_sha256": "a" * 64}, "max_log_bytes": 8388608}
+    frozen["planner_controller_process"] = controller
+    frozen["controller"] = {"executable": str(Path(sys.executable).resolve()), "python_version": sys.version}
+    frozen["pins"] = {controller["executable"]: controller["executable_sha256"],
+                      str(Path(sys.executable).resolve()): sha256(Path(sys.executable).read_bytes())}
     frozen["generation_submission_sha256"] = sha256(isolation.encode({key: value for key, value in job.items()
         if key not in {"status", "message", "updatedAt", "runnerPid", "outcome", "environment_sha256"}}))
     frozen["generation_environment_sha256"] = job["environment_sha256"]
@@ -95,8 +101,11 @@ def sealed(tmp_path, monkeypatch):
         save(directory / "session.jsonl", {"type": "message", "message": {
             "role": "assistant", "stopReason": "stop", "content": [{"type": "text", "text": PLAN}]}})
         (directory / "session.jsonl").write_bytes((directory / "session.jsonl").read_bytes() + b"\n")
-        process = {"pid": os.getpid() + (role == "implementer"), "created_at": time.time() - 2,
-                   "executable": frozen["runtime"]["pi"]}
+        process = {"pid": os.getpid() + 500000000 + (role == "implementer"),
+                   "created_at": max(time.time() - 0.02, frozen["created_at"] + 0.05),
+                   "executable": frozen["runtime"]["pi"], "parent_pid": controller["pid"],
+                   "controller_process": copy.deepcopy(controller)}
+        save(directory / "process.json", process)
         raw = consumer.json_bytes({"max_tokens": 275})
         (directory / "http-1.json").write_bytes(raw)
         (directory / "http-1.trace-prefix").write_bytes(b"")
@@ -401,20 +410,23 @@ def write_workflow(case):
     anchor = receipt["process"]["created_at"]
     stamp = lambda offset: datetime.fromtimestamp(anchor + offset, UTC).isoformat()
     records = [
-        {"stage": "preflight", "at": stamp(-1), "passed": True,
+        {"stage": "preflight", "at": stamp(-0.03), "passed": True,
          "contract_sha256": stop["contract_sha256"], "snapshot_sha256": stop["snapshot_sha256"]},
-        {"stage": "model loaded", "at": stamp(-0.5), "model": model},
-        {"stage": "planner start", "at": stamp(-0.1),
+        {"stage": "model loaded", "at": stamp(-0.02), "model": model},
+        {"stage": "planner start", "at": stamp(-0.01),
          "label": "planner", "expected_model": model},
-        {"stage": "planner end", "at": stamp(0.2),
+        {"stage": "planner end", "at": stamp(0.01),
          "label": "planner", "pid": receipt["process"]["pid"],
          "trace_sha256": sha256((case.directory / "trace.jsonl").read_bytes())},
-        {"stage": "planner stop", "at": stamp(0.3), **stop},
+        {"stage": "planner stop", "at": stamp(0.02), **stop},
     ]
     save(case.capture / "planner-completion.json", {
         "schema": "ephy.triage-planner-completion.v1", "job_id": case.job["id"],
         "freeze_sha256": case.expected, "submission_sha256": case.freeze["generation_submission_sha256"],
-        "started_at": anchor - 1.5, "finished_at": anchor + 0.5, "elapsed_seconds": 2.0})
+        "started_at": anchor - 0.04, "finished_at": anchor + 0.03, "elapsed_seconds": 0.07,
+        "controller_process": copy.deepcopy(case.freeze["planner_controller_process"]),
+        "planner_receipt_sha256": sha256((case.directory / "receipt.json").read_bytes()),
+        "planner_process_sha256": sha256((case.directory / "process.json").read_bytes())})
     (case.job_dir / "workflow.jsonl").write_bytes(
         b"\n".join(consumer.json_bytes(record) for record in records) + b"\n")
 
@@ -539,9 +551,10 @@ def test_review_whole_job_deadline_requires_bound_runner_window(sealed, change):
     elif change == "before_freeze":
         timing["started_at"] = sealed.freeze["created_at"] - 1
     elif change == "start_after_process":
-        timing["started_at"] = timing["finished_at"] - 0.1
+        timing["started_at"] = isolation.load(sealed.directory / "process.json")["created_at"] + 0.1
     elif change == "finish_before_stop":
-        timing["finished_at"] = timing["started_at"] + 0.1
+        timing["finished_at"] = datetime.fromisoformat(
+            isolation.json.loads((sealed.job_dir / "workflow.jsonl").read_bytes().splitlines()[-1])["at"]).timestamp() - 0.001
     elif change == "wall_over_cap":
         timing["finished_at"] = timing["started_at"] + 301
     elif change == "elapsed_disagrees":
@@ -551,4 +564,162 @@ def test_review_whole_job_deadline_requires_bound_runner_window(sealed, change):
     if change != "missing":
         save(path, timing)
     with pytest.raises((InvalidEvaluation, FileNotFoundError, KeyError, ValueError)):
+        publish(sealed)
+
+def inject_duplicate(raw, key, earlier):
+    needle = consumer.json_bytes(key) + b":"
+    assert needle in raw
+    return raw.replace(needle, needle + consumer.json_bytes(earlier) + b"," + needle, 1)
+
+
+@pytest.mark.parametrize("boundary", [
+    "workflow_stage", "workflow_time", "workflow_stop", "trace_kind", "trace_usage",
+    "session_role", "session_text", "HTTP_request", "HTTP_response_usage", "HTTP_response_text",
+    "HTTP_prefix", "process", "receipt", "completion", "Job", "report",
+])
+def test_review_duplicate_JSON_cannot_hide_contradictory_approval_evidence(sealed, boundary):
+    if boundary.startswith("workflow"):
+        path = sealed.job_dir / "workflow.jsonl"
+        key, earlier = {"workflow_stage": ("stage", "implementer start"),
+                        "workflow_time": ("at", "not a timestamp"),
+                        "workflow_stop": ("implementation_started", True)}[boundary]
+    elif boundary.startswith("trace"):
+        path = sealed.directory / "trace.jsonl"
+        key, earlier = ("kind", "implementer") if boundary == "trace_kind" else ("responseTokens", 9999)
+    elif boundary.startswith("session"):
+        path = sealed.directory / "session.jsonl"
+        key, earlier = ("role", "user") if boundary == "session_role" else ("text", "forged")
+    elif boundary == "HTTP_request":
+        path, key, earlier = sealed.directory / "http-1.json", "max_tokens", 9999
+    elif boundary.startswith("HTTP_response"):
+        path = sealed.directory / "http-1.response"
+        key, earlier = ("completion_tokens", 9999) if boundary == "HTTP_response_usage" else ("content", "forged")
+    elif boundary == "HTTP_prefix":
+        path = sealed.directory / "http-1.trace-prefix"
+        path.write_bytes(b'{"kind":"implementer","kind":"provider_request"}\n')
+        key = None
+    else:
+        target, key, earlier = {
+            "process": ("process.json", "pid", 1),
+            "receipt": ("receipt.json", "exit_code", 77),
+            "completion": ("planner-completion.json", "elapsed_seconds", 9999),
+            "Job": ("job.json", "humanAuthorization", "forbidden"),
+            "report": ("capture.json", "implementation_requests", 1),
+        }[boundary]
+        if boundary == "report":
+            publish(sealed)
+            path = sealed.capture / target
+        elif boundary == "Job":
+            path = sealed.job_dir / target
+        elif boundary == "completion":
+            path = sealed.capture / target
+        else:
+            path = sealed.directory / target
+            if boundary == "process" and not path.exists():
+                save(path, isolation.load(sealed.directory / "receipt.json")["process"])
+    if key is not None:
+        path.write_bytes(inject_duplicate(path.read_bytes(), key, earlier))
+    if boundary == "HTTP_request":
+        receipt = isolation.load(sealed.directory / "http-1.receipt.json")
+        receipt["payload_sha256"] = sha256(path.read_bytes())
+        save(sealed.directory / "http-1.receipt.json", receipt)
+    if boundary in {"trace_kind", "trace_usage", "session_role", "session_text", "HTTP_request",
+                    "HTTP_response_usage", "HTTP_response_text", "HTTP_prefix", "process"}:
+        # Seal raw bytes without decoding the intentionally ambiguous record.
+        receipt_path = sealed.directory / "receipt.json"
+        receipt = isolation.load(receipt_path)
+        closure = isolation.load(sealed.directory / "http-1.complete.json")
+        closure["files"] = {name: sha256((sealed.directory / name).read_bytes()) for name in closure["files"]}
+        save(sealed.directory / "http-1.complete.json", closure)
+        receipt["captures"] = [sha256((sealed.directory / "http-1.complete.json").read_bytes())]
+        receipt["files"] = {p.relative_to(sealed.directory).as_posix(): sha256(p.read_bytes())
+                           for p in sealed.directory.rglob("*") if p.is_file() and p.name != "receipt.json"}
+        save(receipt_path, receipt)
+        workflow = (sealed.job_dir / "workflow.jsonl").read_bytes()
+        records = [isolation.json.loads(line) for line in workflow.splitlines()]
+        records[3]["trace_sha256"] = sha256((sealed.directory / "trace.jsonl").read_bytes())
+        (sealed.job_dir / "workflow.jsonl").write_bytes(
+            b"\n".join(consumer.json_bytes(record) for record in records) + b"\n")
+    with pytest.raises(InvalidEvaluation, match="Duplicate JSON key"):
+        isolation.verify_capture(sealed.path, sealed.expected) if boundary == "report" else publish(sealed)
+
+
+@pytest.mark.parametrize("missing", ["receipt_owner", "freeze_owner"])
+def test_review_completion_requires_pre_frozen_controller_owner(sealed, missing):
+    path = sealed.capture / "planner-completion.json"
+    timing = isolation.load(path)
+    if missing == "receipt_owner":
+        timing.pop("controller_process", None)
+        save(path, timing)
+    else:
+        sealed.freeze.pop("planner_controller_process", None)
+    with pytest.raises(InvalidEvaluation, match="controller"):
+        publish(sealed)
+
+@pytest.mark.parametrize("change", [
+    "pid", "boolean_pid", "created_at", "executable", "executable_sha256", "unknown_field",
+    "missing_field", "receipt_hash", "process_hash", "parent_pid", "child_owner", "runnerPid",
+    "boolean_runnerPid", "live_child", "missing_process_file", "wrong_frozen_pin",
+])
+def test_review_controller_receipt_requires_exact_owned_process_and_successful_termination(sealed, monkeypatch, change):
+    timing_path = sealed.capture / "planner-completion.json"
+    timing = isolation.load(timing_path)
+    process_path = sealed.directory / "process.json"
+    if change in {"pid", "boolean_pid", "created_at", "executable", "executable_sha256", "unknown_field", "missing_field"}:
+        owner = timing["controller_process"]
+        if change == "pid":
+            owner["pid"] += 1
+        elif change == "boolean_pid":
+            owner["pid"] = True
+        elif change == "created_at":
+            owner["created_at"] += 1
+        elif change == "executable":
+            owner["executable"] += ".other"
+        elif change == "executable_sha256":
+            owner["executable_sha256"] = "0" * 64
+        elif change == "unknown_field":
+            owner["unexpected"] = True
+        else:
+            owner.pop("created_at")
+        save(timing_path, timing)
+    elif change in {"receipt_hash", "process_hash"}:
+        timing["planner_" + ("receipt" if change == "receipt_hash" else "process") + "_sha256"] = "0" * 64
+        save(timing_path, timing)
+    elif change in {"parent_pid", "child_owner"}:
+        process = isolation.load(process_path)
+        if change == "parent_pid":
+            process["parent_pid"] += 1
+        else:
+            process["controller_process"]["pid"] += 1
+        save(process_path, process)
+        receipt_path = sealed.directory / "receipt.json"
+        receipt = isolation.load(receipt_path)
+        receipt["process"] = process
+        receipt["files"]["process.json"] = sha256(process_path.read_bytes())
+        save(receipt_path, receipt)
+        admission = isolation.load(sealed.directory / "http-1.admission.json")
+        admission["process"] = process
+        save(sealed.directory / "http-1.admission.json", admission)
+        http = isolation.load(sealed.directory / "http-1.receipt.json")
+        http["generation_admission_sha256"] = sha256((sealed.directory / "http-1.admission.json").read_bytes())
+        save(sealed.directory / "http-1.receipt.json", http)
+        reseal(sealed, include_closure=True)
+    elif change in {"runnerPid", "boolean_runnerPid"}:
+        job = copy.deepcopy(sealed.job)
+        job["runnerPid"] = True if change == "boolean_runnerPid" else job["runnerPid"] + 1
+        save(sealed.job_dir / "job.json", job)
+    elif change == "live_child":
+        process = isolation.load(process_path)
+        original = isolation.psutil.Process
+        def lookup(pid=None):
+            if pid == process["pid"]:
+                return SimpleNamespace(create_time=lambda: process["created_at"], is_running=lambda: True)
+            return original(pid)
+        monkeypatch.setattr(isolation.psutil, "Process", lookup)
+    elif change == "missing_process_file":
+        process_path.unlink()
+    else:
+        owner = sealed.freeze["planner_controller_process"]
+        sealed.freeze["pins"][owner["executable"]] = "0" * 64
+    with pytest.raises((InvalidEvaluation, FileNotFoundError), match="controller|process|Process|capture"):
         publish(sealed)
