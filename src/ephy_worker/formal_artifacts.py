@@ -62,10 +62,10 @@ FINAL_BINDINGS = {
 }
 SEQUENCE = [
     "preflight",
-    "designated model plan",
-    "pi attempt loop",
+    "gpt-oss lead plan",
+    "qwen attempt loop",
     "freeze final candidate and audit bundle",
-    "fresh designated-model audit",
+    "fresh gpt-oss audit",
     "proposal stop",
 ]
 
@@ -271,7 +271,7 @@ def freeze_bundle(bundle: Path, job: dict, artifacts: dict[str, bytes]) -> dict:
                 "path": filename,
                 "size_bytes": len(artifacts[name]),
                 "media_type": "application/json" if suffix == ".json" else "text/plain",
-                "producer": "runner" if name not in ("lead_plan",) else "designated planner",
+                "producer": "runner" if name not in ("lead_plan",) else "gpt-oss planner",
                 "sha256": digest(artifacts[name]),
             }
         )
@@ -317,9 +317,7 @@ def freeze_bundle(bundle: Path, job: dict, artifacts: dict[str, bytes]) -> dict:
     return audit_input
 
 
-def validate_audit_result(
-    result: dict, bundle: Path, audit_input: dict, observed_artifacts: set[str]
-) -> None:
+def validate_audit_result(result: dict, bundle: Path, audit_input: dict) -> None:
     manifest = read_json(bundle / "evidence-manifest.json")
     entries = {entry["artifact_id"]: entry for entry in manifest["artifacts"]}
     schema_path = safe_path(bundle, entries["audit_result_schema"]["path"])
@@ -341,8 +339,6 @@ def validate_audit_result(
     for document in result["documents_read"]:
         if document["sha256"] != entries[document["artifact_id"]]["sha256"]:
             raise GateFailure("Document identity mismatch")
-        if document["artifact_id"] not in observed_artifacts:
-            raise GateFailure("Claimed audit document has no observed delivery")
     for domain in ("integrity", "candidate", "workflow"):
         # No empty-domain or invented citations may authorize review_ready.
         ids = [check["check_id"] for check in result[domain]["checks"]]
@@ -355,8 +351,6 @@ def validate_audit_result(
                     or ref["sha256"] != entries[ref["artifact_id"]]["sha256"]
                 ):
                     raise GateFailure("Audit evidence citation mismatch")
-                if ref["artifact_id"] not in observed_artifacts:
-                    raise GateFailure("Audit citation has no observed delivery")
             cited = {ref["artifact_id"] for ref in check["evidence"]}
             if check["status"] == "PASS" and not set(AUDIT_EVIDENCE[check["check_id"]]) <= cited:
                 raise GateFailure("Missing relevant audit evidence coverage: " + check["check_id"])
@@ -364,5 +358,3 @@ def validate_audit_result(
         for ref in finding["evidence"]:
             if ref["artifact_id"] not in entries or ref["sha256"] != entries[ref["artifact_id"]]["sha256"]:
                 raise GateFailure("Audit finding citation mismatch")
-            if ref["artifact_id"] not in observed_artifacts:
-                raise GateFailure("Audit finding has no observed delivery")

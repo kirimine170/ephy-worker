@@ -8,10 +8,8 @@ from __future__ import annotations
 
 import argparse
 import configparser
-import copy
 import importlib.metadata
 import json
-import math
 import os
 import re
 import shutil
@@ -47,62 +45,6 @@ from .formal_artifacts import (
 
 LEAD = "gpt-oss-20b-MXFP4"
 WORKER = "Qwen3-Coder-Next-Q4_K_M"
-
-
-def role_model(runtime: dict, role: str) -> str:
-    """Model selection belongs to the frozen controller, never to a stage agent."""
-    if role not in ("planner", "implementer", "auditor"):
-        raise GateFailure("Unknown model role")
-    roles = runtime.get("model_roles")
-    if roles is None:
-        return WORKER if role == "implementer" else LEAD
-    if (
-        not isinstance(roles, dict)
-        or set(roles) != {"planner", "implementer", "auditor"}
-        or any(not isinstance(value, str) or not value.strip() for value in roles.values())
-    ):
-        raise GateFailure("Frozen model roles must identify all three stages")
-    return roles[role]
-
-
-def role_thinking(runtime: dict, role: str) -> str:
-    value = runtime.get("thinking", {}).get(role, "off" if role == "implementer" else "medium")
-    if value not in ("off", "medium", "high"):
-        raise GateFailure("Invalid frozen thinking level")
-    return value
-
-
-def observed_process_identity(pid: int) -> dict:
-    process = psutil.Process(pid)
-    executable = Path(process.exe()).resolve(strict=True)
-    return {
-        "pid": pid,
-        "created_at": process.create_time(),
-        "executable": str(executable),
-        "executable_sha256": file_hash(executable),
-    }
-
-
-def observe_submitting_process(pid: int, executable: str, expected_sha256: str) -> dict:
-    """Observe the frozen Pi caller from its actual helper-child process."""
-    if type(pid) is not int or pid <= 0:
-        raise GateFailure("Invalid submitting process PID")
-    try:
-        caller = psutil.Process(pid)
-        if not any(
-            parent.pid == pid and parent.create_time() == caller.create_time()
-            for parent in psutil.Process().parents()
-        ):
-            raise GateFailure("Submitting process is not an ancestor of its observer")
-        identity = observed_process_identity(pid)
-        if (
-            identity["executable"] != str(Path(executable).resolve(strict=True))
-            or identity["executable_sha256"] != expected_sha256
-        ):
-            raise GateFailure("Submitting process differs from the frozen Pi executable")
-        return identity
-    except (psutil.Error, OSError) as exc:
-        raise GateFailure("Submitting process identity cannot be observed") from exc
 
 
 def injected_context_pins(runtime: dict, controls: dict) -> dict[str, str]:
@@ -264,16 +206,13 @@ def invocation_identity(runtime: dict, contract: dict, role: str) -> str:
     return digest(
         encode(
             {
-                "model": role_model(runtime, role),
-                "provider": runtime.get("provider_id", "dual-local"),
-                "backend": runtime.get("backend", "owned_llama"),
+                "model": WORKER if role == "implementer" else LEAD,
                 "role": role,
-                "thinking": role_thinking(runtime, role),
+                "thinking": "off" if role == "implementer" else "medium",
                 "runtime_files": {
                     name: file_hash(Path(runtime[name]))
                     for name in ("pi", "server", "models_ini", "provider", "stage_guard", "governance_gate")
                 },
-                "stage_stop_sha256": file_hash(Path(runtime["stage_guard"]).with_name("formal-stage-stop.ts")),
                 "limits": {
                     name: contract[name]
                     for name in (
@@ -288,7 +227,7 @@ def invocation_identity(runtime: dict, contract: dict, role: str) -> str:
     )
 
 
-def command_environment(cwd: Path, temp_root: Path | None = None) -> dict[str, str]:
+def command_environment(cwd: Path) -> dict[str, str]:
     # Keep only platform/locale inputs needed by the fixed subprocess commands.
     # Pi role/session variables and Python/Git injection variables are not inputs
     # to the verifier, so planning and authorized integration use identical bytes.
@@ -298,6 +237,8 @@ def command_environment(cwd: Path, temp_root: Path | None = None) -> dict[str, s
         "WINDIR",
         "COMSPEC",
         "PATHEXT",
+        "TEMP",
+        "TMP",
         "HOME",
         "USERPROFILE",
         "HOMEDRIVE",
@@ -317,9 +258,6 @@ def command_environment(cwd: Path, temp_root: Path | None = None) -> dict[str, s
         PYTHONDONTWRITEBYTECODE="1",
         PIP_NO_INDEX="1",
         UV_OFFLINE="1",
-        TEMP=str(temp_root or cwd / ".runner-temp"),
-        TMP=str(temp_root or cwd / ".runner-temp"),
-        TMPDIR=str(temp_root or cwd / ".runner-temp"),
     )
     return env
 
@@ -332,117 +270,35 @@ def executable_identity(argument: str) -> dict[str, str]:
     return {"path": str(path), "sha256": file_hash(path)}
 
 
-def observed_dependency_versions() -> dict[str, str]:
-    """Measure required installed versions without installing or importing their code."""
-    versions = {}
-    for name in ("pytest", "ruff", "jsonschema", "psutil"):
-        try:
-            version = importlib.metadata.version(name)
-        except importlib.metadata.PackageNotFoundError as exc:
-            raise GateFailure("Required verifier dependency unavailable: " + name) from exc
-        if not isinstance(version, str) or not version.strip():
-            raise GateFailure("Required verifier dependency version missing: " + name)
-        versions[name] = version
-    return versions
-
-
-def observed_verifier_identity(
-    runtime: dict, contract: dict, *, observation: dict | None = None,
-    dependency_versions: dict[str, str] | None = None,
-) -> dict[str, str]:
+def observed_verifier_identity(runtime: dict, contract: dict) -> dict[str, str]:
     """Derive identity from the running controller and its actual command resolution."""
-    observation = observation if observation is not None else {}
-    environment = command_environment(Path("<measured-worktree>"), Path("<runner-temp>"))
-    observation.update(
-        phase="python_resolution",
-        environment_sha256=digest(encode(environment)),
-        environment_value_sha256={
-            key: digest(value.encode("utf-8")) for key, value in sorted(environment.items())
-        },
-        checks_sha256=digest(encode(contract["checks"])),
-        python_version_sha256=digest(sys.version.encode("utf-8")),
-        files={},
-    )
-
-    def measure(path: Path, label: str, requested: str) -> dict[str, str]:
-        observation["phase"] = label
-        entry = observation["files"][label] = {"requested_path_sha256": digest(requested.encode("utf-8"))}
-        path = path.resolve(strict=True)
-        entry["resolved_path_sha256"] = digest(str(path).encode("utf-8"))
-        before = path.stat()
-        sha = file_hash(path)
-        after = path.stat()
-        stamps = [
-            (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
-            for stat in (before, after)
-        ]
-        entry.update(
-            sha256=sha,
-            expected_pin_sha256=contract["runtime_hashes"].get(str(path)),
-            stat_before_sha256=digest(encode(stamps[0])),
-            stat_after_sha256=digest(encode(stamps[1])),
-            stable=stamps[0] == stamps[1],
-        )
-        entry["pin_matches"] = entry["expected_pin_sha256"] == sha
-        if not entry["stable"]:
-            raise GateFailure("Verifier artifact changed during measurement")
-        return {"path": str(path), "sha256": sha}
-
-    def executable(argument: str, label: str) -> dict[str, str]:
-        observation["phase"] = label + "_resolution"
-        path = Path(argument) if Path(argument).is_absolute() else Path(shutil.which(argument) or "")
-        if not path.is_file():
-            raise GateFailure("Verifier executable unavailable: " + argument)
-        return measure(path, label, argument)
-
     python = Path(sys.executable).resolve(strict=True)
-    observation["python_paths"] = {
-        "requested_sha256": digest(str(runtime["python"]).encode("utf-8")),
-        "running_resolved_sha256": digest(str(python).encode("utf-8")),
-    }
-    configured_python = Path(runtime["python"]).resolve(strict=True)
-    observation["python_paths"]["configured_resolved_sha256"] = digest(str(configured_python).encode("utf-8"))
-    if configured_python != python:
+    if Path(runtime["python"]).resolve(strict=True) != python:
         raise GateFailure("Configured verifier Python differs from the running interpreter")
     modules = [Path(__file__), Path(__file__).with_name("formal_artifacts.py")]
-    executables = [executable(str(python), "python"), executable("git", "git")]
-    for index, check in enumerate(contract["checks"]):
-        argument = check["argv"][0].format(python=str(python))
-        executables.append(executable(argument, "check_" + str(index)))
+    executables = [executable_identity(str(python)), executable_identity("git")]
+    for check in contract["checks"]:
+        executable = check["argv"][0].format(python=str(python))
+        executables.append(executable_identity(executable))
     pins = {item["path"]: item["sha256"] for item in executables}
-    for index, path in enumerate(modules):
-        item = measure(path, "module_" + str(index), str(path))
-        pins[item["path"]] = item["sha256"]
-    observation["phase"] = "dependency_resolution"
-    dependencies = observed_dependency_versions()
-    if dependency_versions is not None:
-        dependency_versions.update(dependencies)
-    observation["dependency_versions_sha256"] = digest(encode(dependencies))
-    observation["dependency_version_sha256"] = {
-        name: digest(version.encode("utf-8")) for name, version in dependencies.items()
-    }
-    identity = {
+    pins.update({str(path.resolve()): file_hash(path) for path in modules})
+    for path, sha in pins.items():
+        if contract["runtime_hashes"].get(path) != sha:
+            raise GateFailure("Actual verifier runtime lacks a matching frozen pin: " + path)
+    return {
         "executor_id": "ephy_worker.formal_runtime.independent-verifier.v1",
-        "runtime_sha256": digest(encode({
-            "files": pins, "python_version": sys.version, "dependencies": dependencies,
-        })),
+        "runtime_sha256": digest(encode({"files": pins, "python_version": sys.version})),
         "invocation_config_sha256": digest(
             encode(
                 {
                     "checks": contract["checks"],
                     "executables": executables,
-                    "environment_sha256": observation["environment_sha256"],
+                    "environment_sha256": digest(encode(command_environment(Path("<measured-worktree>")))),
                     "command_timeout_seconds": 600,
                 }
             )
         ),
     }
-    observation.update(phase="pin_validation", observed_identity=identity)
-    for path, sha in pins.items():
-        if contract["runtime_hashes"].get(path) != sha:
-            raise GateFailure("Actual verifier runtime lacks a matching frozen pin: " + path)
-    observation["phase"] = "complete"
-    return identity
 
 
 def final_assistant_text(path: Path, *, session: bool = False) -> str:
@@ -469,119 +325,6 @@ def validate_observed_audit_output(directory: Path, result: dict) -> None:
         or final_assistant_text(safe_path(directory, "auditor.stdout.log")) != raw
     ):
         raise GateFailure("Audit result differs from the auditor's actual final output")
-
-
-def read_trace(directory: Path) -> list[dict]:
-    return [
-        json.loads(line)
-        for line in safe_path(directory, "auditor-trace.jsonl").read_text(encoding="utf-8").splitlines()
-        if line
-    ]
-
-
-def observed_audit_artifacts(bundle: Path, events: list[dict], model: str = LEAD) -> set[str]:
-    """Credit actual complete tool results or byte-matching forced context only."""
-    ack = stage_evidence(events, model, "auditor")["governance_ack"]
-    entries = {
-        entry["artifact_id"]: entry for entry in read_json(bundle / "evidence-manifest.json")["artifacts"]
-    }
-    observed = set()
-    ack_index = events.index(ack)
-    subsequent = events[ack_index + 1 :]
-    # A subsequent provider request establishes that the final context gate unlocked.
-    if any(event.get("kind") == "provider_request" for event in subsequent):
-        if ack.get("details", {}).get("policySha256") == entries["system_development_policy"]["sha256"]:
-            observed.add("system_development_policy")
-        injected = {
-            "audit_contract": "policies/independent-audit.md",
-            "audit_prompt": "prompts/audit-ephy-worker.md",
-            "audit_input_schema": "policies/audit-input.schema.json",
-            "evidence_manifest_schema": "policies/evidence-manifest.schema.json",
-            "audit_result_schema": "policies/audit-result.schema.json",
-        }
-        documents = ack.get("details", {}).get("requiredContext", [])
-        content = "".join(
-            item.get("text", "") for item in ack.get("content", []) if item.get("type") == "text"
-        )
-        for name, path in injected.items():
-            data = safe_path(bundle, entries[name]["path"]).read_bytes()
-            matching = [
-                d
-                for d in documents
-                if d.get("path") == path
-                and d.get("sha256") == entries[name]["sha256"]
-                and d.get("bytes") == len(data)
-            ]
-            if len(matching) == 1:
-                document = matching[0]
-                block = (
-                    f"BEGIN REQUIRED GOVERNANCE DOCUMENT path={path} sha256={document['sha256']} "
-                    f"bytes={len(data)} lines={document['lines']}\n"
-                    + data.decode("utf-8")
-                    + f"\nEND REQUIRED GOVERNANCE DOCUMENT path={path} sha256={document['sha256']}"
-                )
-                if block in content:
-                    observed.add(name)
-    calls = {}
-    for event in subsequent:
-        if event.get("kind") == "tool_call" and event.get("tool") == "read" and not event.get("blocked"):
-            calls[event.get("toolCallId")] = event.get("path")
-        elif event.get("kind") == "evidence_read" and event.get("full_content_delivered") is True:
-            identifier = event.get("toolCallId")
-            value = calls.pop(identifier, None)
-            if not isinstance(value, str) or not identifier:
-                raise GateFailure("Audit read result has no matching successful call")
-            path = Path(value)
-            if path.is_absolute():
-                try:
-                    value = path.relative_to(bundle).as_posix()
-                except ValueError as exc:
-                    raise GateFailure("Observed audit read escaped bundle") from exc
-            target = safe_path(bundle, value)
-            if target != safe_path(bundle, event["path"]):
-                raise GateFailure("Observed audit read path mismatch")
-            for name, entry in entries.items():
-                if event["path"] == entry["path"] and event.get("sha256") == entry["sha256"]:
-                    observed.add(name)
-    return observed
-
-
-def validate_proposal_stop(
-    directory: Path, bundle: Path, result: dict, attestation: dict, auditor_model: str = LEAD
-) -> None:
-    """The temporal postcondition is runner-observed after audit, never guessed by it."""
-    path = safe_path(directory, "post-audit-workflow.json")
-    post = read_json(path)
-    audit_input = read_json(bundle / "audit-input.json")
-    frozen = read_json(bundle / "workflow_events.txt")
-    events = post.get("events", [])
-    tail = events[len(frozen) :]
-    if (
-        attestation.get("proposal_stopped") is not True
-        or attestation.get("post_audit_workflow_sha256") != file_hash(path)
-        or post.get("job_id") != audit_input["job_id"]
-        or post.get("frozen_workflow_sha256") != file_hash(bundle / "workflow_events.txt")
-        or post.get("audit_result_sha256") != file_hash(directory / "audit-result.json")
-        or post.get("audit_trace_sha256") != file_hash(directory / "auditor-trace.jsonl")
-        or not frozen
-        or frozen[-1].get("stage") != "freeze"
-        or frozen[-1].get("proposal_stop_required") is not True
-        or frozen[-1].get("controller_sha256") != file_hash(Path(__file__))
-        or events[: len(frozen)] != frozen
-        or [event.get("stage") for event in tail]
-        != ["model loaded", "auditor start", "auditor end", "proposal stop"]
-        or tail[0].get("model") != auditor_model
-        or not isinstance(tail[0].get("server_pid"), int)
-        or tail[0]["server_pid"] <= 0
-        or tail[0]["server_pid"] != frozen[-1].get("server_pid")
-        or tail[0].get("router_entry", {}).get("id") != auditor_model
-        or tail[0].get("router_entry", {}).get("status", {}).get("value") != "loaded"
-        or tail[1].get("expected_model") != auditor_model
-        or tail[2].get("pid") != attestation["observed_auditor"]["pid"]
-        or tail[2].get("trace_sha256") != post.get("audit_trace_sha256")
-        or tail[-1].get("decision") != result["decision"]
-    ):
-        raise GateFailure("Missing or invalid post-audit proposal stop binding")
 
 
 def stage_evidence(events: list[dict], model: str, role: str) -> dict:
@@ -626,9 +369,9 @@ def stage_evidence(events: list[dict], model: str, role: str) -> dict:
 
 
 class FormalRunner:
-    def __init__(self, job_file: Path, *, initial_job: dict | None = None):
+    def __init__(self, job_file: Path):
         self.job_file = job_file.resolve()
-        self.job = read_json(job_file) if initial_job is None else copy.deepcopy(initial_job)
+        self.job = read_json(job_file)
         self.contract = self.job["contract"]
         self.directory = Path(self.job["jobDir"]).resolve()
         self.candidate = Path(self.job["worktreePath"]).resolve()
@@ -640,41 +383,8 @@ class FormalRunner:
         self.deadline = time.monotonic() + self.contract["timeout_seconds"]
         self.contract_sha = digest(encode(self.contract))
         self.server: subprocess.Popen | None = None
-        self.server_owned = True
         self.loaded_model: str | None = None
         self.campaign_stop: Path | None = None
-
-    def reject_conflicting_processes(self, names: tuple[str, ...]) -> None:
-        owner = self.job.get("submitting_process")
-        if owner is not None:
-            if (
-                not isinstance(owner, dict)
-                or set(owner) != {"pid", "created_at", "executable", "executable_sha256"}
-                or type(owner["pid"]) is not int
-                or owner["pid"] <= 0
-                or type(owner["created_at"]) not in (int, float)
-                or not math.isfinite(owner["created_at"])
-                or owner["created_at"] <= 0
-            ):
-                raise GateFailure("Invalid submitting process identity")
-            frozen_pi = str(Path(self.runtime["pi"]).resolve(strict=True))
-            if (
-                owner["executable"] != frozen_pi
-                or owner["executable_sha256"] != self.contract["runtime_hashes"].get(frozen_pi)
-                or not re.fullmatch("[a-f0-9]{64}", str(owner["executable_sha256"]))
-            ):
-                raise GateFailure("Submitting process lacks the frozen Pi executable pin")
-        for process in psutil.process_iter(["name"]):
-            name = (process.info["name"] or "").lower()
-            if name not in names:
-                continue
-            if name == "pi.exe" and owner is not None and process.pid == owner["pid"]:
-                try:
-                    if observed_process_identity(process.pid) == owner:
-                        continue
-                except (psutil.Error, OSError) as exc:
-                    raise GateFailure("Submitting Pi identity cannot be revalidated") from exc
-            raise GateFailure("Another Pi/model process is active; do not duplicate or stop it")
 
     def router_request(self, route: str, body: dict | None = None) -> dict:
         with httpx.Client(trust_env=False, timeout=15) as client:
@@ -690,7 +400,9 @@ class FormalRunner:
         url = urlparse(self.runtime["base_url"])
         if url.scheme != "http" or url.hostname != "127.0.0.1" or not url.port or url.path:
             raise GateFailure("Only an owned loopback model router is supported")
-        self.reject_conflicting_processes(("pi.exe", "llama-server.exe", "strata.exe"))
+        for process in psutil.process_iter(["name"]):
+            if (process.info["name"] or "").lower() in ("pi.exe", "llama-server.exe", "strata.exe"):
+                raise GateFailure("Another Pi/model process is active; do not duplicate or stop it")
         with socket.socket() as sock:
             if sock.connect_ex(("127.0.0.1", url.port)) == 0:
                 raise GateFailure("Frozen model router port is occupied")
@@ -833,8 +545,6 @@ class FormalRunner:
 
     def intact(self) -> None:
         current = read_json(self.job_file)
-        if current.get("submitting_process") != self.job.get("submitting_process"):
-            raise GateFailure("Frozen submitting process identity changed")
         if digest(encode(current["contract"])) != self.contract_sha:
             raise GateFailure("Frozen contract changed")
         for field in (
@@ -861,22 +571,11 @@ class FormalRunner:
             if file_hash(Path(self.contract[name])) != self.contract[name + "_sha256"]:
                 raise GateFailure(f"Fixed checker evidence changed: {name}")
 
-    def command(
-        self,
-        argv: list[str],
-        cwd: Path,
-        label: str,
-        seconds: int,
-        stage_environment: dict[str, str] | None = None,
-    ) -> dict:
+    def command(self, argv: list[str], cwd: Path, label: str, seconds: int) -> dict:
         self.resources()
         self.intact()
         out, err = self.directory / (label + ".stdout.log"), self.directory / (label + ".stderr.log")
-        temp = self.directory / "temp"
-        temp.mkdir(exist_ok=True)
-        env = command_environment(cwd, temp)
-        if stage_environment is not None:
-            env.update(stage_environment)
+        env = command_environment(cwd)
         executable = executable_identity(argv[0])
         argv = [executable["path"], *argv[1:]]
         started = now()
@@ -913,8 +612,6 @@ class FormalRunner:
             "stderr_sha256": file_hash(err),
             "environment_sha256": self.job["environment_sha256"],
             "effective_environment_sha256": digest(encode(env)),
-            "temp_root": str(temp),
-            "temp_variables": {key: env[key] for key in ("TEMP", "TMP", "TMPDIR")},
             "executable": executable,
         }
         self.transcripts.append(
@@ -930,59 +627,16 @@ class FormalRunner:
         return record
 
     def verifier_identity(self) -> dict:
-        observation = {
-            "schema": "ephy.verifier-identity-observation.v1",
-            "at": now(),
-            "controller_pid": os.getpid(),
-            "expected_identity": self.job["verifier_identity"],
-            "observed_identity": None,
-        }
-        dependencies = {}
-        try:
-            observed = observed_verifier_identity(
-                self.runtime, self.contract, observation=observation,
-                dependency_versions=dependencies,
-            )
-        except Exception as exc:
-            observation.update(decision="observation_failed", failure_type=type(exc).__name__)
-            self.retain_verifier_observation(observation)
-            raise
-        matches = observed == self.job["verifier_identity"]
-        observation.update(decision="matched" if matches else "identity_mismatch", matches=matches)
-        self.retain_verifier_observation(observation)
-        if not matches:
+        observed = observed_verifier_identity(self.runtime, self.contract)
+        if observed != self.job["verifier_identity"]:
             raise GateFailure("Observed independent verifier identity differs from frozen expectation")
-        self._verified_dependency_versions = dependencies
         return observed
-
-    def retain_verifier_observation(self, observation: dict) -> None:
-        """Persist only digests before permitting checks; missing diagnostics fail closed."""
-        try:
-            path = safe_path(self.directory, "verifier-identity.jsonl", missing=True)
-            data = json.dumps(observation, sort_keys=True).encode("utf-8") + b"\n"
-            limit = min(self.contract["max_log_bytes"], 1024 * 1024)
-            if (path.stat().st_size if path.exists() else 0) + len(data) > limit:
-                raise GateFailure("Verifier identity diagnostic log limit exceeded")
-            with path.open("ab") as stream:
-                stream.write(data)
-                stream.flush()
-                os.fsync(stream.fileno())
-        except OSError as exc:
-            raise GateFailure("Verifier identity diagnostic could not be retained") from exc
 
     def run_checks(self, label: str, baseline: bool = False) -> dict:
         verifier = self.verifier_identity()
-        dependencies = dict(self._verified_dependency_versions)
-
-        def dependencies_intact() -> None:
-            if observed_dependency_versions() != dependencies:
-                self.verifier_identity()  # Retain the changed measurement before refusing it.
-                raise GateFailure("Independent verifier dependency versions changed during checks")
-
         before = snapshot_hash(self.candidate)
         checks = []
         for check in self.contract["checks"]:
-            dependencies_intact()
             temp = self.directory / (label + "-temp")
             temp.mkdir(exist_ok=True)
             substitutions = {
@@ -993,14 +647,11 @@ class FormalRunner:
             }
             argv = [arg.format(**substitutions) for arg in check["argv"]]
             result = self.command(argv, self.candidate, label + "-" + check["id"], 600)
-            dependencies_intact()
             if (
                 result["argv"] != [executable_identity(argv[0])["path"], *argv[1:]]
                 or result["cwd"] != str(self.candidate)
                 or result["effective_environment_sha256"]
-                != digest(encode(command_environment(self.candidate, self.directory / "temp")))
-                or result["temp_root"] != str(self.directory / "temp")
-                or set(result["temp_variables"].values()) != {str(self.directory / "temp")}
+                != digest(encode(command_environment(self.candidate)))
             ):
                 raise GateFailure("Observed verifier command differs from frozen invocation")
             checks.append(
@@ -1010,11 +661,16 @@ class FormalRunner:
                     "passed": result["exit_code"] == (check["baseline_exit_code"] if baseline else 0),
                 }
             )
-        dependencies_intact()
-        checks.append(self.run_diff_check(label))
-        dependencies_intact()
         if snapshot_hash(self.candidate) != before:
             raise GateFailure("Independent verification changed candidate")
+        diff = subprocess.run(
+            ["git", "-C", str(self.candidate), "diff", "--check"],
+            capture_output=True,
+            check=False,
+            env=command_environment(self.candidate),
+        )
+        if diff.returncode:
+            checks.append({"id": "diff", "passed": False, "exit_code": diff.returncode})
         after = snapshot(self.candidate)
         changed = sorted(
             name
@@ -1036,76 +692,14 @@ class FormalRunner:
         write_json(self.directory / (label + "-results.json"), result)
         return result
 
-    def run_diff_check(self, label: str) -> dict:
-        index = safe_path(self.directory, label + "-diff.index", missing=True)
-        if index.exists():
-            raise GateFailure("Diff index already exists")
-        index_environment = {"GIT_INDEX_FILE": str(index)}
-        preparation = []
-        for suffix, arguments in (
-            ("base", ["read-tree", self.job["baseRevision"]]),
-            ("stage", ["add", "--all", "--"]),
-        ):
-            record = self.command(
-                ["git", "-C", str(self.candidate), *arguments],
-                self.candidate,
-                label + "-diff-" + suffix,
-                600,
-                stage_environment=index_environment,
-            )
-            if record["exit_code"] != 0:
-                raise GateFailure("Cannot prepare complete candidate diff")
-            preparation.append(record)
-        index_hash = file_hash(index)
-        diff = self.command(
-            ["git", "-C", str(self.candidate), "diff", "--cached", "--check", self.job["baseRevision"]],
-            self.candidate,
-            label + "-diff",
-            600,
-            stage_environment=index_environment,
-        )
-        if file_hash(index) != index_hash:
-            raise GateFailure("Diff command changed isolated index")
-        return {
-            "id": "diff", **diff, "passed": diff["exit_code"] == 0,
-            "isolated_index": {"path": str(index), "sha256": index_hash},
-            "preparation": preparation,
-        }
-
-    def freeze_patch(self, result: dict) -> bytes:
-        """Capture exactly the index that passed the complete candidate diff check."""
-        diff = next(check for check in result["checks"] if check["id"] == "diff")
-        index = safe_path(self.directory, Path(diff["isolated_index"]["path"]).name)
-        if (
-            result["passed"] is not True
-            or diff["passed"] is not True
-            or diff["exit_code"] != 0
-            or snapshot_hash(self.candidate) != result["snapshot_sha256"]
-            or file_hash(index) != diff["isolated_index"]["sha256"]
-        ):
-            raise GateFailure("Candidate or checked index changed before patch freeze")
-        record = self.command(
-            ["git", "-C", str(self.candidate), "diff", "--cached", "--binary", "--full-index", self.job["baseRevision"]],
-            self.candidate, "candidate-patch", 600,
-            stage_environment={"GIT_INDEX_FILE": str(index)},
-        )
-        if (
-            record["exit_code"] != 0
-            or file_hash(index) != diff["isolated_index"]["sha256"]
-            or snapshot_hash(self.candidate) != result["snapshot_sha256"]
-        ):
-            raise GateFailure("Candidate or checked index changed during patch freeze")
-        return safe_path(self.directory, record["stdout"]).read_bytes()
-
     def stage(self, role: str, prompt: str, label: str, root: Path, envelope: dict | None = None) -> str:
         self.intact()
-        model = role_model(self.runtime, role)
+        model = WORKER if role == "implementer" else LEAD
         self.load_model(model)
         stage_config = {
             "root": str(root),
             "role": role,
             "model_id": model,
-            "provider_id": self.runtime.get("provider_id", "dual-local"),
             "allowed_files": self.contract["allowed_files"] if role == "implementer" else [],
             **{
                 key: self.contract[key]
@@ -1118,32 +712,26 @@ class FormalRunner:
         task_path.write_text(prompt, encoding="utf-8")
         system_path = self.directory / (label + "-system.txt")
         system = "Use the canonical development_governance section and exact governance_ack before any task."
-        system += (
-            "\nEvery file tool must use an explicit nonempty path. Use '.' for the stage root; "
-            "never use an empty path. Use exact relative file paths for read/edit/write. "
-            "Do not list or search files unless the frozen task needs it."
-        )
         if envelope:
             system += "\nSYSTEM-CONTROLLED AUDIT ENVELOPE\n" + encode(envelope).decode()
         system_path.write_text(system, encoding="utf-8")
         trace = self.directory / (label + "-trace.jsonl")
         # Managed configuration is dedicated to this run; no global/auth settings or discovery.
-        stage_environment = {
-            "PI_CODING_AGENT_DIR": self.runtime["managed_dir"],
-            "PI_OFFLINE": "1",
-            "DUAL_LLAMA_BASE_URL": self.runtime["base_url"],
-            "DUAL_GOVERNANCE_ROLE": role,
-            "DUAL_GOVERNANCE_POLICY": self.runtime["policy"],
-            "DUAL_GOVERNANCE_CONTEXT_ROOT": self.runtime["governance_root"],
-            "DUAL_JOB_RUNNER": self.runtime["runner"],
-            "DUAL_RUNNER_SMOKE_TEST": self.runtime["runner_test"],
-            "EPHY_FORMAL_STAGE_CONFIG": str(config_path),
-            "EPHY_FORMAL_TRACE": str(trace),
-        }
-        if self.runtime.get("backend") == "external_strata":
-            stage_environment["EPHY_STRATA_IDENTITY"] = self.runtime["models_ini"]
+        previous = os.environ.copy()
+        os.environ.update(
+            PI_CODING_AGENT_DIR=self.runtime["managed_dir"],
+            PI_OFFLINE="1",
+            DUAL_LLAMA_BASE_URL=self.runtime["base_url"],
+            DUAL_GOVERNANCE_ROLE=role,
+            DUAL_GOVERNANCE_POLICY=self.runtime["policy"],
+            DUAL_GOVERNANCE_CONTEXT_ROOT=self.runtime["governance_root"],
+            DUAL_JOB_RUNNER=self.runtime["runner"],
+            DUAL_RUNNER_SMOKE_TEST=self.runtime["runner_test"],
+            EPHY_FORMAL_STAGE_CONFIG=str(config_path),
+            EPHY_FORMAL_TRACE=str(trace),
+        )
         if role == "auditor":
-            stage_environment["DUAL_AUDIT_BUNDLE_ROOT"] = str(root)
+            os.environ["DUAL_AUDIT_BUNDLE_ROOT"] = str(root)
         session = self.directory / (label + "-session.jsonl")
         if role == "implementer":
             system_path.write_text(
@@ -1159,11 +747,11 @@ class FormalRunner:
             "--no-context-files",
             "--offline",
             "--provider",
-            self.runtime.get("provider_id", "dual-local"),
+            "dual-local",
             "--model",
             model,
             "--thinking",
-            role_thinking(self.runtime, role),
+            "off" if role == "implementer" else "medium",
             "--extension",
             self.runtime["provider"],
             "--extension",
@@ -1182,9 +770,11 @@ class FormalRunner:
             "@" + str(task_path),
         ]
         self.event(role + " start", label=label, expected_model=model)
-        result = self.command(
-            argv, root, label, self.contract["stage_seconds"], stage_environment=stage_environment
-        )
+        try:
+            result = self.command(argv, root, label, self.contract["stage_seconds"])
+        finally:
+            os.environ.clear()
+            os.environ.update(previous)
         if result["exit_code"] != 0:
             raise GateFailure("Managed Pi stage failed: " + label)
         self.verify_model_artifacts(model)
@@ -1232,9 +822,8 @@ class FormalRunner:
         }
         required_runtime.update(
             str(Path(__file__).with_name(name))
-            for name in ("__init__.py", "formal_runtime.py", "formal_artifacts.py", "formal_campaign.py", "strata_runtime.py")
+            for name in ("formal_runtime.py", "formal_artifacts.py", "formal_campaign.py")
         )
-        required_runtime.add(str(Path(self.runtime["stage_guard"]).with_name("formal-stage-stop.ts").resolve()))
         context_pins = injected_context_pins(self.runtime, self.job["controls"])
         context_pins[self.runtime["policy"]] = self.job["controls"]["system_development_policy"]
         required_runtime.update(context_pins)
@@ -1251,9 +840,11 @@ class FormalRunner:
                 self.runtime, self.contract, role
             ):
                 raise GateFailure("Frozen model invocation config mismatch")
-        for role in ("planner", "implementer", "auditor"):
-            model = role_model(self.runtime, role)
-            identity = self.job["model_identities"][role]
+        for model, identity in (
+            (LEAD, self.job["model_identities"]["planner"]),
+            (WORKER, self.job["model_identities"]["implementer"]),
+            (LEAD, self.job["model_identities"]["auditor"]),
+        ):
             if identity["model_id"] != model:
                 raise GateFailure("Expected model/role mismatch")
             if identity["runtime_sha256"] != file_hash(Path(self.runtime["server"])):
@@ -1295,19 +886,21 @@ class FormalRunner:
             "scope_escape",
         } or any(c["actual"] != c["expected"] for c in controls):
             raise GateFailure("Fixed checker control evidence invalid")
-        self.verifier_identity()
         env = {
             "python": self.runtime["python"],
             "python_version": sys.version,
-            "dependencies": dict(self._verified_dependency_versions),
+            "dependencies": {
+                name: importlib.metadata.version(name) for name in ("pytest", "ruff", "jsonschema", "psutil")
+            },
             "offline": True,
             "locale": "UTF-8",
             "pythonpath": "<measured-worktree>/src",
-            "temp_root": str(self.directory / "temp"),
+            "temp_root": str(self.directory),
             "contract_sha256": self.contract_sha,
         }
         self.job["environment_sha256"] = digest(encode(env))
         self.environment = encode(env)
+        self.verifier_identity()
         self.state("preparing", "Checking frozen baseline before any model invocation")
         self.baseline_result = self.run_checks("baseline", baseline=True)
         if not self.baseline_result["passed"]:
@@ -1321,9 +914,8 @@ class FormalRunner:
 
     def run(self) -> None:
         try:
-            self.state("preparing", "Validating frozen runtime before preflight")
             self.preflight()
-            self.state("running", "Fresh designated-model planning session")
+            self.state("running", "Fresh gpt-oss planning session")
             before = snapshot_hash(self.candidate)
             plan = self.stage(
                 "planner",
@@ -1346,7 +938,7 @@ class FormalRunner:
             result: dict = {}
             for attempt in range(self.contract["max_repairs"] + 1):
                 self.state(
-                    "running" if attempt == 0 else "repairing", f"Pi implementation attempt {attempt + 1}"
+                    "running" if attempt == 0 else "repairing", f"Qwen implementation attempt {attempt + 1}"
                 )
                 prompt = (
                     self.contract["task"]
@@ -1382,16 +974,23 @@ class FormalRunner:
                 self.state("verification_failed", "No implementation change; never count this as improvement")
                 return
             final = snapshot(self.candidate)
-            patch = self.freeze_patch(result)
+            patch = git(self.candidate, "diff", "--binary", "HEAD")
+            # Include new files without altering the candidate index.
+            for name in result["changed_files"]:
+                if name not in self.baseline_snapshot:
+                    safe_path(self.candidate, name)
+                    addition = subprocess.run(
+                        ["git", "diff", "--no-index", "--binary", "--", os.devnull, name],
+                        cwd=self.candidate,
+                        capture_output=True,
+                        check=False,
+                        env=command_environment(self.candidate),
+                    )
+                    if addition.returncode not in (0, 1):
+                        raise GateFailure("Cannot capture new-file patch")
+                    patch += addition.stdout
             (self.directory / "candidate.patch").write_bytes(patch)
-            self.event(
-                "freeze",
-                patch_sha256=digest(patch),
-                snapshot_sha256=digest(encode(final)),
-                proposal_stop_required=True,
-                controller_sha256=file_hash(Path(__file__)),
-                server_pid=self.server.pid,
-            )
+            self.event("freeze", patch_sha256=digest(patch), snapshot_sha256=digest(encode(final)))
             artifacts = {
                 name: safe_path(Path(self.runtime["governance_root"]), path).read_bytes()
                 for name, path in CONTROL_PATHS.items()
@@ -1417,14 +1016,7 @@ class FormalRunner:
             bundle = self.directory / "audit-bundle"
             audit_input = freeze_bundle(bundle, self.job, artifacts)
             frozen = {p.name: file_hash(p) for p in bundle.iterdir()}
-            if self.runtime.get("review_mode", "formal") == "external_codex":
-                from .strata_runtime import freeze_external_proposal
-
-                freeze_external_proposal(self, bundle, audit_input)
-                return
-            if self.runtime.get("review_mode", "formal") != "formal":
-                raise GateFailure("Unknown frozen review mode")
-            self.state("audit_pending", "Fresh read-only designated-model final audit")
+            self.state("audit_pending", "Fresh read-only gpt-oss final audit")
             envelope = {
                 "audit_id": audit_input["audit_id"],
                 "job_id": self.job["id"],
@@ -1442,18 +1034,11 @@ class FormalRunner:
             prompt += " Every PASS must cite all artifact IDs in required_audit_evidence for that check, "
             prompt += "with their manifest hashes and relevant locations. Coverage does not replace reading "
             prompt += "and assessing the evidence; never invent a citation to satisfy coverage."
-            prompt += (
-                " Cited artifacts must have a successful full read or matching forced context delivery. "
-            )
-            prompt += "For W11 assess the frozen proposal-only boundary and absence of adoption so far; "
-            prompt += "the controller must separately bind the actual post-audit stop before review_ready."
             text = self.stage("auditor", prompt, "auditor", bundle, envelope)
             (self.directory / "audit-result.raw.txt").write_text(text, encoding="utf-8")
             audit_result = read_json(self.directory / "audit-result.raw.txt")
             validate_observed_audit_output(self.directory, audit_result)
-            events = read_trace(self.directory)
-            observed_artifacts = observed_audit_artifacts(bundle, events, role_model(self.runtime, "auditor"))
-            validate_audit_result(audit_result, bundle, audit_input, observed_artifacts)
+            validate_audit_result(audit_result, bundle, audit_input)
             inspect_bundle(
                 bundle,
                 read_json(bundle / "evidence-manifest.json"),
@@ -1465,17 +1050,6 @@ class FormalRunner:
             if not unchanged:
                 raise GateFailure("Candidate/bundle changed during audit")
             write_json(self.directory / "audit-result.json", audit_result)
-            self.event("proposal stop", decision=audit_result["decision"])
-            write_json(
-                self.directory / "post-audit-workflow.json",
-                {
-                    "job_id": self.job["id"],
-                    "events": self.events,
-                    "frozen_workflow_sha256": audit_input["final_bindings"]["workflow_events_sha256"],
-                    "audit_result_sha256": file_hash(self.directory / "audit-result.json"),
-                    "audit_trace_sha256": file_hash(self.directory / "auditor-trace.jsonl"),
-                },
-            )
             write_json(
                 self.directory / "audit-execution-attestation.json",
                 {
@@ -1488,18 +1062,9 @@ class FormalRunner:
                     "audit_stdout_sha256": file_hash(self.directory / "auditor.stdout.log"),
                     "audit_input_sha256": file_hash(bundle / "audit-input.json"),
                     "passed": True,
-                    "proposal_stopped": True,
-                    "post_audit_workflow_sha256": file_hash(self.directory / "post-audit-workflow.json"),
-                    "observed_audit_artifacts": sorted(observed_artifacts),
                 },
             )
-            validate_proposal_stop(
-                self.directory,
-                bundle,
-                audit_result,
-                read_json(self.directory / "audit-execution-attestation.json"),
-                role_model(self.runtime, "auditor"),
-            )
+            self.event("proposal stop", decision=audit_result["decision"])
             self.job["outcome"] = (
                 "accepted_proposal" if audit_result["decision"] == "ACCEPT_PROPOSAL" else "audit_rejected"
             )
@@ -1525,31 +1090,8 @@ class FormalRunner:
                 write_json(self.directory / "retention-error.json", {"error": str(exc)})
                 raise
             finally:
-                if self.server and self.server_owned:
+                if self.server:
                     stop_tree(self.server)
-
-
-def freeze_submission_identity(draft: dict, *, observation: dict | None = None) -> dict:
-    """Freeze a fresh draft inside the controller that will execute it.
-
-    This trusted submission step cannot accept an existing spec or job. Comparisons
-    never call it: a later environment, command or artifact change remains a failure.
-    """
-    if set(draft) != {
-        "repoRoot",
-        "baseRevision",
-        "contract",
-        "runtime",
-        "controls",
-        "model_identities",
-    }:
-        raise GateFailure("Verifier identity freeze requires an unfrozen submission draft")
-    spec = copy.deepcopy(draft)
-    validate_contract(spec["contract"])
-    spec["verifier_identity"] = observed_verifier_identity(
-        spec["runtime"], spec["contract"], observation=observation
-    )
-    return spec
 
 
 def submit(spec: dict, root: Path) -> Path:
@@ -1590,10 +1132,6 @@ def submit(spec: dict, root: Path) -> Path:
 def verify_proposal_for_integration(job_file: Path) -> Path:
     """Read-only adoption gate outside the model Job; never infer approval from status alone."""
     runner = FormalRunner(job_file)
-    if runner.runtime.get("review_mode", "formal") != "formal":
-        raise GateFailure(
-            "External-review proposals require separate current-head review; cannot integrate here"
-        )
     validate_contract(runner.contract)
     runner.intact()
     if runner.job["status"] != "review_ready" or runner.job.get("outcome") != "accepted_proposal":
@@ -1603,9 +1141,7 @@ def verify_proposal_for_integration(job_file: Path) -> Path:
     result_file = runner.directory / "audit-result.json"
     audit_result = read_json(result_file)
     validate_observed_audit_output(runner.directory, audit_result)
-    events = read_trace(runner.directory)
-    observed_artifacts = observed_audit_artifacts(bundle, events, role_model(runner.runtime, "auditor"))
-    validate_audit_result(audit_result, bundle, audit_input, observed_artifacts)
+    validate_audit_result(audit_result, bundle, audit_input)
     if audit_result["decision"] != "ACCEPT_PROPOSAL":
         raise GateFailure("Auditor did not accept the proposal")
     inspect_bundle(
@@ -1619,24 +1155,15 @@ def verify_proposal_for_integration(job_file: Path) -> Path:
     ):
         raise GateFailure("Integration Job/base identity mismatch")
     attestation = read_json(runner.directory / "audit-execution-attestation.json")
-    if sorted(observed_artifacts) != attestation.get("observed_audit_artifacts"):
-        raise GateFailure("Integration observed audit delivery mismatch")
-    validate_proposal_stop(
-        runner.directory, bundle, audit_result, attestation, role_model(runner.runtime, "auditor")
-    )
     observed = attestation["observed_auditor"]
-    auditor_model = role_model(runner.runtime, "auditor")
-    if (
-        observed.get("model_id") != auditor_model
-        or runner.job["model_identities"]["auditor"]["model_id"] != auditor_model
-    ):
+    if observed.get("model_id") != LEAD or runner.job["model_identities"]["auditor"]["model_id"] != LEAD:
         raise GateFailure("Integration auditor model mismatch")
     events = [
         json.loads(line)
         for line in (runner.directory / "auditor-trace.jsonl").read_text(encoding="utf-8").splitlines()
         if line
     ]
-    trace_evidence = stage_evidence(events, auditor_model, "auditor")
+    trace_evidence = stage_evidence(events, LEAD, "auditor")
     if (
         trace_evidence["governance_ack"]["details"].get("policySha256")
         != runner.job["controls"]["system_development_policy"]
@@ -1671,7 +1198,7 @@ def verify_proposal_for_integration(job_file: Path) -> Path:
     return patch
 
 
-def main(*, launch_job_bytes: bytes | None = None) -> None:
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--job", type=Path, required=True)
     parser.add_argument("--verify-proposal-only", action="store_true")
@@ -1679,19 +1206,7 @@ def main(*, launch_job_bytes: bytes | None = None) -> None:
     if args.verify_proposal_only:
         print(json.dumps({"patch": str(verify_proposal_for_integration(args.job)), "verified": True}))
         return
-    if launch_job_bytes is None:
-        job = read_json(args.job)
-    else:
-        if args.job.read_bytes() != launch_job_bytes:
-            raise GateFailure("Frozen launch job bytes changed before controller entry")
-        job = json.loads(launch_job_bytes.decode("utf-8"))
-    dispatch_module = Path(__file__).with_name("strata_runtime.py")
-    expected = job.get("contract", {}).get("runtime_hashes", {}).get(str(dispatch_module))
-    if not expected or file_hash(dispatch_module) != expected:
-        raise GateFailure("Strata dispatch module lacks a matching frozen pin")
-    from .strata_runtime import make_runner
-
-    runner = make_runner(args.job) if launch_job_bytes is None else make_runner(args.job, initial_job=job)
+    runner = FormalRunner(args.job)
     with exclusive_lock(Path(runner.runtime["resource_lock"])):
         runner.run()
 

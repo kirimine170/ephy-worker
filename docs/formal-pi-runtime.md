@@ -2,13 +2,11 @@
 
 今回の基盤実装は，ユーザーが明示したCodexによる修正・PR・merge依頼として作成する．gpt-oss／Qwenで実装した正式Jobではなく，過去コードをQwenの成果へ認定し直さない．CIとPRレビューを通すbootstrapの基盤修正と，このrunnerで新規実行するモデルのproposalを区別する．
 
-PR15／PR16をmain向けにまとめる[限定bootstrap採用経路のADR](adr/0004-authorized-codex-bootstrap-adoption.md)は，2026-10-04の明示承認によりAcceptedである．今回のPR17基盤だけを，最終headのCI，main向け全範囲の独立Codex Review，P0／P1解消を確認して採用・mergeする．対象コードのformal pre-audit実装来歴は未実施のまま保持し，旧来歴gateや停止したJobを完了扱いにしない．既存CIと実StrataのMarkdown試験は元のsource／policy／candidateへ結び付け，変更後headの新規実モデル実行とは記録しない．採用判断は別roleのIntegration／release operatorが記録し，runnerの正式合格状態，integration拒否，一般Jobの監査・予算・CI／review要件を変更しない．
-
 ## 入口と実装範囲
 
 既存labの`run-background-job.ps1`と対応するsmoke testを`tools/pi-local/windows/`へversion管理用に取り込んだ．既存v1は挙動を保持し，`schemaVersion: 2`だけを`ephy_worker.formal_runtime`へdispatchする．v1の`audit_pending`を正式合格へ昇格させない．managed Piの`background_job_submit`は，controllerが事前固定したspecの実在pathとSHA-256を受け取り，既存のUI確認後にv2を提出できる．対話用`tools/pi-local/run.ps1`はこの入口ではない．
 
-正式v2はclean detached worktree，固定file／semantic scope，外部checkerとcontrol，5種類のcheck，runtimeとmodelのhash，時間・output token・request・RAM・空き容量・log上限，最大2回のrepairを起動前に検証する．実行前に契約で指定したplanner，Pi implementer，runner独立検証，freeze，fresh指定auditorを別process／sessionで順に実行する．gpt-oss／Qwenは既存owned profileの既定modelであり，model名だけでroleの独立性を証明しない．実装者にはshellを与えず，file toolのwriteを正規化した許可pathへ限定し，範囲外path・hard link・role違反・wrong model・予算超過を遮断してsessionを停止する．既存governance gateは最後に読み込み，system配送とexactなack前の依頼隔離を保持する．必須runtimeの実在pathとhashも配送する．
+正式v2はclean detached worktree，固定file／semantic scope，外部checkerとcontrol，5種類のcheck，runtimeとmodelのhash，時間・output token・request・RAM・空き容量・log上限，最大2回のrepairを起動前に検証する．gpt-oss planner，Qwen implementer，runner独立検証，freeze，fresh gpt-oss auditorを別process／sessionで順に実行する．実装者にはshellを与えず，file toolのwriteを正規化した許可pathへ限定し，範囲外path・hard link・role違反・wrong model・予算超過を遮断してsessionを停止する．既存governance gateは最後に読み込み，system配送とexactなack前の依頼隔離を保持する．必須runtimeの実在pathとhashも配送する．
 
 最初の対応profileは`docs/`または`.agents/skills/`内のMarkdown proposalだけである．検証時に変更プログラムを実行するsandboxは未接続であり，Python・tool・MCPの実行コード変更を許可すると，checker経由でfile toolの境界を超えられるため，このprofileでは拒否する．OSの権限・security設定を変更して制限を外さない．文書の合格はskillの別課題への実効性を証明せず，転用測定は別に固定した課題と条件が必要である．
 
@@ -25,10 +23,6 @@ Windows回帰fixtureはPythonで実際のRPC subprocessを起動し，POSIX sheb
 CIのPython UTF-8 modeと標準入出力encodingを明示し，Windowsの既定code pageに依存した文書・ログのdecode失敗を防ぐ．テストのassertionや入力は変更しない．
 
 ## 有限の再帰実行
-
-監査引用とdocuments_readは，guardが成功した全文read結果のraw hashを記録したartifact，またはackと次provider callの間に全文・hash一致の強制context配送を観測した文書へ限定する．失敗・部分・truncation・grepだけの結果は全文readと扱わない．監査前bundleに将来のstopを記載したとは主張しない．W11は凍結された未採用境界とrunnerのstop義務を監査し，監査後にrunnerが実際のproposal stopを別workflowへ保存する．frozen prefix，audit結果，実trace，auditor processと結び付けてからreview_readyへ進み，Integrationも再検査する．
-
-検証processのTEMP／TMP／TMPDIRはjob配下のtempへ固定し，環境契約と実transcriptに同じrootを記録する．Pi stage固有のmanaged directory・role・policy・provider・trace設定はrunnerが明示的なstage環境として構築して渡す．親環境のrole変数を独立verifierへ継承せず，必要なPi設定を消してgate未接続で実行することも許さない．
 
 `python -m ephy_worker.formal_campaign --plan <controller-owned-plan.json> --state <new-state-directory> --execute-authorized`は，ユーザーの明示的な実行依頼を受けたtrusted controller用入口である．agentには公開しない．spec配列，最大連続失敗，campaign全体の期限を固定する．上限は20件／24時間で，controllerのkernel-held lockで重複運転を拒否する．各Jobは新しいIDとclean worktreeを持つ．model serverも所有processだけを起動・停止し，他のPi／llama／Strata processまたは占有portがあれば停止する．
 

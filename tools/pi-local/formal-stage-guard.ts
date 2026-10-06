@@ -1,8 +1,6 @@
 import { appendFileSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createHash } from "node:crypto";
-import { stopManagedStage } from "./formal-stage-stop.ts";
 
 // Load BEFORE governance-gate, which remains the final payload/ack gate.
 export default function (pi: ExtensionAPI) {
@@ -11,15 +9,11 @@ export default function (pi: ExtensionAPI) {
   const root = realpathSync(config.root);
   const reads = new Set(["read", "grep", "find", "ls"]);
   const writes = new Set(["edit", "write"]);
-  const pendingReads = new Map<string, string>();
   let failed = false;
   let outputTokens = 0;
   let requests = 0;
-  let responseTokenCap = 0;
-  const record = (kind: string, value: object) => {
-    try { appendFileSync(trace, JSON.stringify({ at: new Date().toISOString(), kind, ...value }) + "\n"); }
-    catch { stopManagedStage("Could not persist formal stage evidence"); }
-  };
+  const record = (kind: string, value: object) => appendFileSync(trace,
+    JSON.stringify({ at: new Date().toISOString(), kind, ...value }) + "\n");
   function within(base: string, target: string) {
     const rel = relative(base, target);
     return rel !== ".." && !rel.startsWith("../") && !rel.startsWith("..\\") && !isAbsolute(rel);
@@ -29,10 +23,6 @@ export default function (pi: ExtensionAPI) {
     pi.setActiveTools([]);
     record("violation", { reason });
     return { block: true, terminate: true, reason };
-  }
-  function stopRequest(reason: string): never {
-    try { reject(reason); }
-    finally { stopManagedStage(reason); }
   }
   function pathCheck(value: string, writing: boolean) {
     const target = resolve(root, value);
@@ -59,24 +49,18 @@ export default function (pi: ExtensionAPI) {
     return undefined;
   }
   pi.on("before_provider_request", (event: any) => {
-    if (failed) stopRequest("Formal stage is permanently latched");
-    if (!event?.payload || typeof event.payload !== "object") stopRequest("Invalid provider payload");
+    if (failed) throw new Error("FORMAL_STAGE_LATCHED");
     if (event.payload.model !== config.model_id) {
-      stopRequest("Wrong model in provider payload");
+      reject("Wrong model in provider payload");
+      throw new Error("FORMAL_MODEL_MISMATCH");
     }
-    // Count admitted provider calls, including the currently in-flight call.
-    // Do not admit or increment the N+1 call. Pi retries are disabled by the controller.
-    if (requests >= config.max_requests || outputTokens >= config.output_token_budget) {
-      stopRequest("Stage request/token budget exhausted");
+    if (++requests > config.max_requests || outputTokens >= config.output_token_budget) {
+      reject("Stage request/token budget exhausted");
+      throw new Error("FORMAL_BUDGET_EXHAUSTED");
     }
-    ++requests;
-    responseTokenCap = Math.min(config.max_response_tokens, config.output_token_budget - outputTokens);
-    const payload = { ...event.payload, max_tokens: responseTokenCap };
-    // Pi can supply this alias even for local providers. Strata prioritizes it
-    // over max_tokens, so retaining its larger value defeats the frozen cap.
-    delete payload.max_completion_tokens;
-    record("provider_request", { model: payload.model, requests, outputTokens, responseTokenCap });
-    return payload;
+    record("provider_request", { model: event.payload.model, requests, outputTokens });
+    return { ...event.payload,
+      max_tokens: Math.min(config.max_response_tokens, config.output_token_budget - outputTokens) };
   });
   pi.on("tool_call", (event: any) => {
     if (failed) return reject("Formal stage is permanently latched");
@@ -91,54 +75,33 @@ export default function (pi: ExtensionAPI) {
     const value = event.input?.path ?? ".";
     if (typeof value !== "string" || !value || value.includes("\0")) return reject("Invalid tool path");
     const reason = pathCheck(value, writing);
-    record("tool_call", { tool: event.toolName, path: value, blocked: Boolean(reason),
-      toolCallId: event.toolCallId });
+    record("tool_call", { tool: event.toolName, path: value, blocked: Boolean(reason) });
     if (reason) return reject(reason);
-    if (event.toolName === "read" && typeof event.toolCallId === "string") {
-      pendingReads.set(event.toolCallId, resolve(root, value));
-    }
   });
   pi.on("message_end", (event: any) => {
     const message = event.message;
     if (message?.role === "assistant") {
-      if (message.model !== config.model_id || message.provider !== (config.provider_id ?? "dual-local")) {
-        stopRequest("Wrong model in observed assistant response");
+      if (message.model !== config.model_id || message.provider !== "dual-local") {
+        reject("Wrong model in observed assistant response");
+        throw new Error("FORMAL_MODEL_MISMATCH");
       }
       const output = message.usage?.output;
       if (!Number.isSafeInteger(output) || output < 0) {
-        stopRequest("Missing model usage evidence");
+        reject("Missing model usage evidence");
+        throw new Error("FORMAL_USAGE_MISSING");
       }
       outputTokens += output;
       record("assistant", { model: message.model, provider: message.provider, outputTokens,
-        responseTokens: output, responseTokenCap, stopReason: message.stopReason });
-      if (output > responseTokenCap) {
-        stopRequest("Provider exceeded per-response token cap");
-      }
+        stopReason: message.stopReason });
       if (outputTokens > config.output_token_budget) {
-        stopRequest("Provider exceeded output-token cap");
-      }
-      if (["error", "aborted", "length"].includes(message.stopReason)) {
-        stopRequest("Provider returned a failed assistant response");
+        reject("Provider exceeded output-token cap");
+        throw new Error("FORMAL_BUDGET_EXHAUSTED");
       }
     }
   });
   pi.on("tool_result", (event: any) => {
     if (event.toolName === "governance_ack") {
       record("governance_result", { isError: event.isError, content: event.content, details: event.details });
-    }
-    if (event.toolName === "read") {
-      const target = pendingReads.get(event.toolCallId);
-      pendingReads.delete(event.toolCallId);
-      if (!target || event.isError || pathCheck(target, false)) return;
-      const bytes = readFileSync(target);
-      const expected = new TextDecoder("utf-8", { fatal: true }).decode(bytes).replaceAll("\r\n", "\n");
-      const delivered = (event.content ?? []).filter((item: any) => item.type === "text")
-        .map((item: any) => item.text).join("").replaceAll("\r\n", "\n");
-      // Partial/truncated/error results cannot attest a complete artifact read.
-      if (delivered === expected) record("evidence_read", {
-        toolCallId: event.toolCallId, path: relative(root, target).replaceAll("\\", "/"),
-        sha256: createHash("sha256").update(bytes).digest("hex"), full_content_delivered: true,
-      });
     }
   });
   pi.on("agent_end", () => record("stage_end", { failed, requests, outputTokens }));
