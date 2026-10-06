@@ -70,7 +70,9 @@ python scripts/validate_repository.py --check-sensitive-patterns
 ## Existing Job connection
 
 `ephy_worker.karte_experiment_job.record_result` is an explicit post-run controller
-entrypoint for an existing Worker Job schemaVersion 2．It checks the Job ID，base，
+entrypoint for an existing Worker Job schemaVersion 2．Only the canonical
+`JOB_DIR/job.json` is accepted；a copied JSON file cannot supply a stopped status．
+It checks the Job ID，base，
 contract and original `audit-bundle` artifact bytes against the same consumer
 binding．The frozen task artifact must contain the Job's exact contract，and the
 standalone `candidate.patch` must match the bundle patch．Queued，running or
@@ -78,6 +80,16 @@ standalone `candidate.patch` must match the bundle patch．Queued，running or
 are refused．The canonical `job.json`，frozen
 bundle，model runner and adoption gates are unchanged．The adapter never launches
 Pi，contacts a model，or calls an integration operation．
+
+Current bundle consistency is insufficient．The adapter also checks the original
+`audit-input.json` and bundle-integrity bindings，including the manifest，all final
+and control hashes，Job contract，models and verifier．The retained
+`external-review.json` pins that audit input for external review；formal Jobs
+require matching `audit-result.json` and `audit-execution-attestation.json`
+bindings．Missing or stale freeze records are refused，including Jobs which
+stopped before producing the required frozen evidence．These checks establish
+evidence identity only；they do not replace the full external-review or formal
+integration gates，or supply a positive audit decision．
 
 The separate `JOB_DIR/karte-consumer/state.json` records `received → verified →
 review_pending` with the immutable review target．This sidecar is consumer
@@ -87,7 +99,8 @@ latches at `cancelled`．Missing or changed evidence raises an error．An initia
 invalid result records `verification_failed`；a failed retry preserves the last
 validated `state.json` and records a separate content-addressed
 `verification-failure-SHA256.json` diagnostic，bound to the raw status and prior
-state hashes．Restoring evidence allows the original duplicate receipt to remain
+state hashes and stable error identity．Identical failed retries reuse that
+diagnostic without growing or changing the sidecar．Restoring evidence allows the original duplicate receipt to remain
 idempotent without losing cancellation or prior review progress．Every state
 retains `adopted=false` and `review_ready=false`．
 Identical retries revalidate evidence and leave saved files unchanged．

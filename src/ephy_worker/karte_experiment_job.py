@@ -13,7 +13,17 @@ import stat
 from dataclasses import asdict
 from pathlib import Path
 
-from .formal_artifacts import GateFailure, digest, encode, now, read_json, safe_path, write_json
+from .formal_artifacts import (
+    CONTROL_PATHS,
+    FINAL_BINDINGS,
+    GateFailure,
+    digest,
+    encode,
+    now,
+    read_json,
+    safe_path,
+    write_json,
+)
 from .formal_runtime import exclusive_lock, validate_contract
 from .karte_experiment_consumer import (
     MANIFEST_REF,
@@ -92,6 +102,122 @@ def _previous(record: dict, job_pin: str) -> Observation | None:
     return observation
 
 
+def _frozen_bindings(directory: Path, bundle: Path, job: dict, artifacts: dict[str, bytes]) -> None:
+    """Check retained Job freeze identities without granting audit/adoption authority."""
+    audit_raw = _read(safe_path(bundle, "audit-input.json"))
+    audit_input = read_json(bundle / "audit-input.json")
+    if (
+        not isinstance(audit_input, dict)
+        or audit_input.get("schema_version") != "ephy.audit-input.v1"
+        or audit_input.get("proposal_only") is not True
+        or not isinstance(audit_input.get("stage_contract"), dict)
+    ):
+        raise GateFailure("Invalid frozen Job audit input")
+    integrity_raw = _read(safe_path(bundle, "bundle-integrity.json"))
+    integrity = read_json(bundle / "bundle-integrity.json")
+    manifest = json.loads(artifacts[MANIFEST_REF])
+    bindings = {key: digest(artifacts["worker/artifacts/" + name]) for key, name in FINAL_BINDINGS.items()}
+    controls = {
+        name: digest(artifacts["worker/artifacts/" + name])
+        for name in (*CONTROL_PATHS, "environment_contract")
+    }
+    recomputed = [
+        {
+            "artifact_id": entry["artifact_id"],
+            "path": entry["path"],
+            "size_bytes": len(artifacts["worker/artifacts/" + entry["artifact_id"]]),
+            "sha256": digest(artifacts["worker/artifacts/" + entry["artifact_id"]]),
+        }
+        for entry in manifest["artifacts"]
+    ]
+    expected_integrity = {
+        "manifest_schema_valid": True,
+        "path_safety_valid": True,
+        "all_artifacts_match": True,
+        "recomputed_artifacts": recomputed,
+        "manifest_sha256": digest(artifacts[MANIFEST_REF]),
+    }
+    if (
+        audit_input["job_id"] != job["id"]
+        or audit_input["audit_id"] != job["id"] + "-audit"
+        or audit_input["baseline_commit"] != job["baseRevision"]
+        or audit_input["evidence_manifest_path"] != "evidence-manifest.json"
+        or audit_input["evidence_manifest_sha256"] != digest(artifacts[MANIFEST_REF])
+        or audit_input["bundle_integrity_attestation_path"] != "bundle-integrity.json"
+        or audit_input["bundle_integrity_attestation_sha256"] != digest(integrity_raw)
+        or audit_input["final_bindings"] != bindings
+        or audit_input["control_document_hashes"] != controls
+        or audit_input["allowed_file_scope"] != job["contract"]["allowed_files"]
+        or audit_input["semantic_scope"] != job["contract"]["semantic_scope"]
+        or audit_input["required_checks"]
+        != [check["id"] for check in job["contract"]["checks"]] + ["scope", "diff"]
+        or audit_input["stage_contract"]["expected_models"] != job["model_identities"]
+        or audit_input["stage_contract"]["verifier_identity"] != job["verifier_identity"]
+        or audit_input["stage_contract"]["max_repair_attempts"] != job["contract"]["max_repairs"]
+        or integrity != expected_integrity
+    ):
+        raise GateFailure("Job evidence differs from its frozen audit input")
+    mode = job.get("runtime", {}).get("review_mode", "formal")
+    if mode == "external_codex":
+        _read(safe_path(directory, "external-review.json"))
+        anchor = read_json(directory / "external-review.json")
+        if (
+            not isinstance(anchor, dict)
+            or anchor.get("schema") != "ephy.external-review.v1"
+            or anchor.get("job_id") != job["id"]
+            or anchor.get("audit_input_sha256") != digest(audit_raw)
+            or anchor.get("final_bindings") != bindings
+            or anchor.get("formal_audit_executed") is not False
+            or anchor.get("adopted") is not False
+            or anchor.get("required")
+            != ["current-head CI", "independent Codex Review", "no unresolved P0/P1"]
+            or job["status"] == "review_ready"
+            or (
+                job["status"] == "external_review_pending" and job.get("outcome") != "external_review_pending"
+            )
+        ):
+            raise GateFailure("Job external-review freeze binding changed")
+    elif mode == "formal":
+        result_raw = _read(safe_path(directory, "audit-result.json"))
+        result = read_json(directory / "audit-result.json")
+        if not isinstance(result, dict) or result.get("schema_version") != "ephy.audit-result.v1":
+            raise GateFailure("Invalid frozen Job audit result")
+        _read(safe_path(directory, "audit-execution-attestation.json"))
+        anchor = read_json(directory / "audit-execution-attestation.json")
+        expected = {
+            "audit_input_sha256": digest(audit_raw),
+            "evidence_manifest_sha256": digest(artifacts[MANIFEST_REF]),
+            "prompt_template_sha256": digest(artifacts["worker/artifacts/audit_prompt"]),
+            **{key: value for key, value in bindings.items() if key != "changed_files_manifest_sha256"},
+        }
+        if (
+            not isinstance(anchor, dict)
+            or anchor.get("audit_input_sha256") != digest(audit_raw)
+            or anchor.get("audit_result_sha256") != digest(result_raw)
+            or any(
+                anchor.get(field) is not True
+                for field in (
+                    "passed",
+                    "schema_valid",
+                    "candidate_unchanged",
+                    "bundle_unchanged",
+                    "proposal_stopped",
+                )
+            )
+            or result["job_id"] != job["id"]
+            or result["audit_id"] != job["id"] + "-audit"
+            or result["bound_inputs"] != expected
+            or job["status"] == "external_review_pending"
+            or (
+                job["status"] == "review_ready"
+                and (job.get("outcome") != "accepted_proposal" or result["decision"] != "ACCEPT_PROPOSAL")
+            )
+        ):
+            raise GateFailure("Job formal-audit freeze binding changed")
+    else:
+        raise GateFailure("Unsupported stopped Job review mode")
+
+
 def _artifacts(directory: Path, metadata: bytes, job: dict) -> dict[str, bytes]:
     bundle = safe_path(directory, "audit-bundle")
     manifest_raw = _read(safe_path(bundle, "evidence-manifest.json"))
@@ -113,6 +239,7 @@ def _artifacts(directory: Path, metadata: bytes, job: dict) -> dict[str, bytes]:
         safe_path(directory, "candidate.patch"), MAX_ARTIFACT
     ):
         raise GateFailure("Job patch differs from its frozen artifact")
+    _frozen_bindings(directory, bundle, job, artifacts)
     return artifacts
 
 
@@ -132,6 +259,8 @@ def record_result(
     returned sidecar state is not the Job's formal workflow or review decision.
     """
     job_file = Path(job_file).absolute()
+    if job_file.name != "job.json":
+        raise GateFailure("Consumer requires the canonical job.json")
     directory = job_file.parent
     if any(parent.is_symlink() or parent.is_junction() for parent in (directory, *directory.parents)):
         raise GateFailure("Linked Job directory")
@@ -235,7 +364,7 @@ def record_result(
                         "status_sha256": digest(status_raw),
                         "previous_state_sha256": digest(_read(state_file)),
                         "error_type": type(exc).__name__,
-                        "at": now(),
+                        "error_sha256": digest(str(exc).encode("utf-8")),
                         "adopted": False,
                         "review_ready": False,
                     }

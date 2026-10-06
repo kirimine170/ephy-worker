@@ -1,13 +1,22 @@
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 
 import pytest
 import test_karte_experiment_consumer as consumer_fixtures
-from test_formal_runtime import contract
+from test_formal_runtime import accepted_result, contract
 
-from ephy_worker.formal_artifacts import GateFailure, digest, encode, read_json, write_json
+from ephy_worker.formal_artifacts import (
+    CONTROL_PATHS,
+    GateFailure,
+    digest,
+    encode,
+    freeze_bundle,
+    read_json,
+    write_json,
+)
 from ephy_worker.formal_runtime import submit
 from ephy_worker.karte_experiment_job import record_result
 
@@ -22,8 +31,20 @@ def connected_job(tmp_path):
         "contract": contract(),
         "runtime": {"review_mode": "external_codex"},
         "controls": {},
-        "model_identities": {},
-        "verifier_identity": {"executor_id": "synthetic"},
+        "model_identities": {
+            role: {
+                "model_id": "synthetic",
+                "model_artifact_manifest_sha256": "a" * 64,
+                "runtime_sha256": "b" * 64,
+                "invocation_config_sha256": "c" * 64,
+            }
+            for role in ("planner", "implementer", "auditor")
+        },
+        "verifier_identity": {
+            "executor_id": "synthetic",
+            "runtime_sha256": "d" * 64,
+            "invocation_config_sha256": "e" * 64,
+        },
     }
     job_file = submit(spec, tmp_path / "jobs-root")
     job = read_json(job_file)
@@ -35,23 +56,99 @@ def connected_job(tmp_path):
     fixture.record.update(
         run_id=job["id"], experiment_id=job["id"] + "-audit", target_commit=job["baseRevision"]
     )
-    fixture.manifest.update(job_id=job["id"], audit_id=job["id"] + "-audit")
+    for name, path in CONTROL_PATHS.items():
+        fixture.artifacts["worker/artifacts/" + name] = (
+            Path(__file__).resolve().parents[1] / path
+        ).read_bytes()
     fixture.artifacts["worker/artifacts/task_spec"] = encode(job["contract"])
+    fixture.artifacts["worker/artifacts/verification_results"] = encode(
+        {"verifier_identity": job["verifier_identity"], "synthetic_only": True}
+    )
+    fixture.artifacts["worker/artifacts/workflow_events"] = encode([])
     (job_file.parent / "candidate.patch").write_bytes(fixture.artifacts["worker/artifacts/candidate_patch"])
-    for entry in fixture.manifest["artifacts"]:
-        raw = fixture.artifacts["worker/artifacts/" + entry["artifact_id"]]
-        entry.update(size_bytes=len(raw), sha256=digest(raw))
-    fixture.artifacts["adapter/metadata.json"] = encode(fixture.metadata)
-    fixture.artifacts["worker/evidence-manifest.json"] = encode(fixture.manifest)
-    fixture.rebind()
     bundle = job_file.parent / "audit-bundle"
-    bundle.mkdir()
-    (bundle / "evidence-manifest.json").write_bytes(fixture.artifacts["worker/evidence-manifest.json"])
-    for entry in fixture.manifest["artifacts"]:
-        path = bundle / entry["path"]
-        path.parent.mkdir(exist_ok=True)
-        path.write_bytes(fixture.artifacts["worker/artifacts/" + entry["artifact_id"]])
+    audit_input = freeze_bundle(
+        bundle,
+        job,
+        {name: fixture.artifacts["worker/artifacts/" + name] for name in consumer_fixtures.WORKER_ARTIFACTS},
+    )
+    fixture.manifest = read_json(bundle / "evidence-manifest.json")
+    fixture.artifacts["adapter/metadata.json"] = encode(fixture.metadata)
+    fixture.artifacts["worker/evidence-manifest.json"] = (bundle / "evidence-manifest.json").read_bytes()
+    fixture.rebind()
+    write_json(
+        job_file.parent / "external-review.json",
+        {
+            "schema": "ephy.external-review.v1",
+            "job_id": job["id"],
+            "audit_input_sha256": digest((bundle / "audit-input.json").read_bytes()),
+            "final_bindings": audit_input["final_bindings"],
+            "workflow": [],
+            "required": ["current-head CI", "independent Codex Review", "no unresolved P0/P1"],
+            "formal_audit_executed": False,
+            "adopted": False,
+        },
+    )
     return job_file, fixture
+
+
+def formal_stop(job_file, fixture):
+    """Synthetic frozen bindings only; no model audit or approval is executed."""
+    job = read_json(job_file)
+    job["runtime"]["review_mode"] = "formal"
+    job.update(status="review_ready", outcome="accepted_proposal")
+    write_json(job_file, job, exclusive=False)
+    bundle = job_file.parent / "audit-bundle"
+    result = accepted_result(bundle, read_json(bundle / "audit-input.json"))
+    write_json(job_file.parent / "audit-result.json", result)
+    write_json(
+        job_file.parent / "audit-execution-attestation.json",
+        {
+            "passed": True,
+            "schema_valid": True,
+            "candidate_unchanged": True,
+            "bundle_unchanged": True,
+            "proposal_stopped": True,
+            "audit_input_sha256": digest((bundle / "audit-input.json").read_bytes()),
+            "audit_result_sha256": digest((job_file.parent / "audit-result.json").read_bytes()),
+        },
+    )
+
+
+def replace_bundle(job_file, fixture, artifact, refreeze):
+    """Consistently substitute evidence while leaving terminal Job anchors intact."""
+    ref = "worker/artifacts/" + artifact
+    if artifact == "verification_results":
+        value = json.loads(fixture.artifacts[ref])
+        value["substituted"] = True
+        fixture.artifacts[ref] = encode(value)
+    else:
+        fixture.artifacts[ref] += b"changed synthetic evidence\n"
+    bundle = job_file.parent / "audit-bundle"
+    if refreeze:
+        replacement = job_file.parent / "replacement-bundle"
+        freeze_bundle(
+            replacement,
+            read_json(job_file),
+            {
+                name: fixture.artifacts["worker/artifacts/" + name]
+                for name in consumer_fixtures.WORKER_ARTIFACTS
+            },
+        )
+        for path in replacement.iterdir():
+            (bundle / path.name).write_bytes(path.read_bytes())
+        fixture.manifest = read_json(bundle / "evidence-manifest.json")
+    else:
+        for entry in fixture.manifest["artifacts"]:
+            raw = fixture.artifacts["worker/artifacts/" + entry["artifact_id"]]
+            entry.update(size_bytes=len(raw), sha256=digest(raw))
+            (bundle / entry["path"]).write_bytes(raw)
+        write_json(bundle / "evidence-manifest.json", fixture.manifest, exclusive=False)
+    patch = fixture.artifacts["worker/artifacts/candidate_patch"]
+    (job_file.parent / "candidate.patch").write_bytes(patch)
+    fixture.record["patch_sha256"] = digest(patch)
+    fixture.artifacts["worker/evidence-manifest.json"] = (bundle / "evidence-manifest.json").read_bytes()
+    fixture.rebind()
 
 
 def receive(job_file, fixture, phase="report_accepted", **kwargs):
@@ -146,7 +243,7 @@ def test_worker_failed_or_cancelled_job_is_not_promoted(connected_job, state):
 def test_failed_verification_records_failure_without_job_or_bundle_mutation(connected_job, mutation):
     job_file, fixture = connected_job
     bundle = job_file.parent / "audit-bundle"
-    path = bundle / "artifacts/candidate_patch.txt"
+    path = bundle / "candidate_patch.txt"
     if mutation == "missing":
         path.unlink()
     elif mutation == "changed":
@@ -228,7 +325,7 @@ def test_invalid_retry_preserves_verified_state_and_recovers_idempotently(
     state_raw = (sidecar / "state.json").read_bytes()
     job_raw = job_file.read_bytes()
     bundle = job_file.parent / "audit-bundle"
-    artifact = bundle / "artifacts/candidate_patch.txt"
+    artifact = bundle / "candidate_patch.txt"
     original_artifact = artifact.read_bytes()
     status_raw = encode(fixture.status(phase))
     if mutation == "missing":
@@ -255,6 +352,17 @@ def test_invalid_retry_preserves_verified_state_and_recovers_idempotently(
     assert failure["adopted"] is False and failure["review_ready"] is False
     assert job_file.read_bytes() == job_raw
     assert snapshot(bundle) == before_bundle
+    before_failed_retry = snapshot(job_file.parent)
+    with pytest.raises(GateFailure):
+        record_result(
+            job_file,
+            status_raw,
+            fixture.payload,
+            fixture.artifacts["adapter/metadata.json"],
+            candidate_id=fixture.candidate,
+            payload_sha256=fixture.pin,
+        )
+    assert snapshot(job_file.parent) == before_failed_retry
     if mutation == "missing":
         artifact.write_bytes(original_artifact)
     before_retry = snapshot(job_file.parent)
@@ -307,3 +415,66 @@ def test_consumer_hardlink_and_concurrent_lock_are_refused(connected_job):
     with pytest.raises(GateFailure):
         receive(job_file, fixture)
     assert snapshot(job_file.parent) == before
+
+
+@pytest.mark.parametrize("state", ["running", "audit_pending", "external_review_pending"])
+def test_alternate_job_json_cannot_replace_canonical_stopped_state(connected_job, state):
+    job_file, fixture = connected_job
+    alias = job_file.parent / "stale-job.json"
+    alias.write_bytes(job_file.read_bytes())
+    job = read_json(job_file)
+    job["status"] = state
+    write_json(job_file, job, exclusive=False)
+    before = snapshot(job_file.parent)
+    with pytest.raises(GateFailure):
+        receive(alias, fixture)
+    assert snapshot(job_file.parent) == before
+
+
+@pytest.mark.parametrize("mode", ["external", "formal"])
+@pytest.mark.parametrize("artifact", ["candidate_patch", "lead_plan", "verification_results"])
+@pytest.mark.parametrize("refreeze", [False, True])
+def test_consistent_replacement_cannot_discard_original_job_freeze(connected_job, mode, artifact, refreeze):
+    job_file, fixture = connected_job
+    if mode == "formal":
+        formal_stop(job_file, fixture)
+    replace_bundle(job_file, fixture, artifact, refreeze)
+    # The transport is valid on its own; the original Job's frozen bindings are not.
+    assert fixture.consume().observation.review_target.patch_sha256 == fixture.record["patch_sha256"]
+    before = {
+        name: raw for name, raw in snapshot(job_file.parent).items() if not name.startswith("karte-consumer/")
+    }
+    with pytest.raises(GateFailure):
+        receive(job_file, fixture)
+    assert {
+        name: raw for name, raw in snapshot(job_file.parent).items() if not name.startswith("karte-consumer/")
+    } == before
+    assert read_json(job_file.parent / "karte-consumer/state.json")["state"] == "verification_failed"
+
+
+def test_formal_stopped_job_binding_does_not_grant_audit_or_adoption_authority(connected_job):
+    job_file, fixture = connected_job
+    formal_stop(job_file, fixture)
+    before = {
+        name: raw for name, raw in snapshot(job_file.parent).items() if not name.startswith("karte-consumer/")
+    }
+    result = receive(job_file, fixture)
+    assert result["state"] == "review_pending"
+    assert not result["adopted"] and not result["review_ready"]
+    assert {
+        name: raw for name, raw in snapshot(job_file.parent).items() if not name.startswith("karte-consumer/")
+    } == before
+
+
+@pytest.mark.parametrize(
+    "path", ["audit-bundle/audit-input.json", "audit-bundle/bundle-integrity.json", "external-review.json"]
+)
+def test_missing_frozen_job_anchor_is_refused(connected_job, path):
+    job_file, fixture = connected_job
+    (job_file.parent / path).unlink()
+    original_job = job_file.read_bytes()
+    original_bundle = snapshot(job_file.parent / "audit-bundle")
+    with pytest.raises(GateFailure):
+        receive(job_file, fixture)
+    assert job_file.read_bytes() == original_job
+    assert snapshot(job_file.parent / "audit-bundle") == original_bundle
