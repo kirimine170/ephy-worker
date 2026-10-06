@@ -1,0 +1,209 @@
+{
+  "archiveSchemaVersion": 2,
+  "group": "work-queue",
+  "description": "Historical overnight work queue and controller snapshots",
+  "status": "historical-source-preservation-only",
+  "adopted": false,
+  "sourceCollectorCommit": "1e7c034377c7ecce70664eeac794330d855eb857",
+  "sourceCollectorBaseCommit": "26ddbe65a9bd9fe530dca13238c2eb3838f3aee5",
+  "publicationBaseCommit": "26ddbe65a9bd9fe530dca13238c2eb3838f3aee5",
+  "remoteCommitIdentity": "Connector publication recreates source commits on publicationBaseCommit. Published source tree hashes must equal origsourceTree; commit identities, author, timestamp and original history differ from origsourceCommit. The private local bundle preserves original history.",
+  "snapshots": [
+    {
+      "slug": "overnight-worktrees-ephy-work-queue-20260927-011355-975",
+      "originalHead": "0f6c3cb7a272bc67e2a0a0dc828e579df6823d98",
+      "originalBranch": null,
+      "origsourceCommit": "805a3a455a0352bf60b50b0f2b3b151d50433018",
+      "origsourceTree": "e732ccdd66df3c0b1d26f2a502c8f1a4beaf96a6",
+      "published_snapshot_commit": "3ae00eb561e786bbf4ac9aeafeaed43173444fc6",
+      "published_snapshot_tree": "e732ccdd66df3c0b1d26f2a502c8f1a4beaf96a6",
+      "adopted": false,
+      "restoration": {
+        "publishedGitSource": "Restore source using published_snapshot_commit after validating published_snapshot_tree equals origsourceTree",
+        "originalExactHistory": "The private local Git bundle retains the original commit, author, timestamp and history",
+        "exactFileBytes": "The corresponding private local source ZIP retains original disk bytes and line endings"
+      }
+    },
+    {
+      "slug": "overnight-worktrees-ephy-work-queue-20260927-012041-781",
+      "originalHead": "0f6c3cb7a272bc67e2a0a0dc828e579df6823d98",
+      "originalBranch": null,
+      "origsourceCommit": "805a3a455a0352bf60b50b0f2b3b151d50433018",
+      "origsourceTree": "e732ccdd66df3c0b1d26f2a502c8f1a4beaf96a6",
+      "published_snapshot_commit": "3ae00eb561e786bbf4ac9aeafeaed43173444fc6",
+      "published_snapshot_tree": "e732ccdd66df3c0b1d26f2a502c8f1a4beaf96a6",
+      "adopted": false,
+      "restoration": {
+        "publishedGitSource": "Restore source using published_snapshot_commit after validating published_snapshot_tree equals origsourceTree",
+        "originalExactHistory": "The private local Git bundle retains the original commit, author, timestamp and history",
+        "exactFileBytes": "The corresponding private local source ZIP retains original disk bytes and line endings"
+      }
+    },
+    {
+      "slug": "overnight-worktrees-ephy-work-queue-20260927-012827-639",
+      "originalHead": "0f6c3cb7a272bc67e2a0a0dc828e579df6823d98",
+      "originalBranch": null,
+      "origsourceCommit": "805a3a455a0352bf60b50b0f2b3b151d50433018",
+      "origsourceTree": "e732ccdd66df3c0b1d26f2a502c8f1a4beaf96a6",
+      "published_snapshot_commit": "3ae00eb561e786bbf4ac9aeafeaed43173444fc6",
+      "published_snapshot_tree": "e732ccdd66df3c0b1d26f2a502c8f1a4beaf96a6",
+      "adopted": false,
+      "restoration": {
+        "publishedGitSource": "Restore source using published_snapshot_commit after validating published_snapshot_tree equals origsourceTree",
+        "originalExactHistory": "The private local Git bundle retains the original commit, author, timestamp and history",
+        "exactFileBytes": "The corresponding private local source ZIP retains original disk bytes and line endings"
+      }
+    },
+    {
+      "slug": "overnight-worktrees-ephy-work-queue-20260927-013331-452",
+      "originalHead": "0f6c3cb7a272bc67e2a0a0dc828e579df6823d98",
+      "originalBranch": null,
+      "origsourceCommit": "ab947ae534808a111d41e187500009fc5eec0821",
+      "origsourceTree": "9c7ab1d5b96f4267aa50b147327a70571d7c34dd",
+      "published_snapshot_commit": "6b9b8b84fb91eeab46ce26fb655bc4b6f9b5f123",
+      "published_snapshot_tree": "9c7ab1d5b96f4267aa50b147327a70571d7c34dd",
+      "adopted": false,
+      "restoration": {
+        "publishedGitSource": "Restore source using published_snapshot_commit after validating published_snapshot_tree equals origsourceTree",
+        "originalExactHistory": "The private local Git bundle retains the original commit, author, timestamp and history",
+        "exactFileBytes": "The corresponding private local source ZIP retains original disk bytes and line endings"
+      }
+    },
+    {
+      "slug": "overnight-worktrees-ephy-work-queue-20260927-092156-100",
+      "originalHead": "0f6c3cb7a272bc67e2a0a0dc828e579df6823d98",
+      "originalBranch": null,
+      "origsourceCommit": "ab947ae534808a111d41e187500009fc5eec0821",
+      "origsourceTree": "9c7ab1d5b96f4267aa50b147327a70571d7c34dd",
+      "published_snapshot_commit": "6b9b8b84fb91eeab46ce26fb655bc4b6f9b5f123",
+      "published_snapshot_tree": "9c7ab1d5b96f4267aa50b147327a70571d7c34dd",
+      "adopted": false,
+      "restoration": {
+        "publishedGitSource": "Restore source using published_snapshot_commit after validating published_snapshot_tree equals origsourceTree",
+        "originalExactHistory": "The private local Git bundle retains the original commit, author, timestamp and history",
+        "exactFileBytes": "The corresponding private local source ZIP retains original disk bytes and line endings"
+      }
+    },
+    {
+      "slug": "overnight-worktrees-ephy-worker-20260924",
+      "originalHead": "0f6c3cb7a272bc67e2a0a0dc828e579df6823d98",
+      "originalBranch": null,
+      "origsourceCommit": "3569c093ab63cbccf6300c717c7fe7991d8d9d5c",
+      "origsourceTree": "ad5ffb13c350c334b198744289dea7cfb6a6d608",
+      "published_snapshot_commit": "106085f5c0de3e9e2902bb4e6a8bd56972a607b4",
+      "published_snapshot_tree": "ad5ffb13c350c334b198744289dea7cfb6a6d608",
+      "adopted": false,
+      "restoration": {
+        "publishedGitSource": "Restore source using published_snapshot_commit after validating published_snapshot_tree equals origsourceTree",
+        "originalExactHistory": "The private local Git bundle retains the original commit, author, timestamp and history",
+        "exactFileBytes": "The corresponding private local source ZIP retains original disk bytes and line endings"
+      }
+    },
+    {
+      "slug": "overnight-worktrees-ephy-worker-controller-v2-20260926",
+      "originalHead": "0f6c3cb7a272bc67e2a0a0dc828e579df6823d98",
+      "originalBranch": null,
+      "origsourceCommit": "0f6c3cb7a272bc67e2a0a0dc828e579df6823d98",
+      "origsourceTree": "2f4d7fb70330463b7638afcde58da0efbed2e4f1",
+      "published_snapshot_commit": "f7bd55582508c6d69344496740d5a0240b746cf9",
+      "published_snapshot_tree": "2f4d7fb70330463b7638afcde58da0efbed2e4f1",
+      "adopted": false,
+      "restoration": {
+        "publishedGitSource": "Restore source using published_snapshot_commit after validating published_snapshot_tree equals origsourceTree",
+        "originalExactHistory": "The private local Git bundle retains the original commit, author, timestamp and history",
+        "exactFileBytes": "The corresponding private local source ZIP retains original disk bytes and line endings"
+      }
+    },
+    {
+      "slug": "overnight-worktrees-ephy-worker-controller-v3-20260926",
+      "originalHead": "0f6c3cb7a272bc67e2a0a0dc828e579df6823d98",
+      "originalBranch": null,
+      "origsourceCommit": "0f6c3cb7a272bc67e2a0a0dc828e579df6823d98",
+      "origsourceTree": "2f4d7fb70330463b7638afcde58da0efbed2e4f1",
+      "published_snapshot_commit": "f7bd55582508c6d69344496740d5a0240b746cf9",
+      "published_snapshot_tree": "2f4d7fb70330463b7638afcde58da0efbed2e4f1",
+      "adopted": false,
+      "restoration": {
+        "publishedGitSource": "Restore source using published_snapshot_commit after validating published_snapshot_tree equals origsourceTree",
+        "originalExactHistory": "The private local Git bundle retains the original commit, author, timestamp and history",
+        "exactFileBytes": "The corresponding private local source ZIP retains original disk bytes and line endings"
+      }
+    },
+    {
+      "slug": "overnight-worktrees-ephy-worker-controller-v4-20260926",
+      "originalHead": "0f6c3cb7a272bc67e2a0a0dc828e579df6823d98",
+      "originalBranch": null,
+      "origsourceCommit": "0f6c3cb7a272bc67e2a0a0dc828e579df6823d98",
+      "origsourceTree": "2f4d7fb70330463b7638afcde58da0efbed2e4f1",
+      "published_snapshot_commit": "f7bd55582508c6d69344496740d5a0240b746cf9",
+      "published_snapshot_tree": "2f4d7fb70330463b7638afcde58da0efbed2e4f1",
+      "adopted": false,
+      "restoration": {
+        "publishedGitSource": "Restore source using published_snapshot_commit after validating published_snapshot_tree equals origsourceTree",
+        "originalExactHistory": "The private local Git bundle retains the original commit, author, timestamp and history",
+        "exactFileBytes": "The corresponding private local source ZIP retains original disk bytes and line endings"
+      }
+    },
+    {
+      "slug": "overnight-worktrees-ephy-worker-controller-v5-20260926",
+      "originalHead": "0f6c3cb7a272bc67e2a0a0dc828e579df6823d98",
+      "originalBranch": null,
+      "origsourceCommit": "0f6c3cb7a272bc67e2a0a0dc828e579df6823d98",
+      "origsourceTree": "2f4d7fb70330463b7638afcde58da0efbed2e4f1",
+      "published_snapshot_commit": "f7bd55582508c6d69344496740d5a0240b746cf9",
+      "published_snapshot_tree": "2f4d7fb70330463b7638afcde58da0efbed2e4f1",
+      "adopted": false,
+      "restoration": {
+        "publishedGitSource": "Restore source using published_snapshot_commit after validating published_snapshot_tree equals origsourceTree",
+        "originalExactHistory": "The private local Git bundle retains the original commit, author, timestamp and history",
+        "exactFileBytes": "The corresponding private local source ZIP retains original disk bytes and line endings"
+      }
+    },
+    {
+      "slug": "overnight-worktrees-ephy-worker-controller-v6-test-20260927",
+      "originalHead": "0f6c3cb7a272bc67e2a0a0dc828e579df6823d98",
+      "originalBranch": null,
+      "origsourceCommit": "0f6c3cb7a272bc67e2a0a0dc828e579df6823d98",
+      "origsourceTree": "2f4d7fb70330463b7638afcde58da0efbed2e4f1",
+      "published_snapshot_commit": "f7bd55582508c6d69344496740d5a0240b746cf9",
+      "published_snapshot_tree": "2f4d7fb70330463b7638afcde58da0efbed2e4f1",
+      "adopted": false,
+      "restoration": {
+        "publishedGitSource": "Restore source using published_snapshot_commit after validating published_snapshot_tree equals origsourceTree",
+        "originalExactHistory": "The private local Git bundle retains the original commit, author, timestamp and history",
+        "exactFileBytes": "The corresponding private local source ZIP retains original disk bytes and line endings"
+      }
+    },
+    {
+      "slug": "overnight-worktrees-ephy-worker-controller-v6-test2-20260927",
+      "originalHead": "0f6c3cb7a272bc67e2a0a0dc828e579df6823d98",
+      "originalBranch": null,
+      "origsourceCommit": "0f6c3cb7a272bc67e2a0a0dc828e579df6823d98",
+      "origsourceTree": "2f4d7fb70330463b7638afcde58da0efbed2e4f1",
+      "published_snapshot_commit": "f7bd55582508c6d69344496740d5a0240b746cf9",
+      "published_snapshot_tree": "2f4d7fb70330463b7638afcde58da0efbed2e4f1",
+      "adopted": false,
+      "restoration": {
+        "publishedGitSource": "Restore source using published_snapshot_commit after validating published_snapshot_tree equals origsourceTree",
+        "originalExactHistory": "The private local Git bundle retains the original commit, author, timestamp and history",
+        "exactFileBytes": "The corresponding private local source ZIP retains original disk bytes and line endings"
+      }
+    },
+    {
+      "slug": "overnight-worktrees-ephy-worker-controller-v6-test3-20260927",
+      "originalHead": "0f6c3cb7a272bc67e2a0a0dc828e579df6823d98",
+      "originalBranch": null,
+      "origsourceCommit": "ab947ae534808a111d41e187500009fc5eec0821",
+      "origsourceTree": "9c7ab1d5b96f4267aa50b147327a70571d7c34dd",
+      "published_snapshot_commit": "6b9b8b84fb91eeab46ce26fb655bc4b6f9b5f123",
+      "published_snapshot_tree": "9c7ab1d5b96f4267aa50b147327a70571d7c34dd",
+      "adopted": false,
+      "restoration": {
+        "publishedGitSource": "Restore source using published_snapshot_commit after validating published_snapshot_tree equals origsourceTree",
+        "originalExactHistory": "The private local Git bundle retains the original commit, author, timestamp and history",
+        "exactFileBytes": "The corresponding private local source ZIP retains original disk bytes and line endings"
+      }
+    }
+  ],
+  "privacy": "Credentials, runtime logs, raw model responses, private evidence ZIPs and the entire encoding-candidate experiment family are excluded from the public archive. All original sources remain in private local recovery backups."
+}
