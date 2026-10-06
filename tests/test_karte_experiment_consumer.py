@@ -304,8 +304,10 @@ class KarteExperimentConsumerTests(unittest.TestCase):
     def test_changed_metadata_cannot_reuse_candidate_observation(self) -> None:
         previous = self.consume().observation
         self.metadata["interpretation"] = "different immutable experiment"
+        self.record["interpretation"] = self.metadata["interpretation"]
         self.artifacts[METADATA_REF] = encode(self.metadata)
         self.rebind()
+        self.assertNotEqual(previous.review_target, self.consume().observation.review_target)
         with self.assertRaises(ConsumerFailure):
             self.consume(previous=previous)
 

@@ -271,6 +271,7 @@ def test_changed_payload_cannot_overwrite_immutable_snapshot(connected_job):
     receive(job_file, fixture)
     before = snapshot(job_file.parent)
     fixture.metadata["interpretation"] = "different synthetic result"
+    fixture.record["interpretation"] = fixture.metadata["interpretation"]
     fixture.artifacts["adapter/metadata.json"] = encode(fixture.metadata)
     fixture.rebind()
     with pytest.raises(GateFailure):
