@@ -1,0 +1,119 @@
+{
+  "archiveSchemaVersion": 2,
+  "group": "legacy-pi",
+  "description": "Historical Pi routing, reexperiment and encoding snapshots",
+  "status": "historical-source-preservation-only",
+  "adopted": false,
+  "sourceCollectorCommit": "0045c5e32b21c35aeb32e746c0547f36690a787d",
+  "sourceCollectorBaseCommit": "26ddbe65a9bd9fe530dca13238c2eb3838f3aee5",
+  "publicationBaseCommit": "26ddbe65a9bd9fe530dca13238c2eb3838f3aee5",
+  "remoteCommitIdentity": "Connector publication recreates source commits on publicationBaseCommit. Published source tree hashes must equal origsourceTree; commit identities, author, timestamp and original history differ from origsourceCommit. The private local bundle preserves original history.",
+  "snapshots": [
+    {
+      "slug": "codex-worktrees-windows-pi-mac-routing",
+      "originalHead": "0f6c3cb7a272bc67e2a0a0dc828e579df6823d98",
+      "originalBranch": "refs/heads/codex/windows-pi-mac-routing",
+      "origsourceCommit": "65e5fb1756976dd5c570035683a0caf0f3ca4e7a",
+      "origsourceTree": "e25643cc6596be88c20b3c361698a8ff42e52085",
+      "published_snapshot_commit": "eac015fd5add749b58023acc3657fde519c34aa5",
+      "published_snapshot_tree": "e25643cc6596be88c20b3c361698a8ff42e52085",
+      "adopted": false,
+      "restoration": {
+        "publishedGitSource": "Restore source using published_snapshot_commit after validating published_snapshot_tree equals origsourceTree",
+        "originalExactHistory": "The private local Git bundle retains the original commit, author, timestamp and history",
+        "exactFileBytes": "The corresponding private local source ZIP retains original disk bytes and line endings"
+      }
+    },
+    {
+      "slug": "pi-dual-reexperiment-20260924-worktrees-bg-20260924-governed-retry-01",
+      "originalHead": "a3693671ba4e03788945b9441dc1fdb92aee8baa",
+      "originalBranch": null,
+      "origsourceCommit": "a3693671ba4e03788945b9441dc1fdb92aee8baa",
+      "origsourceTree": "d44629452f90d7f7128865172fa1fcad4e044484",
+      "published_snapshot_commit": "6960be98e5418a00a8bf67ee488221760e111f6d",
+      "published_snapshot_tree": "d44629452f90d7f7128865172fa1fcad4e044484",
+      "adopted": false,
+      "restoration": {
+        "publishedGitSource": "Restore source using published_snapshot_commit after validating published_snapshot_tree equals origsourceTree",
+        "originalExactHistory": "The private local Git bundle retains the original commit, author, timestamp and history",
+        "exactFileBytes": "The corresponding private local source ZIP retains original disk bytes and line endings"
+      }
+    },
+    {
+      "slug": "pi-dual-reexperiment-20260924-worktrees-bg-20260924-governed-retry-02",
+      "originalHead": "a3693671ba4e03788945b9441dc1fdb92aee8baa",
+      "originalBranch": null,
+      "origsourceCommit": "a4cd909b26759ccc2b01e3de7056759f31b466f0",
+      "origsourceTree": "de080b2e878b9c1b51296dfdcfcdd37f624a07a2",
+      "published_snapshot_commit": "66e45788ef1f658a5070c05b2451befb78e4297c",
+      "published_snapshot_tree": "de080b2e878b9c1b51296dfdcfcdd37f624a07a2",
+      "adopted": false,
+      "restoration": {
+        "publishedGitSource": "Restore source using published_snapshot_commit after validating published_snapshot_tree equals origsourceTree",
+        "originalExactHistory": "The private local Git bundle retains the original commit, author, timestamp and history",
+        "exactFileBytes": "The corresponding private local source ZIP retains original disk bytes and line endings"
+      }
+    },
+    {
+      "slug": "pi-dual-reexperiment-20260924-worktrees-bg-20260924-governed-retry-03",
+      "originalHead": "a3693671ba4e03788945b9441dc1fdb92aee8baa",
+      "originalBranch": null,
+      "origsourceCommit": "a3693671ba4e03788945b9441dc1fdb92aee8baa",
+      "origsourceTree": "d44629452f90d7f7128865172fa1fcad4e044484",
+      "published_snapshot_commit": "6960be98e5418a00a8bf67ee488221760e111f6d",
+      "published_snapshot_tree": "d44629452f90d7f7128865172fa1fcad4e044484",
+      "adopted": false,
+      "restoration": {
+        "publishedGitSource": "Restore source using published_snapshot_commit after validating published_snapshot_tree equals origsourceTree",
+        "originalExactHistory": "The private local Git bundle retains the original commit, author, timestamp and history",
+        "exactFileBytes": "The corresponding private local source ZIP retains original disk bytes and line endings"
+      }
+    },
+    {
+      "slug": "pi-dual-reexperiment-20260924-worktrees-bg-20260924-governed-retry-04",
+      "originalHead": "a3693671ba4e03788945b9441dc1fdb92aee8baa",
+      "originalBranch": null,
+      "origsourceCommit": "251671d072c2d6f3e64adc699abf35588a2b5c24",
+      "origsourceTree": "223c3f0069c067ae3ca56854fb566058b836ab80",
+      "published_snapshot_commit": "cf76968e6aed8a10459d8b7ceabb92462aaf096e",
+      "published_snapshot_tree": "223c3f0069c067ae3ca56854fb566058b836ab80",
+      "adopted": false,
+      "restoration": {
+        "publishedGitSource": "Restore source using published_snapshot_commit after validating published_snapshot_tree equals origsourceTree",
+        "originalExactHistory": "The private local Git bundle retains the original commit, author, timestamp and history",
+        "exactFileBytes": "The corresponding private local source ZIP retains original disk bytes and line endings"
+      }
+    },
+    {
+      "slug": "pi-dual-runtime-worktrees-bg-20260923043039-a0f8f7",
+      "originalHead": "a3693671ba4e03788945b9441dc1fdb92aee8baa",
+      "originalBranch": null,
+      "origsourceCommit": "d5a773f6e9a07ed6e40804ef14e0def5fd4ea9cc",
+      "origsourceTree": "5b6a566429638ee464b20757831ccc516acd1c7d",
+      "published_snapshot_commit": "9f3e32d7f497d96fc40fc5e4be6d1b3f247e0c8f",
+      "published_snapshot_tree": "5b6a566429638ee464b20757831ccc516acd1c7d",
+      "adopted": false,
+      "restoration": {
+        "publishedGitSource": "Restore source using published_snapshot_commit after validating published_snapshot_tree equals origsourceTree",
+        "originalExactHistory": "The private local Git bundle retains the original commit, author, timestamp and history",
+        "exactFileBytes": "The corresponding private local source ZIP retains original disk bytes and line endings"
+      }
+    },
+    {
+      "slug": "pi-dual-runtime-worktrees-encoding-baseline-20260923",
+      "originalHead": "bd62feda41eeca867e8a98c0b99802a54fbf07d8",
+      "originalBranch": null,
+      "origsourceCommit": "bd62feda41eeca867e8a98c0b99802a54fbf07d8",
+      "origsourceTree": "0356896a608ac4cd76bb2b60cbe6ca15255e566f",
+      "published_snapshot_commit": "70c0674358bcecc3f9d8561f66649828693d665f",
+      "published_snapshot_tree": "0356896a608ac4cd76bb2b60cbe6ca15255e566f",
+      "adopted": false,
+      "restoration": {
+        "publishedGitSource": "Restore source using published_snapshot_commit after validating published_snapshot_tree equals origsourceTree",
+        "originalExactHistory": "The private local Git bundle retains the original commit, author, timestamp and history",
+        "exactFileBytes": "The corresponding private local source ZIP retains original disk bytes and line endings"
+      }
+    }
+  ],
+  "privacy": "Credentials, runtime logs, raw model responses, private evidence ZIPs and the entire encoding-candidate experiment family are excluded from the public archive. All original sources remain in private local recovery backups."
+}
