@@ -10,6 +10,8 @@ from pathlib import Path
 from .formal_artifacts import GateFailure, digest, encode, now, read_json, write_json
 from .formal_runtime import FormalRunner, exclusive_lock, freeze_submission_identity, submit
 
+PLANNER_STOP_REASON = "Planner-only boundary reached; no next job is authorized"
+
 
 def proposal_valid(job_file: Path) -> bool:
     job = read_json(job_file)
@@ -74,6 +76,7 @@ def run_campaign(plan_file: Path, state_root: Path, *, resume: bool = False) -> 
                     "external_review_pending",
                     "verification_failed",
                     "failed",
+                    "planner_stopped",
                 ):
                     job.update(
                         status="failed",
@@ -89,6 +92,8 @@ def run_campaign(plan_file: Path, state_root: Path, *, resume: bool = False) -> 
                     0 if proposal_valid(job_file) else state["consecutive_failures"] + 1
                 )
                 state["active_job"] = None
+                if job["status"] == "planner_stopped":
+                    state.update(status="stopped", reason=PLANNER_STOP_REASON)
                 if (
                     job.get("runtime", {}).get("backend") == "external_strata"
                     and job.get("outcome") == "infrastructure_failed"
@@ -224,6 +229,9 @@ def run_campaign(plan_file: Path, state_root: Path, *, resume: bool = False) -> 
                 state["next_index"] += 1
                 state["active_job"] = None
                 save()
+                if job["status"] == "planner_stopped":
+                    state.update(status="stopped", reason=PLANNER_STOP_REASON)
+                    break
                 if (
                     spec["runtime"].get("backend") == "external_strata"
                     and job.get("outcome") == "infrastructure_failed"

@@ -233,8 +233,12 @@ def validate_contract(contract: dict) -> None:
         "max_log_bytes",
         "runtime_hashes",
     }
-    if set(contract) != required:
+    if set(contract) - {"planner_only"} != required:
         raise GateFailure("Frozen formal contract fields missing or unknown")
+    if "planner_only" in contract and type(contract["planner_only"]) is not bool:
+        raise GateFailure("planner_only must be an explicit boolean")
+    if contract.get("planner_only", False) and contract["max_repairs"] != 0:
+        raise GateFailure("Planner-only contracts cannot authorize repairs")
     if not contract["allowed_files"] or len(set(contract["allowed_files"])) != len(contract["allowed_files"]):
         raise GateFailure("Empty/duplicate file scope")
     for name in contract["allowed_files"]:
@@ -1120,6 +1124,8 @@ class FormalRunner:
 
     def stage(self, role: str, prompt: str, label: str, root: Path, envelope: dict | None = None) -> str:
         self.intact()
+        if self.contract.get("planner_only", False) and role != "planner":
+            raise GateFailure("Planner-only contract forbids non-planner stages")
         model = role_model(self.runtime, role)
         self.load_model(model)
         stage_config = {
@@ -1341,6 +1347,7 @@ class FormalRunner:
         )
 
     def run(self) -> None:
+        planner_only = self.contract.get("planner_only", False)
         try:
             self.state("preparing", "Validating frozen runtime before preflight")
             self.preflight()
@@ -1369,6 +1376,31 @@ class FormalRunner:
             if snapshot_hash(self.candidate) != before:
                 raise GateFailure("Planner modified candidate")
             (self.directory / "lead-plan.txt").write_text(plan, encoding="utf-8")
+            if planner_only:
+                if digest(encode(self.contract)) != self.contract_sha:
+                    raise GateFailure("Frozen contract changed during planning")
+                self.intact()
+                self.resources()
+                if not plan.strip():
+                    raise GateFailure("Planner returned an empty plan")
+                if snapshot_hash(self.candidate) != before:
+                    raise GateFailure("Planner modified candidate")
+                stop = {
+                    "job_id": self.job["id"],
+                    "contract_sha256": self.contract_sha,
+                    "plan_sha256": digest(plan.encode("utf-8")),
+                    "snapshot_sha256": before,
+                    "implementation_started": False,
+                    "formal_audit_executed": False,
+                    "automatic_adoption": False,
+                }
+                write_json(self.directory / "planner-stop.json", stop)
+                self.event("planner stop", **stop)
+                self.job["outcome"] = "no_hypothesis" if plan.strip() == "NO_HYPOTHESIS" else "planned_only"
+                if self.job["outcome"] == "no_hypothesis":
+                    write_json(self.directory / "BACKLOG.json", {"task": self.contract["task"], "reason": plan})
+                self.state("planner_stopped", "Frozen planner-only boundary reached; no implementation or adoption")
+                return
             if plan.strip() == "NO_HYPOTHESIS":
                 self.job["outcome"] = "no_hypothesis"
                 self.state(
