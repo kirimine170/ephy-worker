@@ -337,3 +337,64 @@ def test_later_planner_stop_survives_termination_after_checkpoint(tmp_path, monk
     assert resumed["next_index"] == 2 and len(resumed["results"]) == 2
     assert len(calls) == 2
     assert [job_file.read_bytes() for job_file in calls] == retained_jobs
+
+@pytest.mark.parametrize("planner_only", [False, True])
+@pytest.mark.parametrize("resume_after_failure", [False, True])
+def test_planner_only_failed_attempt_stops_all_later_jobs(tmp_path, monkeypatch,
+                                                        planner_only, resume_after_failure):
+    spec = verifier_draft(verifier_runner(tmp_path))
+    spec["runtime"]["resource_lock"] = str(tmp_path / "lock")
+    spec["contract"].update(planner_only=False, max_repairs=0)
+    specs = [copy.deepcopy(spec) for _ in range(3)]
+    specs[1]["contract"]["planner_only"] = planner_only
+    plan = {
+        "specs": specs, "max_consecutive_failures": 3, "timeout_seconds": 600,
+        "resource_lock": str(tmp_path / "lock"),
+    }
+    plan_file = tmp_path / "campaign-plan.json"
+    state_root = tmp_path / "campaign"
+    write_json(plan_file, plan)
+    calls = []
+    failed_bytes = []
+
+    def make_runner(job_file):
+        def run():
+            job = read_json(job_file)
+            calls.append(job_file)
+            if len(calls) == 2:
+                job.update(status="failed", outcome="infrastructure_failed",
+                           message="Frozen budget/stage/cancellation gate failed")
+                write_json(job_file, job, exclusive=False)
+                failed_bytes.append(job_file.read_bytes())
+                write_json(job_file.parent / "runner-error.json", {"error": job["message"]})
+                if resume_after_failure:
+                    raise SystemExit("Controller terminated after failed Job")
+                raise GateFailure(job["message"])
+            job.update(status="review_ready")
+            write_json(job_file, job, exclusive=False)
+        return SimpleNamespace(run=run)
+
+    monkeypatch.setattr(formal_campaign, "FormalRunner", make_runner)
+    monkeypatch.setattr(
+        formal_campaign, "proposal_valid",
+        lambda job_file: read_json(job_file)["status"] == "review_ready",
+    )
+    if resume_after_failure:
+        with pytest.raises(SystemExit, match="after failed Job"):
+            formal_campaign.run_campaign(plan_file, state_root)
+        interrupted = read_json(state_root / "campaign.json")
+        assert len(calls) == 2 and interrupted["next_index"] == 1
+        assert interrupted["active_job"] == str(calls[1])
+        state = formal_campaign.run_campaign(plan_file, state_root, resume=True)
+    else:
+        state = formal_campaign.run_campaign(plan_file, state_root)
+
+    expected_jobs = 2 if planner_only else 3
+    assert len(calls) == expected_jobs and state["next_index"] == expected_jobs
+    assert len(state["results"]) == expected_jobs and state["active_job"] is None
+    assert state["status"] == ("stopped" if planner_only else "completed")
+    if planner_only:
+        assert state["reason"] == formal_campaign.PLANNER_STOP_REASON
+    assert read_json(calls[1])["status"] == "failed"
+    assert read_json(calls[1])["outcome"] == "infrastructure_failed"
+    assert calls[1].read_bytes() == failed_bytes[0]

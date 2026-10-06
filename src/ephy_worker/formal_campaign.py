@@ -69,6 +69,7 @@ def run_campaign(plan_file: Path, state_root: Path, *, resume: bool = False) -> 
             # Interrupted candidate stays preserved. It counts as a failed attempt;
             # no unknown implementation/check/audit is replayed as completed.
             if state.get("active_job"):
+                planner_only = plan["specs"][state["next_index"]]["contract"].get("planner_only", False)
                 job_file = Path(state["active_job"])
                 job = read_json(job_file)
                 if job["status"] not in (
@@ -92,7 +93,7 @@ def run_campaign(plan_file: Path, state_root: Path, *, resume: bool = False) -> 
                     0 if proposal_valid(job_file) else state["consecutive_failures"] + 1
                 )
                 state["active_job"] = None
-                if job["status"] == "planner_stopped":
+                if planner_only or job["status"] == "planner_stopped":
                     state.update(status="stopped", reason=PLANNER_STOP_REASON)
                 if (
                     job.get("runtime", {}).get("backend") == "external_strata"
@@ -206,6 +207,7 @@ def run_campaign(plan_file: Path, state_root: Path, *, resume: bool = False) -> 
                             "observation": observation,
                         },
                     )
+                planner_only = spec["contract"].get("planner_only", False)
                 job_file = submit(spec, state_root)
                 state["active_job"] = str(job_file)
                 save()
@@ -228,10 +230,10 @@ def run_campaign(plan_file: Path, state_root: Path, *, resume: bool = False) -> 
                 state["consecutive_failures"] = 0 if valid else state["consecutive_failures"] + 1
                 state["next_index"] += 1
                 state["active_job"] = None
-                if job["status"] == "planner_stopped":
+                if planner_only or job["status"] == "planner_stopped":
                     state.update(status="stopped", reason=PLANNER_STOP_REASON)
                 save()
-                if job["status"] == "planner_stopped":
+                if planner_only or job["status"] == "planner_stopped":
                     break
                 if (
                     spec["runtime"].get("backend") == "external_strata"
