@@ -1349,7 +1349,20 @@ class FormalRunner:
             plan = self.stage(
                 "planner",
                 self.contract["task"] + "\nPlan the single frozen task. Read only; no delegation or edits. "
-                "Return a concrete plan. If no justified change is possible, return NO_HYPOTHESIS.",
+                "Return a concrete plan. If no justified change is possible, return NO_HYPOTHESIS."
+                f"\nPlanner budget: at most {self.contract['max_requests']} provider requests total, "
+                "including the governance_ack request, and "
+                f"{self.contract['output_token_budget']} output tokens total "
+                f"(at most {self.contract['max_response_tokens']} per response). "
+                "Reserve at least one provider request for the final concrete plan or NO_HYPOTHESIS. "
+                "After governance_ack succeeds and required context delivery is verified, read AGENTS.md "
+                "and README.md from the stage root completely unless their byte-exact full contents "
+                "are already supplied. Reuse fully delivered policy and required-context documents. "
+                "Complete every other applicable mandatory read before planning; never bypass a "
+                "mandatory read or stop condition to fit the budget. Then return the concrete plan "
+                "instead of spending the remaining requests on optional repository exploration. "
+                "This stage plans only; do not edit the candidate, submit an auditor result, "
+                "rerun controller checks, or invent measurements.",
                 "planner",
                 self.candidate,
             )
