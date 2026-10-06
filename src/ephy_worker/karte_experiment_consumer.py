@@ -282,78 +282,18 @@ def _payload(raw: bytes, artifacts: Mapping[str, bytes], candidate: str, pin: st
     )
 
 
-def consume_result(
+def _status_observation(
     status_raw: bytes,
     payload_raw: bytes,
-    artifacts: Mapping[str, bytes],
+    target: ReviewTarget,
+    worker_result: str,
     *,
-    candidate_id: str,
-    payload_sha256: str,
-    previous: Observation | None = None,
     cancelled: bool = False,
-) -> Consumption:
-    """Consume prepare/publish/status snapshots using pins retained before receipt.
-
-    Persist ``observation`` in the caller's existing Job storage for retries.
-    A ReviewTarget identifies evidence for later independent review; it is never
-    a review decision or permission to apply the patch.
-    """
-    if not isinstance(candidate_id, str) or not re.fullmatch(
-        r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", candidate_id
-    ):
-        raise ConsumerFailure("Invalid candidate ID")
+) -> Observation:
+    """Reconstruct receipt semantics for an already bound payload and target."""
     if type(cancelled) is not bool:
         raise ConsumerFailure("Cancellation must be explicit boolean")
-    if not isinstance(artifacts, Mapping):
-        raise ConsumerFailure("Artifact byte mapping required")
-    artifacts = dict(artifacts)
-    target = _payload(payload_raw, artifacts, candidate_id, payload_sha256)
-    metadata = _object(
-        _decode(artifacts[METADATA_REF]),
-        {
-            "adapter_version",
-            "synthetic_only",
-            "candidate_id",
-            "experiment_id",
-            "run_id",
-            "attempt_id",
-            "target_commit",
-            "environment",
-            "model",
-            "checker",
-            "worker_result",
-            "observations",
-            "interpretation",
-            "halt_reason",
-            "project",
-            "title",
-            "reported_at",
-        },
-    )
-    if (
-        metadata.get("adapter_version") != "karte.worker-experiment.v1"
-        or metadata.get("synthetic_only") is not True
-    ):
-        raise ConsumerFailure("Only the synthetic Worker adapter v1 is supported")
-    worker_result = metadata.get("worker_result")
-    if not isinstance(worker_result, str) or worker_result not in {
-        "strict_pass",
-        "halted",
-        "external_review_pending",
-    }:
-        raise ConsumerFailure("Unsupported Worker result")
-    record = _decode(payload_raw)["record"]
-    shared = metadata.keys() & record.keys() - {"observations"}
-    if any(not isinstance(metadata[field], str) or metadata[field] != record[field] for field in shared):
-        raise ConsumerFailure("Adapter metadata differs from the bound experiment record")
-    observations = metadata["observations"]
-    if (
-        not isinstance(observations, list)
-        or not observations
-        or any(not isinstance(value, str) or not value.strip() for value in observations)
-        or record["observations"] != ["Worker result (unverified): " + worker_result, *observations]
-    ):
-        raise ConsumerFailure("Experiment observations differ from the producer metadata transform")
+    candidate_id, payload_sha256 = target.candidate_id, target.payload_sha256
     status = _object(
         _decode(status_raw),
         {"candidate_id", "phase", "payload_sha256", "state", "verification", "adopted"},
@@ -428,6 +368,83 @@ def consume_result(
         receipt_hash = _digest(json.dumps(receipt, sort_keys=True, ensure_ascii=True).encode("utf-8"))
     elif "receipt" in status:
         raise ConsumerFailure("Nonterminal phase cannot contain a receipt")
+    return Observation(target, phase, worker_result, receipt_hash, cancelled)
+
+
+def consume_result(
+    status_raw: bytes,
+    payload_raw: bytes,
+    artifacts: Mapping[str, bytes],
+    *,
+    candidate_id: str,
+    payload_sha256: str,
+    previous: Observation | None = None,
+    cancelled: bool = False,
+) -> Consumption:
+    """Consume prepare/publish/status snapshots using pins retained before receipt.
+
+    Persist ``observation`` in the caller's existing Job storage for retries.
+    A ReviewTarget identifies evidence for later independent review; it is never
+    a review decision or permission to apply the patch.
+    """
+    if not isinstance(candidate_id, str) or not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", candidate_id
+    ):
+        raise ConsumerFailure("Invalid candidate ID")
+    if type(cancelled) is not bool:
+        raise ConsumerFailure("Cancellation must be explicit boolean")
+    if not isinstance(artifacts, Mapping):
+        raise ConsumerFailure("Artifact byte mapping required")
+    artifacts = dict(artifacts)
+    target = _payload(payload_raw, artifacts, candidate_id, payload_sha256)
+    metadata = _object(
+        _decode(artifacts[METADATA_REF]),
+        {
+            "adapter_version",
+            "synthetic_only",
+            "candidate_id",
+            "experiment_id",
+            "run_id",
+            "attempt_id",
+            "target_commit",
+            "environment",
+            "model",
+            "checker",
+            "worker_result",
+            "observations",
+            "interpretation",
+            "halt_reason",
+            "project",
+            "title",
+            "reported_at",
+        },
+    )
+    if (
+        metadata.get("adapter_version") != "karte.worker-experiment.v1"
+        or metadata.get("synthetic_only") is not True
+    ):
+        raise ConsumerFailure("Only the synthetic Worker adapter v1 is supported")
+    worker_result = metadata.get("worker_result")
+    if not isinstance(worker_result, str) or worker_result not in {
+        "strict_pass",
+        "halted",
+        "external_review_pending",
+    }:
+        raise ConsumerFailure("Unsupported Worker result")
+    record = _decode(payload_raw)["record"]
+    shared = metadata.keys() & record.keys() - {"observations"}
+    if any(not isinstance(metadata[field], str) or metadata[field] != record[field] for field in shared):
+        raise ConsumerFailure("Adapter metadata differs from the bound experiment record")
+    observations = metadata["observations"]
+    if (
+        not isinstance(observations, list)
+        or not observations
+        or any(not isinstance(value, str) or not value.strip() for value in observations)
+        or record["observations"] != ["Worker result (unverified): " + worker_result, *observations]
+    ):
+        raise ConsumerFailure("Experiment observations differ from the producer metadata transform")
+    incoming = _status_observation(status_raw, payload_raw, target, worker_result)
+    phase, receipt_hash = incoming.producer_phase, incoming.receipt_sha256
     if previous is not None:
         if not isinstance(previous, Observation) or previous.review_target != target:
             raise ConsumerFailure("Retry differs from the original immutable review target")

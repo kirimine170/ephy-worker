@@ -235,6 +235,7 @@ def test_worker_failed_or_cancelled_job_is_not_promoted(connected_job, state):
     before = job_file.read_bytes()
     result = receive(job_file, fixture)
     assert result["state"] == ("cancelled" if state == "cancelled" else "result_failed")
+    assert result["observation"]["cancelled"] is (state == "cancelled")
     assert job_file.read_bytes() == before
     assert not result["adopted"]
 
@@ -478,3 +479,188 @@ def test_missing_frozen_job_anchor_is_refused(connected_job, path):
         receive(job_file, fixture)
     assert job_file.read_bytes() == original_job
     assert snapshot(job_file.parent / "audit-bundle") == original_bundle
+
+
+SAVED_MUTATIONS = [
+    ("schema_version", "unknown"),
+    ("job_id", "another-job"),
+    ("job_sha256", "0" * 64),
+    ("base_commit", "b" * 40),
+    ("contract_sha256", "0" * 64),
+    ("candidate_id", "another-candidate"),
+    ("payload_sha256", "0" * 64),
+    ("status_sha256", "0" * 64),
+    ("state", "other-terminal"),
+    ("state", "received"),
+    ("state", "verified"),
+    ("state", "verification_failed"),
+    ("adopted", True),
+    ("review_ready", True),
+    ("unexpected", True),
+    ("error_type", "GateFailure"),
+    ("observation", None),
+    ("observation.producer_phase", "earlier-phase"),
+    ("observation.worker_result", "halted"),
+    ("observation.receipt_sha256", "0" * 64),
+    ("observation.cancelled", "flip"),
+    ("observation.cancelled", 1),
+    *[
+        ("observation.review_target." + field, "changed")
+        for field in (
+            "candidate_id",
+            "payload_sha256",
+            "patch_sha256",
+            "experiment_id",
+            "run_id",
+            "attempt_id",
+            "target_commit",
+        )
+    ],
+    ("transitions", []),
+    ("transition_state", "review_pending"),
+    ("transition_time", "invalid"),
+    ("transition_extra", True),
+]
+
+
+def alter_saved(record, field, value):
+    if field == "state" and value == "other-terminal":
+        value = "cancelled" if record["state"] == "review_pending" else "review_pending"
+    if field == "observation.producer_phase" and value == "earlier-phase":
+        value = "prepared" if record["observation"]["producer_phase"] == "pending" else "pending"
+    if field == "observation.cancelled" and value == "flip":
+        value = not record["observation"]["cancelled"]
+    if field.startswith("transition_"):
+        key = {"transition_state": "state", "transition_time": "at", "transition_extra": "unexpected"}[field]
+        record["transitions"][0][key] = value
+        return
+    target = record
+    keys = field.split(".")
+    for key in keys[:-1]:
+        target = target[key]
+    target[keys[-1]] = value
+
+
+@pytest.mark.parametrize(
+    "phase,cancelled", [("pending", True), ("rejected", False), ("report_accepted", False)]
+)
+@pytest.mark.parametrize("field,value", SAVED_MUTATIONS)
+def test_every_saved_state_field_is_bound_to_retained_evidence(connected_job, phase, cancelled, field, value):
+    job_file, fixture = connected_job
+    receive(job_file, fixture, phase, cancelled=cancelled)
+    sidecar = job_file.parent / "karte-consumer"
+    record = read_json(sidecar / "state.json")
+    alter_saved(record, field, value)
+    write_json(sidecar / "state.json", record, exclusive=False)
+    # Keep a self-consistent checksum to exercise semantic validation, not only byte identity.
+    raw = (sidecar / "state.json").read_bytes()
+    (sidecar / ("state-" + digest(raw) + ".json")).write_bytes(raw)
+    before = snapshot(job_file.parent)
+    with pytest.raises(GateFailure):
+        receive(job_file, fixture, phase)
+    assert snapshot(job_file.parent) == before
+
+
+@pytest.mark.parametrize(
+    "mutation", ["valid-timestamp", "whitespace", "missing-checkpoint", "changed-status"]
+)
+def test_saved_snapshot_bytes_and_status_are_immutable(connected_job, mutation):
+    job_file, fixture = connected_job
+    receive(job_file, fixture)
+    sidecar = job_file.parent / "karte-consumer"
+    state_file = sidecar / "state.json"
+    original = state_file.read_bytes()
+    if mutation == "missing-checkpoint":
+        (sidecar / ("state-" + digest(original) + ".json")).unlink(missing_ok=True)
+    elif mutation == "whitespace":
+        state_file.write_bytes(original + b"\n")
+    elif mutation == "changed-status":
+        record = read_json(state_file)
+        (sidecar / ("status-" + record["status_sha256"] + ".json")).write_bytes(
+            encode(fixture.status("pending"))
+        )
+    else:
+        record = read_json(state_file)
+        record["transitions"][0]["at"] = "2000-01-01T00:00:00Z"
+        write_json(state_file, record, exclusive=False)
+    before = snapshot(job_file.parent)
+    with pytest.raises(GateFailure):
+        receive(job_file, fixture)
+    assert snapshot(job_file.parent) == before
+
+
+@pytest.mark.parametrize("latch", ["terminal", "cancelled"])
+def test_coherent_saved_state_rollback_cannot_erase_latches(connected_job, latch):
+    job_file, fixture = connected_job
+    receive(job_file, fixture, "pending")
+    state_file = job_file.parent / "karte-consumer/state.json"
+    earlier = state_file.read_bytes()
+    if latch == "terminal":
+        receive(job_file, fixture)
+    else:
+        receive(job_file, fixture, "pending", cancelled=True)
+    state_file.write_bytes(earlier)
+    before = snapshot(job_file.parent)
+    with pytest.raises(GateFailure):
+        receive(job_file, fixture, "pending")
+    assert snapshot(job_file.parent) == before
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("state", "review_pending"),
+        ("job_id", "other"),
+        ("candidate_id", "other"),
+        ("error_type", ""),
+        ("transitions", []),
+        ("observation", {}),
+    ],
+)
+def test_initial_failure_state_cannot_claim_validated_progress(connected_job, field, value):
+    job_file, fixture = connected_job
+    artifact = job_file.parent / "audit-bundle/candidate_patch.txt"
+    raw = artifact.read_bytes()
+    artifact.unlink()
+    with pytest.raises(GateFailure):
+        receive(job_file, fixture)
+    artifact.write_bytes(raw)
+    state_file = job_file.parent / "karte-consumer/state.json"
+    record = read_json(state_file)
+    record[field] = value
+    write_json(state_file, record, exclusive=False)
+    before = snapshot(job_file.parent)
+    with pytest.raises(GateFailure):
+        receive(job_file, fixture)
+    assert snapshot(job_file.parent) == before
+
+
+def test_initial_missing_evidence_can_recover_without_substituting_saved_fields(connected_job):
+    job_file, fixture = connected_job
+    artifact = job_file.parent / "audit-bundle/candidate_patch.txt"
+    original = artifact.read_bytes()
+    artifact.unlink()
+    with pytest.raises(GateFailure):
+        receive(job_file, fixture)
+    artifact.write_bytes(original)
+    recovered = receive(job_file, fixture)
+    assert recovered["state"] == "review_pending"
+    assert not recovered["adopted"] and not recovered["review_ready"]
+    before = snapshot(job_file.parent)
+    assert receive(job_file, fixture)["duplicate"]
+    assert snapshot(job_file.parent) == before
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [b"{", b"null", b"[]", b"{}", b" " * (256 * 1024 + 1)],
+    ids=["malformed", "null", "list", "empty", "oversized"],
+)
+def test_saved_json_cannot_be_malformed_nonobject_empty_or_unbounded(connected_job, raw):
+    job_file, fixture = connected_job
+    receive(job_file, fixture)
+    (job_file.parent / "karte-consumer/state.json").write_bytes(raw)
+    before = snapshot(job_file.parent)
+    with pytest.raises(GateFailure):
+        receive(job_file, fixture)
+    assert snapshot(job_file.parent) == before

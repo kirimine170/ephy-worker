@@ -31,9 +31,12 @@ from .karte_experiment_consumer import (
     MAX_JSON,
     MAX_TOTAL,
     METADATA_REF,
+    TERMINAL_PHASES,
     ConsumerFailure,
     Observation,
     ReviewTarget,
+    _status_observation,
+    _timestamp,
     consume_result,
 )
 from .store import output_root
@@ -73,33 +76,169 @@ def _retain(directory: Path, name: str, raw: bytes) -> None:
             raise GateFailure("Consumer immutable snapshot cannot be replaced") from None
 
 
-def _previous(record: dict, job_pin: str) -> Observation | None:
-    if (
-        record.get("schema_version") != SCHEMA
-        or record.get("job_sha256") != job_pin
-        or (record.get("adopted") is not False or record.get("review_ready") is not False)
+def _state(observation: Observation, job: dict) -> str:
+    if observation.cancelled or job["status"] == "cancelled":
+        return "cancelled"
+    if observation.producer_phase in {"rejected", "conflict", "invalid"} or (
+        observation.worker_result == "halted"
+        or job["status"] in {"verification_failed", "failed", "halted", "budget_exhausted"}
     ):
-        raise GateFailure("Saved consumer state identity or authority mismatch")
-    if record.get("state") not in {
-        "received",
-        "verified",
-        "review_pending",
-        "cancelled",
-        "result_failed",
-        "verification_failed",
-    }:
-        raise GateFailure("Saved consumer state exceeds the receipt boundary")
-    value = record.get("observation")
-    if value is None:
-        return None
+        return "result_failed"
+    return "review_pending"
+
+
+def _terminal(observation: Observation, job_pin: str) -> bytes:
+    return encode(
+        {
+            "schema_version": "ephy.karte-consumer-terminal.v1",
+            "job_sha256": job_pin,
+            "review_target": asdict(observation.review_target),
+            "producer_phase": observation.producer_phase,
+            "receipt_sha256": observation.receipt_sha256,
+        }
+    )
+
+
+def _cancellation(target: ReviewTarget, job_pin: str) -> bytes:
+    return encode(
+        {
+            "schema_version": "ephy.karte-consumer-cancellation.v1",
+            "job_sha256": job_pin,
+            "review_target": asdict(target),
+        }
+    )
+
+
+def _previous(
+    record: dict,
+    job_pin: str,
+    *,
+    sidecar: Path,
+    job: dict,
+    candidate_id: str,
+    payload_sha256: str,
+    payload_raw: bytes,
+    metadata_raw: bytes,
+) -> Observation | None:
+    """Revalidate every saved field, status semantics and immutable latch."""
     try:
-        target = ReviewTarget(**value["review_target"])
-        observation = Observation(**{**value, "review_target": target})
-    except (KeyError, TypeError) as exc:
-        raise GateFailure("Invalid saved consumer observation") from exc
-    if type(observation.cancelled) is not bool:
-        raise GateFailure("Invalid saved cancellation state")
-    return observation
+        required = {
+            "schema_version",
+            "job_id",
+            "job_sha256",
+            "base_commit",
+            "contract_sha256",
+            "candidate_id",
+            "payload_sha256",
+            "status_sha256",
+            "state",
+            "transitions",
+            "adopted",
+            "review_ready",
+            "observation",
+        }
+        if (
+            not isinstance(record, dict)
+            or not required <= record.keys()
+            or (record.keys() - required - {"error_type"})
+        ):
+            raise GateFailure("Saved consumer fields do not match the contract")
+        expected = {
+            "schema_version": SCHEMA,
+            "job_id": job["id"],
+            "job_sha256": job_pin,
+            "base_commit": job["baseRevision"],
+            "contract_sha256": digest(encode(job["contract"])),
+            "candidate_id": candidate_id,
+            "payload_sha256": payload_sha256,
+        }
+        if any(record[key] != value for key, value in expected.items()) or (
+            record["adopted"] is not False or record["review_ready"] is not False
+        ):
+            raise GateFailure("Saved consumer identity or authority mismatch")
+        pin = record["status_sha256"]
+        if not isinstance(pin, str) or len(pin) != 64 or any(c not in "0123456789abcdef" for c in pin):
+            raise GateFailure("Invalid saved status identity")
+        status_raw = _read(safe_path(sidecar, "status-" + pin + ".json"))
+        if digest(status_raw) != pin:
+            raise GateFailure("Saved status snapshot changed")
+        if (
+            _read(safe_path(sidecar, "payload.json")) != payload_raw
+            or digest(payload_raw) != payload_sha256
+            or _read(safe_path(sidecar, "metadata.json")) != metadata_raw
+        ):
+            raise GateFailure("Saved immutable payload or metadata changed")
+        value = record["observation"]
+        if value is None:
+            if (
+                record["state"] != "verification_failed"
+                or not isinstance(record.get("error_type"), str)
+                or not record["error_type"].isidentifier()
+            ):
+                raise GateFailure("Unobserved saved state cannot claim verification")
+            expected_states = ["received", "verification_failed"]
+            observation = None
+        else:
+            if "error_type" in record:
+                raise GateFailure("Verified saved state cannot contain a failure claim")
+            state_raw = _read(safe_path(sidecar, "state.json"))
+            if _read(safe_path(sidecar, "state-" + digest(state_raw) + ".json")) != state_raw:
+                raise GateFailure("Saved verified state differs from its immutable snapshot")
+            metadata = read_json(sidecar / "metadata.json")
+            binding = read_json(sidecar / "payload.json")
+            target = ReviewTarget(
+                candidate_id,
+                payload_sha256,
+                binding["record"]["patch_sha256"],
+                metadata["experiment_id"],
+                metadata["run_id"],
+                metadata["attempt_id"],
+                metadata["target_commit"],
+            )
+            if (
+                target.run_id != job["id"]
+                or target.experiment_id != job["id"] + "-audit"
+                or target.target_commit != job["baseRevision"]
+            ):
+                raise GateFailure("Saved target differs from canonical Job")
+            saved_target = ReviewTarget(**value["review_target"])
+            observation = Observation(**{**value, "review_target": saved_target})
+            if type(observation.cancelled) is not bool:
+                raise GateFailure("Invalid saved cancellation state")
+            reconstructed = _status_observation(
+                status_raw,
+                payload_raw,
+                target,
+                metadata["worker_result"],
+                cancelled=observation.cancelled,
+            )
+            if observation != reconstructed or record["state"] != _state(reconstructed, job):
+                raise GateFailure("Saved state or observation contradicts retained evidence")
+            terminal = safe_path(sidecar, "terminal.json", missing=True)
+            if terminal.exists() and (
+                observation.producer_phase not in TERMINAL_PHASES
+                or _read(terminal) != _terminal(observation, job_pin)
+            ):
+                raise GateFailure("Saved terminal observation regressed")
+            cancellation = safe_path(sidecar, "cancelled.json", missing=True)
+            if cancellation.exists() and (
+                not observation.cancelled or _read(cancellation) != _cancellation(target, job_pin)
+            ):
+                raise GateFailure("Saved cancellation observation regressed")
+            expected_states = ["received", "verified", record["state"]]
+        transitions = record["transitions"]
+        if (
+            not isinstance(transitions, list)
+            or len(transitions) != len(expected_states)
+            or any(not isinstance(event, dict) or event.keys() != {"state", "at"} for event in transitions)
+            or [event["state"] for event in transitions] != expected_states
+        ):
+            raise GateFailure("Saved transition sequence contradicts its state")
+        for event in transitions:
+            _timestamp(event["at"])
+        return observation
+    except (ConsumerFailure, OSError, KeyError, TypeError, ValueError) as exc:
+        raise GateFailure("Invalid saved consumer state or immutable snapshot") from exc
 
 
 def _frozen_bindings(directory: Path, bundle: Path, job: dict, artifacts: dict[str, bytes]) -> None:
@@ -300,8 +439,29 @@ def record_result(
     with exclusive_lock(lock):
         job_pin = digest(job_raw)
         state_file = safe_path(sidecar, "state.json", missing=True)
-        saved = read_json(state_file) if state_file.exists() else None
-        previous = _previous(saved, job_pin) if saved else None
+        saved = None
+        if state_file.exists():
+            try:
+                _read(state_file)
+                saved = read_json(state_file)
+            except (OSError, ValueError, RecursionError) as exc:
+                raise GateFailure("Invalid saved consumer JSON") from exc
+            if not isinstance(saved, dict):
+                raise GateFailure("Saved consumer state must be an object")
+        previous = (
+            _previous(
+                saved,
+                job_pin,
+                sidecar=sidecar,
+                job=job,
+                candidate_id=candidate_id,
+                payload_sha256=payload_sha256,
+                payload_raw=payload_raw,
+                metadata_raw=metadata_raw,
+            )
+            if saved is not None
+            else None
+        )
         _retain(sidecar, "payload.json", payload_raw)
         _retain(sidecar, "metadata.json", metadata_raw)
         transitions = [{"state": "received", "at": now()}]
@@ -329,23 +489,24 @@ def record_result(
                 candidate_id=candidate_id,
                 payload_sha256=payload_sha256,
                 previous=previous,
-                cancelled=cancelled or cancellation,
+                cancelled=cancelled
+                or cancellation
+                or job["status"] == "cancelled"
+                or safe_path(sidecar, "cancelled.json", missing=True).exists(),
             )
             if _read(job_file) != job_raw:
                 raise GateFailure("Job changed while consuming its result")
+            terminal = safe_path(sidecar, "terminal.json", missing=True)
+            if terminal.exists() or result.observation.producer_phase in TERMINAL_PHASES:
+                _retain(sidecar, "terminal.json", _terminal(result.observation, job_pin))
+            if result.observation.cancelled:
+                _retain(sidecar, "cancelled.json", _cancellation(result.observation.review_target, job_pin))
             if result.duplicate:
                 return {**saved, "duplicate": True}
             observation = result.observation
             record["observation"] = asdict(observation)
             transitions.append({"state": "verified", "at": now()})
-            state = "review_pending"
-            if observation.cancelled or job["status"] == "cancelled":
-                state = "cancelled"
-            elif observation.producer_phase in {"rejected", "conflict", "invalid"} or (
-                observation.worker_result == "halted"
-                or job["status"] in {"verification_failed", "failed", "halted", "budget_exhausted"}
-            ):
-                state = "result_failed"
+            state = _state(observation, job)
             record["state"] = state
             transitions.append({"state": state, "at": now()})
         except (ConsumerFailure, GateFailure, OSError, KeyError, TypeError, ValueError) as exc:
@@ -372,6 +533,8 @@ def record_result(
                 _retain(sidecar, "verification-failure-" + digest(failure) + ".json", failure)
             raise GateFailure("Karte result verification failed; see consumer sidecar") from exc
         _retain(sidecar, "status-" + digest(status_raw) + ".json", status_raw)
+        snapshot = encode(record)
+        _retain(sidecar, "state-" + digest(snapshot) + ".json", snapshot)
         write_json(safe_path(sidecar, "state.json", missing=True), record, exclusive=False)
         return {**record, "duplicate": False}
 

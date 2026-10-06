@@ -105,6 +105,17 @@ idempotent without losing cancellation or prior review progress．Every state
 retains `adopted=false` and `review_ready=false`．
 Identical retries revalidate evidence and leave saved files unchanged．
 
+Verified states also retain a content-addressed `state-SHA256.json` snapshot．
+Before retrying，every saved Job，candidate，payload and review-target field must
+match the canonical Job and immutable payload/metadata．The producer phase and
+receipt hash are reconstructed from the retained raw status with the same
+receipt parser used by normal consumption．State and transition sequence must
+match that Observation；no inconsistent saved record is returned as a duplicate．
+Separate immutable terminal and cancellation records prevent a coherent rollback
+to an older pending state from erasing either latch．A Job already marked
+cancelled is also passed to the Observation as cancellation．These records convey
+no audit or adoption authority．
+
 Payload，adapter metadata and raw status snapshots are retained without replacing
 existing bytes．A separate nonblocking kernel lock serializes only this adapter's
 calls．The existing model resource lock and any process are untouched．Links and
