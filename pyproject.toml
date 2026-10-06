@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "ephy-worker"
 version = "0.1.0"
 description = "Bounded public web research executor for Ephy"
-requires-python = ">=3.12,<3.15"
+requires-python = ">=3.10,<3.15"
 dependencies = [
   "pydantic-ai-slim[openai]>=1.0,<2",
   "pydantic>=2.11,<3",
@@ -16,7 +16,6 @@ dependencies = [
   "trafilatura>=2.0,<3",
   "pypdf>=6.0,<7",
   "psutil>=7.0,<8",
-  "jsonschema>=4.23,<5",
 ]
 
 [dependency-groups]
