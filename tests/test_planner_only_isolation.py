@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -47,6 +48,10 @@ def sealed(tmp_path, monkeypatch):
            "runtime": {"resource_lock": str(tmp_path / "lock")},
            "jobDir": str(job_dir), "worktreePath": str(candidate),
            "status": "planner_stopped", "outcome": "planned_only"}
+    job.update(schemaVersion=2, humanAuthorization="explicit-execute-proposal-only",
+               controls={"policy_sha256": "a" * 64}, model_identities={"planner": {"model_id": isolation.FAKE_MODEL}},
+               repoRoot=str(candidate), verifier_identity={"executor_id": "synthetic"},
+               environment_sha256="b" * 64)
     save(job_dir / "job.json", job)
     (job_dir / "lead-plan.txt").write_text(PLAN, encoding="utf-8")
     stop = {"job_id": job["id"], "contract_sha256": sha256(isolation.encode(value)),
@@ -61,8 +66,11 @@ def sealed(tmp_path, monkeypatch):
         "runtime_sha256": sha256(isolation.encode(job["runtime"])), "job_dir": str(job_dir),
         "worktree": str(candidate)},
         "planner_only": True, "identity": {"model_id": isolation.FAKE_MODEL},
-        "runtime": {"pi": str(Path(sys.executable).resolve())}, "created_at": 1,
+        "runtime": {"pi": str(Path(sys.executable).resolve())}, "created_at": time.time() - 10,
         "frozen": {"policy_sha256": "a" * 64}, "max_log_bytes": 8388608}
+    frozen["generation_submission_sha256"] = sha256(isolation.encode({key: value for key, value in job.items()
+        if key not in {"status", "message", "updatedAt", "runnerPid", "outcome", "environment_sha256"}}))
+    frozen["generation_environment_sha256"] = job["environment_sha256"]
     monkeypatch.setattr(isolation, "frozen", lambda *_: frozen)
     # These existing boundaries have separate actual-wire and canonical-delivery controls.
     monkeypatch.setattr(isolation, "wire_matches", lambda *args: {})
@@ -87,7 +95,7 @@ def sealed(tmp_path, monkeypatch):
         save(directory / "session.jsonl", {"type": "message", "message": {
             "role": "assistant", "stopReason": "stop", "content": [{"type": "text", "text": PLAN}]}})
         (directory / "session.jsonl").write_bytes((directory / "session.jsonl").read_bytes() + b"\n")
-        process = {"pid": os.getpid() + (role == "implementer"), "created_at": time.time(),
+        process = {"pid": os.getpid() + (role == "implementer"), "created_at": time.time() - 2,
                    "executable": frozen["runtime"]["pi"]}
         raw = consumer.json_bytes({"max_tokens": 275})
         (directory / "http-1.json").write_bytes(raw)
@@ -118,6 +126,7 @@ def sealed(tmp_path, monkeypatch):
     case = SimpleNamespace(job=job, job_dir=job_dir, capture=capture, candidate=candidate,
                            freeze=frozen, path=freeze_path, expected=expected, session=session,
                            directory=directory)
+    write_workflow(case)
     return case
 
 
@@ -167,6 +176,7 @@ def reseal(case, include_closure=False):
     receipt["files"] = {p.relative_to(directory).as_posix(): sha256(p.read_bytes())
                        for p in directory.rglob("*") if p.is_file() and p.name != "receipt.json"}
     save(directory / "receipt.json", receipt)
+    write_workflow(case)
 
 
 @pytest.mark.parametrize("change", [
@@ -309,6 +319,9 @@ def test_adapter_completion_preserves_failure_and_releases_actual_kernel_lock(se
     runner.identity = sealed.freeze["identity"]
     runner._planner_only = True
     runner.candidate, runner.directory = sealed.candidate, sealed.job_dir
+    runner._isolation_started_at = isolation.load(sealed.capture / "planner-completion.json")["started_at"]
+    runner._isolation_started_monotonic = time.monotonic() - (time.time() - runner._isolation_started_at)
+    (sealed.capture / "planner-completion.json").unlink()
     finalized = []
     def existing_run(self):
         try:
@@ -380,3 +393,162 @@ def test_fullflow_report_cannot_hide_conflicting_or_malformed_job_mode(sealed, f
         "synthetic_only": True, "real_model_generations": 0, "candidate_sha256": sha256(skill.read_bytes())})
     with pytest.raises(InvalidEvaluation, match="boolean|job/flag"):
         isolation.verify_capture(sealed.path, sealed.expected)
+
+def write_workflow(case):
+    receipt = isolation.load(case.directory / "receipt.json")
+    stop = isolation.load(case.job_dir / "planner-stop.json")
+    model = case.freeze["identity"]["model_id"]
+    anchor = receipt["process"]["created_at"]
+    stamp = lambda offset: datetime.fromtimestamp(anchor + offset, UTC).isoformat()
+    records = [
+        {"stage": "preflight", "at": stamp(-1), "passed": True,
+         "contract_sha256": stop["contract_sha256"], "snapshot_sha256": stop["snapshot_sha256"]},
+        {"stage": "model loaded", "at": stamp(-0.5), "model": model},
+        {"stage": "planner start", "at": stamp(-0.1),
+         "label": "planner", "expected_model": model},
+        {"stage": "planner end", "at": stamp(0.2),
+         "label": "planner", "pid": receipt["process"]["pid"],
+         "trace_sha256": sha256((case.directory / "trace.jsonl").read_bytes())},
+        {"stage": "planner stop", "at": stamp(0.3), **stop},
+    ]
+    save(case.capture / "planner-completion.json", {
+        "schema": "ephy.triage-planner-completion.v1", "job_id": case.job["id"],
+        "freeze_sha256": case.expected, "submission_sha256": case.freeze["generation_submission_sha256"],
+        "started_at": anchor - 1.5, "finished_at": anchor + 0.5, "elapsed_seconds": 2.0})
+    (case.job_dir / "workflow.jsonl").write_bytes(
+        b"\n".join(consumer.json_bytes(record) for record in records) + b"\n")
+
+
+@pytest.mark.parametrize("artifact", [
+    "worker-1-trace.jsonl", "worker-1-session.jsonl", "worker-1.stdout.log",
+    "worker-1.stderr.log", "worker-1-config.json", "worker-1-prompt.txt", "worker-1-system.txt",
+    "implementer-trace.jsonl", "implementer.stdout.log", "auditor-trace.jsonl",
+    "audit-result.raw.txt", "candidate.patch", "WORKER-2-SESSION.JSONL",
+])
+def test_parent_audit_implementation_artifact_cannot_be_hidden(sealed, artifact):
+    (sealed.job_dir / artifact).write_bytes(b"{}\n")
+    with pytest.raises(InvalidEvaluation, match="implementation or audit evidence"):
+        publish(sealed)
+
+
+@pytest.mark.parametrize("change", [
+    "implementer_start", "auditor_start", "unknown_stage", "invalid_json",
+    "partial_json", "nonobject", "empty_record", "missing_file", "empty_file",
+    "missing_start", "reordered", "duplicate", "missing_timestamp", "bad_timestamp",
+    "naive_timestamp", "backward_timestamp", "wrong_pid", "wrong_trace", "wrong_stop",
+    "wrong_model", "failed_preflight", "wrong_preflight_binding", "missing_newline",
+])
+def test_parent_audit_workflow_is_complete_known_and_bound(sealed, change):
+    path = sealed.job_dir / "workflow.jsonl"
+    records = [isolation.json.loads(line) for line in path.read_bytes().splitlines()]
+    if change in {"implementer_start", "auditor_start", "unknown_stage"}:
+        records.insert(3, {"stage": {"implementer_start": "implementer start",
+                                   "auditor_start": "auditor start",
+                                   "unknown_stage": "future unknown stage"}[change],
+                           "at": "2026-10-06T12:00:02+00:00"})
+    elif change == "invalid_json":
+        path.write_bytes(b"not json\n")
+    elif change == "partial_json":
+        path.write_bytes(path.read_bytes() + b'{"stage":')
+    elif change == "nonobject":
+        records[2] = []
+    elif change == "empty_record":
+        records[2] = {}
+    elif change == "missing_file":
+        path.unlink()
+    elif change == "empty_file":
+        path.write_bytes(b"")
+    elif change == "missing_start":
+        records.pop(2)
+    elif change == "reordered":
+        records[2], records[3] = records[3], records[2]
+    elif change == "duplicate":
+        records.insert(3, records[2])
+    elif change == "missing_timestamp":
+        records[2].pop("at")
+    elif change == "bad_timestamp":
+        records[2]["at"] = "not a time"
+    elif change == "naive_timestamp":
+        records[2]["at"] = "2026-10-06T12:00:02"
+    elif change == "backward_timestamp":
+        records[2]["at"] = "2026-10-05T12:00:02+00:00"
+    elif change == "wrong_pid":
+        records[3]["pid"] += 1
+    elif change == "wrong_trace":
+        records[3]["trace_sha256"] = "0" * 64
+    elif change == "wrong_stop":
+        records[4]["implementation_started"] = True
+    elif change == "wrong_model":
+        records[2]["expected_model"] = "another-model"
+    elif change == "failed_preflight":
+        records[0]["passed"] = False
+    elif change == "wrong_preflight_binding":
+        records[0]["contract_sha256"] = "0" * 64
+    elif change == "missing_newline":
+        path.write_bytes(path.read_bytes().rstrip(b"\n"))
+    if change not in {"invalid_json", "partial_json", "missing_file", "empty_file", "missing_newline"}:
+        path.write_bytes(b"\n".join(consumer.json_bytes(record) for record in records) + b"\n")
+    with pytest.raises((InvalidEvaluation, FileNotFoundError, KeyError, ValueError)):
+        publish(sealed)
+
+@pytest.mark.parametrize("field", [
+    "humanAuthorization", "schemaVersion", "controls", "model_identities", "repoRoot",
+    "verifier_identity", "environment_sha256", "submitting_process", "extra_immutable_field",
+])
+def test_review_full_submission_identity_cannot_change(sealed, field):
+    changed = copy.deepcopy(sealed.job)
+    changed[field] = {"forged": True}
+    save(sealed.job_dir / "job.json", changed)
+    with pytest.raises(InvalidEvaluation, match="submission identity"):
+        publish(sealed)
+
+
+@pytest.mark.parametrize("field", ["humanAuthorization", "schemaVersion", "controls", "model_identities", "repoRoot"])
+def test_review_authorized_submission_cannot_be_replaced_by_minimal_job(sealed, field):
+    changed = copy.deepcopy(sealed.job)
+    changed.pop(field)
+    save(sealed.job_dir / "job.json", changed)
+    with pytest.raises(InvalidEvaluation, match="submission identity"):
+        publish(sealed)
+
+
+@pytest.mark.parametrize("change", [
+    "missing", "over_elapsed", "negative_elapsed", "boolean_elapsed", "unknown_elapsed",
+    "nonfinite", "wrong_job", "wrong_freeze", "before_freeze", "start_after_process",
+    "finish_before_stop", "wall_over_cap", "elapsed_disagrees", "missing_started_at",
+])
+def test_review_whole_job_deadline_requires_bound_runner_window(sealed, change):
+    path = sealed.capture / "planner-completion.json"
+    timing = isolation.load(path)
+    if change == "missing":
+        path.unlink()
+    elif change == "over_elapsed":
+        timing["elapsed_seconds"] = 301
+    elif change == "negative_elapsed":
+        timing["elapsed_seconds"] = -1
+    elif change == "boolean_elapsed":
+        timing["elapsed_seconds"] = True
+    elif change == "unknown_elapsed":
+        timing["elapsed_seconds"] = None
+    elif change == "nonfinite":
+        timing["elapsed_seconds"] = float("inf")
+    elif change == "wrong_job":
+        timing["job_id"] = "another-job"
+    elif change == "wrong_freeze":
+        timing["freeze_sha256"] = "0" * 64
+    elif change == "before_freeze":
+        timing["started_at"] = sealed.freeze["created_at"] - 1
+    elif change == "start_after_process":
+        timing["started_at"] = timing["finished_at"] - 0.1
+    elif change == "finish_before_stop":
+        timing["finished_at"] = timing["started_at"] + 0.1
+    elif change == "wall_over_cap":
+        timing["finished_at"] = timing["started_at"] + 301
+    elif change == "elapsed_disagrees":
+        timing["elapsed_seconds"] = 1
+    else:
+        timing.pop("started_at")
+    if change != "missing":
+        save(path, timing)
+    with pytest.raises((InvalidEvaluation, FileNotFoundError, KeyError, ValueError)):
+        publish(sealed)

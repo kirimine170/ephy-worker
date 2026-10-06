@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
 import sys
 import time
 import uuid
+from datetime import datetime
 from importlib.metadata import version
 from pathlib import Path
 
@@ -65,6 +67,29 @@ def planner_only_mode(contract):
     value = contract.get("planner_only", False)
     helpers().require(type(value) is bool, "planner_only must be a frozen boolean")
     return value
+
+
+def generation_submission_sha256(job):
+    """Bind every immutable submission field; only controller state can evolve."""
+    c = helpers()
+    c.require({"schemaVersion", "id", "baseRevision", "contract", "runtime", "controls",
+               "model_identities", "verifier_identity", "humanAuthorization",
+               "repoRoot", "worktreePath", "jobDir"} <= set(job),
+              "Planner-only submission identity is incomplete")
+    # Preflight derives environment_sha256; it has a separate frozen binding.
+    mutable = {"status", "message", "updatedAt", "runnerPid", "outcome", "environment_sha256"}
+    return sha256(encode({key: value for key, value in job.items() if key not in mutable}))
+
+
+def generation_environment_sha256(job):
+    """Derive the exact environment that existing preflight records, before it runs."""
+    return sha256(encode({
+        "python": job["runtime"]["python"], "python_version": sys.version,
+        "dependencies": {name: version(name) for name in ("pytest", "ruff", "jsonschema", "psutil")},
+        "offline": True, "locale": "UTF-8", "pythonpath": "<measured-worktree>/src",
+        "temp_root": str(Path(job["jobDir"]).resolve() / "temp"),
+        "contract_sha256": sha256(encode(job["contract"])),
+    }))
 
 
 def freeze_generation(repository, pi, identity, batch, gold, directory, token_argv, *, generation_job=None):
@@ -145,6 +170,8 @@ def freeze_generation(repository, pi, identity, batch, gold, directory, token_ar
         "minimum_free_ram_bytes": 4294967296, "minimum_free_disk_bytes": 2147483648,
         "purpose": "generation_capture", "generation_binding": binding,
         "generation_job_path": str(generation_job.resolve()) if generation_job else None,
+        **({"generation_submission_sha256": generation_submission_sha256(job),
+            "generation_environment_sha256": generation_environment_sha256(job)} if planner_only else {}),
         "dependency_versions": {n: version(n) for n in ("httpx", "psutil", "jsonschema")},
         "controller": {"executable": str(Path(sys.executable).resolve()), "python_version": sys.version},
         "pins": {p: sha256(Path(p).read_bytes()) for p in pins},
@@ -164,6 +191,14 @@ def frozen(path, expected):
               "Unfrozen plan/scope/budgets")
     c.require(not planner_only_mode(value) or value["generation_binding"] is not None,
               "Planner-only capture requires a bound external job")
+    c.require(not planner_only_mode(value)
+              or isinstance(value.get("generation_submission_sha256"), str)
+              and re.fullmatch(r"[0-9a-f]{64}", value["generation_submission_sha256"]),
+              "Planner-only frozen submission identity missing")
+    c.require(not planner_only_mode(value)
+              or isinstance(value.get("generation_environment_sha256"), str)
+              and re.fullmatch(r"[0-9a-f]{64}", value["generation_environment_sha256"]),
+              "Planner-only frozen environment identity missing")
     c.intact(value)
     private = Path(value["private_root"])
     batch, gold = (private/"batch.json").read_bytes(), (private/"gold.json").read_bytes()
@@ -569,6 +604,56 @@ def run_native_generation(freeze_path, expected):
     return result
 
 
+def planner_completion_evidence(contract, expected, job, receipt, stop, planner):
+    """Require the complete known workflow inside the bound whole-run window."""
+    c = helpers()
+    timing_path = Path(contract["directory"]) / "planner-completion.json"
+    timing = load(timing_path)
+    c.require(set(timing) == {"schema", "job_id", "freeze_sha256", "submission_sha256",
+                              "started_at", "finished_at", "elapsed_seconds"}
+              and timing["schema"] == "ephy.triage-planner-completion.v1"
+              and timing["job_id"] == job["id"] and timing["freeze_sha256"] == expected
+              and timing["submission_sha256"] == contract["generation_submission_sha256"],
+              "Planner-only whole-job timing binding changed")
+    c.require(all(type(timing.get(key)) in (int, float) and math.isfinite(timing[key])
+                  for key in ("started_at", "finished_at", "elapsed_seconds")),
+              "Planner-only whole-job timing unknown")
+    start, finish, elapsed = (timing[key] for key in ("started_at", "finished_at", "elapsed_seconds"))
+    c.require(type(contract["created_at"]) in (int, float) and math.isfinite(contract["created_at"])
+              and 0 < contract["created_at"] <= start <= finish
+              and 0 <= elapsed <= job["contract"]["timeout_seconds"]
+              and finish - start <= job["contract"]["timeout_seconds"]
+              and abs((finish - start) - elapsed) <= 0.5,
+              "Planner-only whole-job deadline exceeded or clock evidence changed")
+    workflow_path = Path(job["jobDir"]) / "workflow.jsonl"
+    raw = workflow_path.read_bytes()
+    c.require(raw.endswith(b"\n"), "Planner-only workflow incomplete")
+    workflow = [json.loads(line) for line in raw.splitlines()]
+    stages = ["preflight", "model loaded", "planner start", "planner end", "planner stop"]
+    c.require(len(workflow) == len(stages)
+              and all(isinstance(event, dict) and event.get("stage") == stage
+                      and isinstance(event.get("at"), str) for event, stage in zip(workflow, stages)),
+              "Planner-only workflow has missing, unknown or non-planner stages")
+    dates = [datetime.fromisoformat(event["at"]) for event in workflow]
+    c.require(all(date.utcoffset() is not None for date in dates), "Planner-only workflow time lacks timezone")
+    times = [date.timestamp() for date in dates]
+    c.require(times == sorted(times) and start <= times[0] <= times[-1] <= finish
+              and times[2] <= receipt["process"]["created_at"] <= times[3]
+              and times[3] - times[2] <= job["contract"]["stage_seconds"],
+              "Planner-only workflow escapes the bound runner/stage window")
+    model = contract["identity"]["model_id"]
+    c.require(workflow[0].get("passed") is True
+              and workflow[0].get("contract_sha256") == contract["generation_binding"]["contract_sha256"]
+              and workflow[0].get("snapshot_sha256") == stop["snapshot_sha256"]
+              and workflow[1].get("model") == model and workflow[2].get("label") == "planner"
+              and workflow[2].get("expected_model") == model and workflow[3].get("label") == "planner"
+              and type(workflow[3].get("pid")) is int and workflow[3]["pid"] == receipt["process"]["pid"]
+              and workflow[3].get("trace_sha256") == sha256((planner / "trace.jsonl").read_bytes())
+              and {key: value for key, value in workflow[4].items() if key not in {"stage", "at"}} == stop,
+              "Planner-only workflow binding changed")
+    return sha256(raw), sha256(timing_path.read_bytes())
+
+
 def planner_capture_result(contract, expected):
     """Derive planner completion from bound saved evidence, never a report flag."""
     c = helpers()
@@ -577,6 +662,10 @@ def planner_capture_result(contract, expected):
     c.require(binding is not None, "Planner-only capture requires a bound external job")
     job_dir = Path(binding["job_dir"])
     job = load(Path(contract.get("generation_job_path") or job_dir / "job.json"))
+    c.require(generation_submission_sha256(job) == contract.get("generation_submission_sha256"),
+              "Planner-only submission identity changed")
+    c.require(job.get("environment_sha256") == contract.get("generation_environment_sha256"),
+              "Planner-only submission identity environment changed")
     c.validate_generation_budget(job)
     c.require(planner_only_mode(job["contract"]) and binding == {
         "job_id": job["id"], "base": job["baseRevision"],
@@ -586,6 +675,8 @@ def planner_capture_result(contract, expected):
     }, "Planner-only frozen job/flag changed")
     directory = Path(contract["directory"])
     c.require(not (directory / "implementer").exists()
+              and not any(path.name.casefold().startswith(("worker-", "implementer", "auditor", "audit-"))
+                          for path in job_dir.iterdir())
               and not any((job_dir / name).exists() for name in
                           ("audit-bundle", "audit-result.json", "candidate.patch")),
               "Planner-only capture contains implementation or audit evidence")
@@ -615,6 +706,7 @@ def planner_capture_result(contract, expected):
     c.require(job["status"] == "planner_stopped"
               and job["outcome"] == ("no_hypothesis" if plan.strip() == "NO_HYPOTHESIS" else "planned_only"),
               "Planner-only job did not stop successfully")
+    workflow_sha, completion_sha = planner_completion_evidence(contract, expected, job, receipt, stop, planner)
     events = events_at(planner)
     observed = stage_evidence(events, contract["identity"]["model_id"], "planner")
     c.require(type(observed["requests"]) is int
@@ -659,6 +751,8 @@ def planner_capture_result(contract, expected):
         "implementation_requests": 0, "requests": observed["requests"], "output_tokens": observed["output_tokens"],
         "plan_sha256": stop["plan_sha256"], "stop_sha256": sha256(stop_path.read_bytes()),
         "candidate_snapshot_sha256": stop["snapshot_sha256"],
+        "submission_sha256": contract["generation_submission_sha256"],
+        "workflow_sha256": workflow_sha, "completion_sha256": completion_sha,
     }
 
 
@@ -698,6 +792,8 @@ def verify_capture(freeze_path, expected):
 # baseline, independent checks, proposal freeze, stop, or external review gates.
 class IsolatedStrataRunner(StrataRunner):
     def __init__(self, job_file, freeze_path, expected):
+        self._isolation_started_at = time.time()
+        self._isolation_started_monotonic = time.monotonic()
         self.isolation_path, self.isolation_expected = freeze_path, expected
         self.isolation = frozen(freeze_path, expected)
         super().__init__(job_file)
@@ -718,6 +814,9 @@ class IsolatedStrataRunner(StrataRunner):
         self._planner_only = planner_only_mode(self.contract)
         c.require(self._planner_only == planner_only_mode(self.isolation),
                   "Generation freeze planner_only differs from job")
+        c.require(not self._planner_only or generation_submission_sha256(self.job)
+                  == self.isolation.get("generation_submission_sha256"),
+                  "Planner-only submission identity differs from freeze")
         c.require(all(self.runtime.get("thinking", {}).get(role) == "off" for role in ("planner", "implementer")),
                   "Isolated generation requires planner/implementer thinking=off")
         required = [str(Path(__file__).resolve()), self.isolation["runtime"]["extra_guard"],
@@ -834,6 +933,15 @@ class IsolatedStrataRunner(StrataRunner):
         c = helpers()
         if self._planner_only:
             c.require(self.isolation_stages == ["planner"], "Planner-only external capture incomplete")
+            elapsed = time.monotonic() - self._isolation_started_monotonic
+            c.require(0 <= elapsed <= self.contract["timeout_seconds"], "Planner-only whole-job deadline exceeded")
+            completion = {"schema": "ephy.triage-planner-completion.v1", "job_id": self.job["id"],
+                          "freeze_sha256": self.isolation_expected,
+                          "submission_sha256": self.isolation["generation_submission_sha256"],
+                          "started_at": self._isolation_started_at, "finished_at": time.time(),
+                          "elapsed_seconds": elapsed}
+            write_capture(self.isolation, Path(self.isolation["directory"]) / "planner-completion.json",
+                          c.json_bytes(completion))
             result = planner_capture_result(frozen(self.isolation_path, self.isolation_expected),
                                             self.isolation_expected)
             write_capture(self.isolation, Path(self.isolation["directory"]) / "capture.json", c.json_bytes(result))
