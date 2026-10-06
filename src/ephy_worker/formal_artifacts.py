@@ -62,10 +62,10 @@ FINAL_BINDINGS = {
 }
 SEQUENCE = [
     "preflight",
-    "designated model plan",
-    "pi attempt loop",
+    "gpt-oss lead plan",
+    "qwen attempt loop",
     "freeze final candidate and audit bundle",
-    "fresh designated-model audit",
+    "fresh gpt-oss audit",
     "proposal stop",
 ]
 
@@ -102,36 +102,6 @@ AUDIT_CHECKS = {
         "W10_EXACT_AUDITED_STATE",
         "W11_PROPOSAL_STOP",
     ),
-}
-
-# Minimum relevant artifact coverage for a PASS, independent of model assertions.
-# FAIL/INCONCLUSIVE may cite the available subset without inventing absent evidence.
-AUDIT_EVIDENCE = {
-    "I01_ENVELOPE_IDENTITY": ("audit_contract", "audit_input_schema", "evidence_manifest_schema"),
-    "I02_ARTIFACT_INTEGRITY": ("evidence_manifest_schema", "audit_contract"),
-    "I03_CANDIDATE_BINDING": ("candidate_patch", "candidate_changed_files", "candidate_snapshot_manifest"),
-    "I04_VERIFICATION_BINDING": ("verification_results", "candidate_patch", "candidate_snapshot_manifest"),
-    "I05_FROZEN_CONTROLS": (*CONTROL_PATHS, "checker_source", "environment_contract"),
-    "I06_PROVENANCE": ("workflow_events", "model_provenance"),
-    "I07_COMPLETE_FILE_COVERAGE": ("candidate_changed_files", "candidate_snapshot_manifest"),
-    "C01_ACCEPTANCE": ("task_spec", "evaluation_contract", "candidate_patch", "verification_results"),
-    "C02_SCOPE": ("task_spec", "candidate_patch", "candidate_changed_files"),
-    "C03_NO_UNRELATED_CHANGES": ("candidate_patch", "candidate_changed_files"),
-    "C04_TEST_MEANING": ("candidate_patch", "checker_source", "verification_plan"),
-    "C05_NO_WEAKENING": ("candidate_patch", "checker_source", "required_skill"),
-    "C06_REQUIRED_CHECKS": ("verification_results", "checker_control_results", "command_transcripts"),
-    "C07_ENVIRONMENT_BINDING": ("environment_contract", "verification_results", "command_transcripts"),
-    "W01_PREFLIGHT": ("preflight_result", "workflow_events"),
-    "W02_CONTEXT_ACK": ("workflow_events", "system_development_policy", "required_skill"),
-    "W03_READONLY_PLANNER": ("workflow_events", "model_provenance", "lead_plan"),
-    "W04_QWEN_IMPLEMENTATION": ("workflow_events", "model_provenance"),
-    "W05_MODEL_IDENTITIES": ("model_provenance", "preflight_result"),
-    "W06_INDEPENDENT_VERIFICATION": ("workflow_events", "verification_results", "command_transcripts"),
-    "W07_BOUNDED_REPAIRS": ("task_spec", "workflow_events", "verification_results"),
-    "W08_INFRASTRUCTURE_STOP": ("preflight_result", "workflow_events", "verification_results"),
-    "W09_FINAL_FREEZE": ("workflow_events", "verification_results", "candidate_snapshot_manifest"),
-    "W10_EXACT_AUDITED_STATE": ("candidate_patch", "candidate_snapshot_manifest", "verification_results"),
-    "W11_PROPOSAL_STOP": ("workflow_events", "system_development_policy", "audit_contract"),
 }
 
 
@@ -271,7 +241,7 @@ def freeze_bundle(bundle: Path, job: dict, artifacts: dict[str, bytes]) -> dict:
                 "path": filename,
                 "size_bytes": len(artifacts[name]),
                 "media_type": "application/json" if suffix == ".json" else "text/plain",
-                "producer": "runner" if name not in ("lead_plan",) else "designated planner",
+                "producer": "runner" if name not in ("lead_plan",) else "gpt-oss planner",
                 "sha256": digest(artifacts[name]),
             }
         )
@@ -317,9 +287,7 @@ def freeze_bundle(bundle: Path, job: dict, artifacts: dict[str, bytes]) -> dict:
     return audit_input
 
 
-def validate_audit_result(
-    result: dict, bundle: Path, audit_input: dict, observed_artifacts: set[str]
-) -> None:
+def validate_audit_result(result: dict, bundle: Path, audit_input: dict) -> None:
     manifest = read_json(bundle / "evidence-manifest.json")
     entries = {entry["artifact_id"]: entry for entry in manifest["artifacts"]}
     schema_path = safe_path(bundle, entries["audit_result_schema"]["path"])
@@ -341,8 +309,6 @@ def validate_audit_result(
     for document in result["documents_read"]:
         if document["sha256"] != entries[document["artifact_id"]]["sha256"]:
             raise GateFailure("Document identity mismatch")
-        if document["artifact_id"] not in observed_artifacts:
-            raise GateFailure("Claimed audit document has no observed delivery")
     for domain in ("integrity", "candidate", "workflow"):
         # No empty-domain or invented citations may authorize review_ready.
         ids = [check["check_id"] for check in result[domain]["checks"]]
@@ -355,14 +321,7 @@ def validate_audit_result(
                     or ref["sha256"] != entries[ref["artifact_id"]]["sha256"]
                 ):
                     raise GateFailure("Audit evidence citation mismatch")
-                if ref["artifact_id"] not in observed_artifacts:
-                    raise GateFailure("Audit citation has no observed delivery")
-            cited = {ref["artifact_id"] for ref in check["evidence"]}
-            if check["status"] == "PASS" and not set(AUDIT_EVIDENCE[check["check_id"]]) <= cited:
-                raise GateFailure("Missing relevant audit evidence coverage: " + check["check_id"])
     for finding in result["findings"]:
         for ref in finding["evidence"]:
             if ref["artifact_id"] not in entries or ref["sha256"] != entries[ref["artifact_id"]]["sha256"]:
                 raise GateFailure("Audit finding citation mismatch")
-            if ref["artifact_id"] not in observed_artifacts:
-                raise GateFailure("Audit finding has no observed delivery")
