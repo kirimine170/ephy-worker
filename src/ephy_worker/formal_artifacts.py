@@ -62,10 +62,10 @@ FINAL_BINDINGS = {
 }
 SEQUENCE = [
     "preflight",
-    "designated model plan",
-    "pi attempt loop",
+    "gpt-oss lead plan",
+    "qwen attempt loop",
     "freeze final candidate and audit bundle",
-    "fresh designated-model audit",
+    "fresh gpt-oss audit",
     "proposal stop",
 ]
 
@@ -271,7 +271,7 @@ def freeze_bundle(bundle: Path, job: dict, artifacts: dict[str, bytes]) -> dict:
                 "path": filename,
                 "size_bytes": len(artifacts[name]),
                 "media_type": "application/json" if suffix == ".json" else "text/plain",
-                "producer": "runner" if name not in ("lead_plan",) else "designated planner",
+                "producer": "runner" if name not in ("lead_plan",) else "gpt-oss planner",
                 "sha256": digest(artifacts[name]),
             }
         )
