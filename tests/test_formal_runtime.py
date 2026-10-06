@@ -2605,3 +2605,231 @@ def test_frozen_dependency_versions_reject_drift_before_or_during_checks(
         "frozen_identity_unchanged": runner.job["verifier_identity"] == frozen,
         "native_fixed_commands_completed": len(check_calls),
     }))
+
+
+@pytest.fixture
+def planner_prompt_case(tmp_path, monkeypatch):
+    """Exercise the real run() with synthetic data and an offline stage boundary.
+
+    These controls attest prompt construction and existing controller behavior,
+    not model compliance or the integrity of any historical trial artifacts.
+    No Pi executable, provider, live service, or private fixture is used.
+    """
+    def build(**overrides):
+        candidate = tmp_path / "candidate"
+        candidate.mkdir()
+        (candidate / "README.md").write_text("Offline fixture\n", encoding="utf-8")
+        git(candidate, "init")
+        git(candidate, "add", "README.md")
+        frozen_contract = contract()
+        frozen_contract.update(max_requests=8, output_token_budget=2200, max_response_tokens=1024)
+        frozen_contract.update(overrides)
+        initial = {
+            "schemaVersion": 2, "status": "queued", "jobDir": str(tmp_path),
+            "worktreePath": str(candidate), "repoRoot": str(tmp_path),
+            "contract": frozen_contract, "runtime": {"backend": "existing_strata"},
+            "controls": {"offline_control": "fixture"},
+            "model_identities": {"planner": {"model_id": "offline-fixture"}},
+            "verifier_identity": {"offline_verifier": "fixture"}, "baseRevision": "a" * 40,
+        }
+        job_file = tmp_path / "job.json"
+        write_json(job_file, initial)
+        runner = FormalRunner(job_file)
+        case = SimpleNamespace(runner=runner, initial=copy.deepcopy(initial), calls=[], preflights=[])
+
+        def preflight():
+            case.preflights.append("offline preflight")
+
+        def stage(role, prompt, label, cwd, **kwargs):
+            case.calls.append(SimpleNamespace(role=role, prompt=prompt, label=label, cwd=cwd, kwargs=kwargs))
+            return "NO_HYPOTHESIS"
+
+        monkeypatch.setattr(runner, "preflight", preflight)
+        monkeypatch.setattr(runner, "stage", stage)
+        return case
+
+    return build
+
+
+def completed_planner_prompt_case(factory, **overrides):
+    case = factory(**overrides)
+    case.runner.run()
+    assert len(case.calls) == 1
+    return case
+
+
+@pytest.mark.parametrize("requests,output,cap", [(8, 2200, 1024), (4, 1500, 512), (16, 4400, 1024)])
+def test_planner_prompt_uses_frozen_contract_budgets(planner_prompt_case, requests, output, cap):
+    case = completed_planner_prompt_case(
+        planner_prompt_case, max_requests=requests, output_token_budget=output, max_response_tokens=cap,
+    )
+    prompt = case.calls[0].prompt
+    assert f"Planner budget: at most {requests} provider requests total" in prompt
+    assert f"{output} output tokens total (at most {cap} per response)" in prompt
+
+
+def test_planner_prompt_preserves_the_frozen_task(planner_prompt_case):
+    task = "Synthetic task\nPreserve its second line and Unicode: \u8a08\u753b"
+    case = completed_planner_prompt_case(planner_prompt_case, task=task)
+    assert case.calls[0].prompt.startswith(
+        task + "\nPlan the single frozen task. Read only; no delegation or edits. "
+        "Return a concrete plan. If no justified change is possible, return NO_HYPOTHESIS.\n"
+    )
+
+
+def test_planner_prompt_charges_ack_and_reserves_the_final_response(planner_prompt_case):
+    prompt = completed_planner_prompt_case(planner_prompt_case).calls[0].prompt
+    assert "including the governance_ack request" in prompt
+    assert "Reserve at least one provider request for the final concrete plan or NO_HYPOTHESIS" in prompt
+
+
+def test_planner_prompt_orders_ack_and_delivery_before_required_reads(planner_prompt_case):
+    prompt = completed_planner_prompt_case(planner_prompt_case).calls[0].prompt
+    assert prompt.index("After governance_ack succeeds and required context delivery is verified") < (
+        prompt.index("read AGENTS.md")
+    )
+
+
+def test_planner_prompt_requires_complete_root_documents_or_exact_delivery(planner_prompt_case):
+    prompt = completed_planner_prompt_case(planner_prompt_case).calls[0].prompt
+    assert (
+        "read AGENTS.md and README.md from the stage root completely unless their byte-exact "
+        "full contents are already supplied"
+    ) in prompt
+
+
+def test_planner_prompt_reuses_fully_delivered_context(planner_prompt_case):
+    prompt = completed_planner_prompt_case(planner_prompt_case).calls[0].prompt
+    assert "Reuse fully delivered policy and required-context documents" in prompt
+
+
+def test_planner_prompt_never_waives_mandatory_reads_or_stop_conditions(planner_prompt_case):
+    prompt = completed_planner_prompt_case(planner_prompt_case).calls[0].prompt
+    assert "Complete every other applicable mandatory read before planning" in prompt
+    assert "never bypass a mandatory read or stop condition to fit the budget" in prompt
+
+
+def test_planner_prompt_prioritizes_the_plan_over_optional_exploration(planner_prompt_case):
+    prompt = completed_planner_prompt_case(planner_prompt_case).calls[0].prompt
+    assert (
+        "Then return the concrete plan instead of spending the remaining requests on optional "
+        "repository exploration"
+    ) in prompt
+
+
+def test_planner_prompt_preserves_read_only_role_limits(planner_prompt_case):
+    prompt = completed_planner_prompt_case(planner_prompt_case).calls[0].prompt
+    assert "Read only; no delegation or edits." in prompt
+    assert (
+        "This stage plans only; do not edit the candidate, submit an auditor result, "
+        "rerun controller checks, or invent measurements."
+    ) in prompt
+
+
+def test_planner_prompt_preserves_stage_role_label_root_and_arguments(planner_prompt_case):
+    case = completed_planner_prompt_case(planner_prompt_case)
+    call = case.calls[0]
+    assert (call.role, call.label, call.cwd, call.kwargs) == ("planner", "planner", case.runner.candidate, {})
+    assert case.preflights == ["offline preflight"]
+
+
+def test_planner_prompt_does_not_change_the_contract_or_runtime(planner_prompt_case):
+    case = completed_planner_prompt_case(planner_prompt_case)
+    saved = read_json(case.runner.job_file)
+    assert case.runner.contract == saved["contract"] == case.initial["contract"]
+    assert case.runner.runtime == saved["runtime"] == case.initial["runtime"]
+    assert case.runner.contract_sha == digest(encode(case.initial["contract"]))
+
+
+def test_planner_prompt_preserves_frozen_job_identity(planner_prompt_case):
+    case = completed_planner_prompt_case(planner_prompt_case)
+    saved = read_json(case.runner.job_file)
+    for field in ("controls", "model_identities", "verifier_identity", "baseRevision", "repoRoot", "worktreePath"):
+        assert saved[field] == case.initial[field]
+
+
+def test_planner_prompt_no_hypothesis_stops_before_implementation(planner_prompt_case):
+    case = completed_planner_prompt_case(planner_prompt_case)
+    saved = read_json(case.runner.job_file)
+    assert saved["status"] == "verification_failed" and saved["outcome"] == "no_hypothesis"
+    assert [call.role for call in case.calls] == ["planner"]
+    assert read_json(case.runner.directory / "BACKLOG.json") == {
+        "task": case.initial["contract"]["task"], "reason": "NO_HYPOTHESIS",
+    }
+
+
+def test_planner_prompt_concrete_plan_keeps_normal_implementer_handoff(planner_prompt_case, monkeypatch):
+    case = planner_prompt_case()
+    capture = case.runner.stage
+
+    def stage(role, prompt, label, cwd, **kwargs):
+        capture(role, prompt, label, cwd, **kwargs)
+        if role == "planner":
+            return "A synthetic concrete plan"
+        raise GateFailure("Offline implementer boundary")
+
+    monkeypatch.setattr(case.runner, "stage", stage)
+    with pytest.raises(GateFailure, match="Offline implementer boundary"):
+        case.runner.run()
+    assert [call.role for call in case.calls] == ["planner", "implementer"]
+    assert case.calls[1].label == "worker-1" and case.calls[1].cwd == case.runner.candidate
+    assert "\nPlanner:\nA synthetic concrete plan\nImplement using file tools only." in case.calls[1].prompt
+
+
+def test_planner_prompt_candidate_write_still_blocks_implementation(planner_prompt_case, monkeypatch):
+    case = planner_prompt_case()
+    capture = case.runner.stage
+
+    def stage(*args, **kwargs):
+        capture(*args, **kwargs)
+        (case.runner.candidate / "README.md").write_text("Unauthorized planner edit\n", encoding="utf-8")
+        return "A synthetic concrete plan"
+
+    monkeypatch.setattr(case.runner, "stage", stage)
+    with pytest.raises(GateFailure, match="Planner modified candidate"):
+        case.runner.run()
+    assert [call.role for call in case.calls] == ["planner"]
+    assert read_json(case.runner.job_file)["outcome"] == "infrastructure_failed"
+    assert not (case.runner.directory / "lead-plan.txt").exists()
+
+
+def test_planner_prompt_stage_failure_preserves_normal_stop(planner_prompt_case, monkeypatch):
+    case = planner_prompt_case()
+    capture = case.runner.stage
+
+    def stage(*args, **kwargs):
+        capture(*args, **kwargs)
+        raise GateFailure("Offline provider refusal")
+
+    monkeypatch.setattr(case.runner, "stage", stage)
+    with pytest.raises(GateFailure, match="Offline provider refusal"):
+        case.runner.run()
+    saved = read_json(case.runner.job_file)
+    assert saved["status"] == "failed" and saved["outcome"] == "infrastructure_failed"
+    assert [call.role for call in case.calls] == ["planner"]
+    assert read_json(case.runner.directory / "runner-error.json")["type"] == "GateFailure"
+
+
+def test_planner_prompt_does_not_change_candidate_bytes(planner_prompt_case):
+    case = planner_prompt_case()
+    before = snapshot(case.runner.candidate)
+    case.runner.run()
+    assert snapshot(case.runner.candidate) == before
+
+
+def test_planner_prompt_cleanup_leaves_unowned_service_untouched(planner_prompt_case, monkeypatch):
+    case = planner_prompt_case()
+    case.runner.server = SimpleNamespace(pid=1)  # An inert marker; no process is contacted.
+    case.runner.server_owned = False
+    stops = []
+    monkeypatch.setattr("ephy_worker.formal_runtime.stop_tree", lambda process: stops.append(process))
+    case.runner.run()
+    assert stops == []
+
+
+def test_planner_prompt_retains_the_plan_and_candidate_without_audit_artifacts(planner_prompt_case):
+    case = completed_planner_prompt_case(planner_prompt_case)
+    assert (case.runner.directory / "lead-plan.txt").read_text(encoding="utf-8") == "NO_HYPOTHESIS"
+    assert read_json(case.runner.directory / "retained-candidate-snapshot.json") == snapshot(case.runner.candidate)
+    assert not (case.runner.directory / "audit-result.json").exists()
+    assert not (case.runner.directory / "audit-bundle").exists()
