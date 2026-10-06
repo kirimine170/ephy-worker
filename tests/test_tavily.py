@@ -393,7 +393,7 @@ async def test_full_workflow_uses_tavily_candidates_not_snippet_evidence(
     assert "INCORRECT" not in report.evidence[0].quote
     assert report.metrics["search"]["credits_reported"] == 3
     assert report.metrics["requests"]["search_requests"] == 6
-    assert key not in (store.directory / "report.json").read_text()
+    assert key not in (store.directory / "report.json").read_text(encoding="utf-8")
 
 
 async def test_unexpected_usage_halts_and_unknown_usage_is_not_echoed(key):

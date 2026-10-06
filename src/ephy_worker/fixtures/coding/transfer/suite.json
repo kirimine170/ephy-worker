@@ -1,0 +1,216 @@
+{
+  "schema_version": 1,
+  "suite_id": "transfer-v1",
+  "tasks": [
+    {
+      "split": "development",
+      "family": "numeric-boundaries",
+      "allowed_files": [
+        "batches.py"
+      ],
+      "expected_tests": 1,
+      "fixture": {
+        "task_id": "dev-batch-count",
+        "category": "single_file_bug_fix",
+        "description": "Implement count_batches(size, capacity) for integer size >= 0 and capacity > 0. Return the number of batches needed, including a partial final batch. Preserve zero size as zero. Change only batches.py.",
+        "fixture_repository": "generated:transfer-v1:dev-batch-count",
+        "validation_command": [
+          "{python}",
+          "-m",
+          "unittest",
+          "discover",
+          "-s",
+          "tests",
+          "-q"
+        ],
+        "timeout_seconds": 10,
+        "files": {
+          ".gitignore": "__pycache__/\n",
+          "batches.py": "def count_batches(size, capacity):\n    return size // capacity\n",
+          "tests/test_behavior.py": "import unittest\n\nfrom batches import count_batches\n\n\nclass BehaviorTest(unittest.TestCase):\n    def test_contract(self):\n        for size, capacity, expected in [(0, 4, 0), (1, 4, 1), (4, 4, 1), (5, 4, 2), (9, 3, 3), (10, 3, 4)]:\n            with self.subTest(size=size, capacity=capacity):\n                self.assertEqual(count_batches(size, capacity), expected)\n"
+        },
+        "mock_changes": [
+          {
+            "path": "batches.py",
+            "content": "def count_batches(size, capacity):\n    return (size + capacity - 1) // capacity\n"
+          }
+        ]
+      }
+    },
+    {
+      "split": "development",
+      "family": "sequence-semantics",
+      "allowed_files": [
+        "unique.py"
+      ],
+      "expected_tests": 1,
+      "fixture": {
+        "task_id": "dev-stable-unique",
+        "category": "single_file_bug_fix",
+        "description": "Implement stable_unique(values) for a list of hashable values. Return each distinct value once in first-seen order, without mutating the input. Change only unique.py.",
+        "fixture_repository": "generated:transfer-v1:dev-stable-unique",
+        "validation_command": [
+          "{python}",
+          "-m",
+          "unittest",
+          "discover",
+          "-s",
+          "tests",
+          "-q"
+        ],
+        "timeout_seconds": 10,
+        "files": {
+          ".gitignore": "__pycache__/\n",
+          "unique.py": "def stable_unique(values):\n    return sorted(set(values))\n",
+          "tests/test_behavior.py": "import unittest\n\nfrom unique import stable_unique\n\n\nclass BehaviorTest(unittest.TestCase):\n    def test_contract(self):\n        for values, expected in [([], []), ([3, 1, 3, 2, 1], [3, 1, 2]), ([\"b\", \"a\", \"b\"], [\"b\", \"a\"]), ([0, 2, 0], [0, 2])]:\n            with self.subTest(values=values):\n                original = values.copy()\n                self.assertEqual(stable_unique(values), expected)\n                self.assertEqual(values, original)\n"
+        },
+        "mock_changes": [
+          {
+            "path": "unique.py",
+            "content": "def stable_unique(values):\n    return list(dict.fromkeys(values))\n"
+          }
+        ]
+      }
+    },
+    {
+      "split": "development",
+      "family": "missing-versus-value",
+      "allowed_files": [
+        "counts.py"
+      ],
+      "expected_tests": 1,
+      "fixture": {
+        "task_id": "dev-optional-count",
+        "category": "single_file_bug_fix",
+        "description": "Implement optional_count(text): blank or whitespace-only strings return None; other strings use strict int parsing, including signed values. Invalid nonblank values must still raise ValueError. Change only counts.py.",
+        "fixture_repository": "generated:transfer-v1:dev-optional-count",
+        "validation_command": [
+          "{python}",
+          "-m",
+          "unittest",
+          "discover",
+          "-s",
+          "tests",
+          "-q"
+        ],
+        "timeout_seconds": 10,
+        "files": {
+          ".gitignore": "__pycache__/\n",
+          "counts.py": "def optional_count(text):\n    return int(text)\n",
+          "tests/test_behavior.py": "import unittest\n\nfrom counts import optional_count\n\n\nclass BehaviorTest(unittest.TestCase):\n    def test_contract(self):\n        for text, expected in [(\"\", None), (\" \\t\", None), (\"0\", 0), (\"-7\", -7), (\" +12 \", 12)]:\n            with self.subTest(text=text):\n                self.assertEqual(optional_count(text), expected)\n        for text in [\"bad\", \"1.5\", \"1 2\"]:\n            with self.subTest(text=text), self.assertRaises(ValueError):\n                optional_count(text)\n"
+        },
+        "mock_changes": [
+          {
+            "path": "counts.py",
+            "content": "def optional_count(text):\n    if not text.strip():\n        return None\n    return int(text)\n"
+          }
+        ]
+      }
+    },
+    {
+      "split": "heldout",
+      "family": "numeric-boundaries",
+      "allowed_files": [
+        "limits.py"
+      ],
+      "expected_tests": 1,
+      "fixture": {
+        "task_id": "heldout-clamp",
+        "category": "single_file_bug_fix",
+        "description": "Implement clamp(value, lower, upper) for integers with lower <= upper. Return lower below the range, upper above it, and value inside the inclusive range. Change only limits.py.",
+        "fixture_repository": "generated:transfer-v1:heldout-clamp",
+        "validation_command": [
+          "{python}",
+          "-m",
+          "unittest",
+          "discover",
+          "-s",
+          "tests",
+          "-q"
+        ],
+        "timeout_seconds": 10,
+        "files": {
+          ".gitignore": "__pycache__/\n",
+          "limits.py": "def clamp(value, lower, upper):\n    return min(lower, max(upper, value))\n",
+          "tests/test_behavior.py": "import unittest\n\nfrom limits import clamp\n\n\nclass BehaviorTest(unittest.TestCase):\n    def test_contract(self):\n        for value, lower, upper, expected in [(-2, 0, 10, 0), (0, 0, 10, 0), (5, 0, 10, 5), (10, 0, 10, 10), (13, 0, 10, 10), (-4, -8, -2, -4), (9, 3, 3, 3)]:\n            with self.subTest(value=value, lower=lower, upper=upper):\n                self.assertEqual(clamp(value, lower, upper), expected)\n"
+        },
+        "mock_changes": [
+          {
+            "path": "limits.py",
+            "content": "def clamp(value, lower, upper):\n    return max(lower, min(upper, value))\n"
+          }
+        ]
+      }
+    },
+    {
+      "split": "heldout",
+      "family": "sequence-semantics",
+      "allowed_files": [
+        "runs.py"
+      ],
+      "expected_tests": 1,
+      "fixture": {
+        "task_id": "heldout-collapse-runs",
+        "category": "single_file_bug_fix",
+        "description": "Implement collapse_runs(values) for a list of integers. Collapse adjacent equal values, preserve later separated occurrences and order, and do not mutate the input. Change only runs.py.",
+        "fixture_repository": "generated:transfer-v1:heldout-collapse-runs",
+        "validation_command": [
+          "{python}",
+          "-m",
+          "unittest",
+          "discover",
+          "-s",
+          "tests",
+          "-q"
+        ],
+        "timeout_seconds": 10,
+        "files": {
+          ".gitignore": "__pycache__/\n",
+          "runs.py": "def collapse_runs(values):\n    return list(dict.fromkeys(values))\n",
+          "tests/test_behavior.py": "import unittest\n\nfrom runs import collapse_runs\n\n\nclass BehaviorTest(unittest.TestCase):\n    def test_contract(self):\n        for values, expected in [([], []), ([1], [1]), ([1, 1, 2, 2, 1], [1, 2, 1]), ([0, 0, -1, 0], [0, -1, 0]), ([3, 3, 3], [3])]:\n            with self.subTest(values=values):\n                original = values.copy()\n                self.assertEqual(collapse_runs(values), expected)\n                self.assertEqual(values, original)\n"
+        },
+        "mock_changes": [
+          {
+            "path": "runs.py",
+            "content": "def collapse_runs(values):\n    result = []\n    for value in values:\n        if not result or value != result[-1]:\n            result.append(value)\n    return result\n"
+          }
+        ]
+      }
+    },
+    {
+      "split": "heldout",
+      "family": "missing-versus-value",
+      "allowed_files": [
+        "lookup.py"
+      ],
+      "expected_tests": 1,
+      "fixture": {
+        "task_id": "heldout-present-value",
+        "category": "single_file_bug_fix",
+        "description": "Implement present_value(mapping, key, fallback). Return the stored value whenever the key exists, even if that value is falsey. Use fallback only for an absent key. Do not mutate the mapping. Change only lookup.py.",
+        "fixture_repository": "generated:transfer-v1:heldout-present-value",
+        "validation_command": [
+          "{python}",
+          "-m",
+          "unittest",
+          "discover",
+          "-s",
+          "tests",
+          "-q"
+        ],
+        "timeout_seconds": 10,
+        "files": {
+          ".gitignore": "__pycache__/\n",
+          "lookup.py": "def present_value(mapping, key, fallback):\n    return mapping.get(key) or fallback\n",
+          "tests/test_behavior.py": "import copy\nimport unittest\n\nfrom lookup import present_value\n\n\nclass BehaviorTest(unittest.TestCase):\n    def test_contract(self):\n        for value in [None, False, 0, \"\", [], \"ready\"]:\n            with self.subTest(value=value):\n                mapping = {\"other\": \"unrelated\", \"item\": value}\n                original = copy.deepcopy(mapping)\n                self.assertIs(present_value(mapping, \"item\", \"missing\"), value)\n                self.assertEqual(mapping, original)\n                self.assertEqual(present_value(mapping, \"other\", \"missing\"), \"unrelated\")\n                self.assertEqual(mapping, original)\n        for mapping in [{}, {\"other\": \"stored\"}, {\"other\": [], \"second\": 0}]:\n            original = copy.deepcopy(mapping)\n            fallback = object()\n            self.assertIs(present_value(mapping, \"absent\", fallback), fallback)\n            self.assertEqual(mapping, original)\n"
+        },
+        "mock_changes": [
+          {
+            "path": "lookup.py",
+            "content": "def present_value(mapping, key, fallback):\n    return mapping[key] if key in mapping else fallback\n"
+          }
+        ]
+      }
+    }
+  ]
+}
