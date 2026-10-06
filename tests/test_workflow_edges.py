@@ -209,7 +209,7 @@ async def test_japanese_context_trim_records_only_passages_actually_sent(tmp_pat
     assert model.sent_ids == read_ids == w.extraction_passage_ids
     assert 0 < len(read_ids) < len(all_ids)
     assert all(e.passage_id in read_ids for e in result.evidence)
-    events = [json.loads(line) for line in (w.store.directory / "events.jsonl").read_text().splitlines()]
+    events = [json.loads(line) for line in (w.store.directory / "events.jsonl").read_text(encoding="utf-8").splitlines()]
     reduction = next(
         event for event in events if event["type"] == "context_reduced" and event["stage"] == "extract"
     )

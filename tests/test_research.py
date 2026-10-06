@@ -310,7 +310,7 @@ async def test_complete_report_provenance_and_fresh_job(tmp_path):
     assert len(w.search.calls) == 3 and len(report.sources) == 5
     assert report.claims[0].checked
     assert report.evidence[0].page == 8
-    saved = json.loads((w.store.directory / "report.json").read_text())
+    saved = json.loads((w.store.directory / "report.json").read_text(encoding="utf-8"))
     assert saved["state"] == report.state
     assert (w.store.directory / "report.md").exists()
     assert w.model.closed
@@ -369,7 +369,7 @@ async def test_cancel_saves_non_success_and_closes_clients(tmp_path):
     report = await task
     assert report.state == "cancelled"
     assert w.model.closed
-    assert json.loads((w.store.directory / "status.json").read_text())["state"] == "cancelled"
+    assert json.loads((w.store.directory / "status.json").read_text(encoding="utf-8"))["state"] == "cancelled"
 
 
 async def test_wall_timeout(tmp_path):

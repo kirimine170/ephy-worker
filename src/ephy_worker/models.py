@@ -8,7 +8,6 @@ import math
 from typing import TypeVar
 
 import httpx
-from anyio import ClosedResourceError
 from openai import APIError, AsyncOpenAI
 from pydantic import BaseModel
 from pydantic_ai import Agent, NativeOutput, PromptedOutput, ToolOutput
@@ -28,28 +27,6 @@ class ModelError(RuntimeError):
     def __init__(self, code: str):
         self.code = code
         super().__init__(code)
-
-
-def _closed_cleanup_only(error: BaseException) -> bool:
-    pending = [(error, False)]
-    seen: set[tuple[int, bool]] = set()
-    closed = False
-    while pending:
-        current, context = pending.pop()
-        key = (id(current), context)
-        if key in seen:
-            continue
-        seen.add(key)
-        if isinstance(current, BaseExceptionGroup):
-            pending.extend((child, False) for child in current.exceptions)
-        elif isinstance(current, ClosedResourceError):
-            closed = True
-        elif not (context and isinstance(current, asyncio.CancelledError)):
-            return False
-        # Graph may unwrap one group member，leaving the original group as context．
-        # Walk that evidence too；cycles must not hide another failure or recurse forever．
-        pending.extend((linked, True) for linked in (current.__cause__, current.__context__) if linked is not None)
-    return closed
 
 
 def estimate_tokens(text: str) -> int:
@@ -257,26 +234,11 @@ class ModelRunner:
                 "Return only the required typed result．Use Japanese prose with ，and ．"
             ),
         )
-        # Deliver a pending cancellation before entering the backend．A handled older
-        # cancellation must not turn an unrelated later resource failure into cancellation．
-        await asyncio.sleep(0)
-        task = asyncio.current_task()
-        cancellations_before = task.cancelling() if task is not None else 0
         try:
             result = await agent.run(
                 prompt, usage_limits=UsageLimits(request_limit=settings.schema_retries + 1)
             )
             return result.output
-        except (ClosedResourceError, BaseExceptionGroup) as exc:
-            if (
-                task is not None
-                and task.cancelling() > cancellations_before
-                and _closed_cleanup_only(exc)
-            ):
-                # Pydantic Graph cleanup can replace cancellation with a closed-stream
-                # error．Keep that evidence as the cause and preserve caller cancellation．
-                raise asyncio.CancelledError from exc
-            raise
         except (
             APIError,
             AgentRunError,

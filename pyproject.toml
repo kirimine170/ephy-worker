@@ -16,7 +16,6 @@ dependencies = [
   "trafilatura>=2.0,<3",
   "pypdf>=6.0,<7",
   "psutil>=7.0,<8",
-  "jsonschema>=4.23,<5",
 ]
 
 [dependency-groups]
