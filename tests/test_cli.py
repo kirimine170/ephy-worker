@@ -40,7 +40,6 @@ def test_cli_help_and_missing_profile(tmp_path):
         [sys.executable, "-m", "ephy_worker", "--help"],
         capture_output=True,
         text=True,
-        encoding="utf-8",
         timeout=10,
         check=False,
     )
@@ -62,7 +61,6 @@ def test_cli_help_and_missing_profile(tmp_path):
         ],
         capture_output=True,
         text=True,
-        encoding="utf-8",
         timeout=10,
         check=False,
     )
