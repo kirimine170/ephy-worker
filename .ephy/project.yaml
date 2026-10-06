@@ -11,7 +11,7 @@ project:
 relations:
   parent: "ephy"
   depends_on: []
-  integrates_with: []
+  integrates_with: ["karte"]
   runs_on: []
 
 data_policy:
