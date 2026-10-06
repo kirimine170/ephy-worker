@@ -67,19 +67,18 @@ def fixture_repository(fixture: CodingFixture):
                 or not stat.S_ISREG(metadata.st_mode)
                 or metadata.st_nlink != 1
                 or not getattr(metadata, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_READONLY
-                or not target.is_relative_to(objects_root)
                 or not target.resolve(strict=True).is_relative_to(objects_root)
             ):
                 raise exception
             for parent in target.parents:
-                if parent == owned_root:
-                    break
                 parent_metadata = parent.lstat()
                 if (
                     not stat.S_ISDIR(parent_metadata.st_mode)
                     or getattr(parent_metadata, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
                 ):
                     raise exception
+                if parent.resolve(strict=True) == owned_root:
+                    break
             target.chmod(metadata.st_mode | stat.S_IWRITE)
             function(path)
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import io
 import json
 import os
@@ -15,7 +16,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ephy_worker.coding_profiles import load_coding_profiles
-from ephy_worker.evaluation import load_suite
+from ephy_worker.evaluation import create_fixture_repository, load_suite
 from ephy_worker.transfer_evaluation import (
     ASSETS,
     TransferSuite,
@@ -65,6 +66,41 @@ class TransferEvaluationTests(unittest.TestCase):
                     self.assertTrue(metadata.st_file_attributes & stat.FILE_ATTRIBUTE_READONLY)
                 else:
                     self.assertFalse(metadata.st_mode & stat.S_IWRITE)
+        self.assertFalse(repository.exists())
+
+    def test_fixture_cleanup_accepts_windows_short_path_alias(self):
+        task = self.frozen.suite.tasks[0]
+
+        def create_alias_fixture(fixture):
+            repository, revision = create_fixture_repository(fixture)
+            alias = repository.parent / ".." / repository.parent.name / repository.name
+            if os.name == "nt":
+                get_short_path = ctypes.WinDLL("kernel32", use_last_error=True).GetShortPathNameW
+                get_short_path.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+                get_short_path.restype = ctypes.c_uint32
+                size = get_short_path(str(repository), None, 0)
+                if not size:
+                    raise ctypes.WinError(ctypes.get_last_error())
+                buffer = ctypes.create_unicode_buffer(size)
+                if not get_short_path(str(repository), buffer, size):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                short_path = Path(buffer.value)
+                if short_path != repository.resolve(strict=True):
+                    alias = short_path
+            return alias, revision
+
+        with (
+            patch(
+                "ephy_worker.transfer_evaluation.create_fixture_repository",
+                side_effect=create_alias_fixture,
+            ),
+            fixture_repository(task.fixture) as (repository, _),
+        ):
+            self.assertNotEqual(repository, repository.resolve(strict=True))
+            objects = list((repository / ".git" / "objects").glob("??/*"))
+            self.assertTrue(objects)
+            for path in objects:
+                path.chmod(path.stat().st_mode & ~stat.S_IWRITE)
         self.assertFalse(repository.exists())
 
     def test_fixture_cleanup_propagates_unrelated_permission_errors(self):
