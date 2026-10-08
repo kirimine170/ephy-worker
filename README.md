@@ -191,6 +191,7 @@ Windowsのrepository validationは`python scripts/validate_repository.py --check
 - [Coding executor and evaluation](docs/coding-evaluation.md)
 - [Local coding model validation](docs/coding-model-validation.md)
 - [Pi autonomous model routing](docs/pi-autonomous-model-routing.md)
+- [Autonomous improvement strategy](docs/autonomous-improvement-strategy.md)
 - [Repository relationships](docs/repository-relations.md)
 - [Security and data handling](docs/security-and-data.md)
 
