@@ -150,7 +150,7 @@ stateDiagram-v2
 | cancel受理（Runtime→Manager） | running | cancel_requested（atomic barrier，新結果を即fence） | 同上（barrier以後のsuccess／failure結果は旧ID一致・本文完全一致でも受け付けない） |
 | cancel受理（Runtime→Manager） | cancel_requested | cancel_requested（冪等） | 同上 |
 | cancel受理（Runtime→Manager） | finalizeが先行しterminal | 既存terminal viewを返す（無変更） | successの上書きは不可 |
-| Worker停止確認（Worker） | cancel_requested，現在のattempt | cancelled／failed | 有効leaseとtuple検証はfinalizeと同じ／fence後の新規結果は不可／停止確認なきlease期限切れはsweeperがlostへ |
+| Worker停止確認（Worker） | cancel_requested，現在のattempt | cancelled | 有効leaseとtuple検証はfinalizeと同じ／fence後の新規結果は不可／停止確認なきlease期限切れはsweeperがlostへ |
 | deadline／lease loss（Manager sweeper） | runningかつlease期限切れ，cancel_requestedかつactive lease期限切れ（停止確認なし），またはsubmittedかつdeadline経過 | lost | 以後の結果送信は旧ID一致でも拒否 |
 | retry child作成（信頼済みRuntime承認，Manager実行） | 親がfailed／lostのterminal，認証済みusageと権威あるroot lineage台帳から残budget・original deadlineが証明可能，stable retry identity | 新child Jobがsubmitted（parent_job_id設定，保守的に予約済みの残額budget） | 親のstate／入力／結果は不変／unknown usageはゼロでも解放額でもなくfull予約として保守的に消費／台帳予約はatomicで二重消費なし／同一retry identityの再送は同一childを返す／cancelled親は対象外 |
 | Adoption（Runtime） | Jobがsucceeded，認証済みManager受理final result receipt，独立検証済み証拠・provenance，T-033／T-122ポリシーの明示許可，freshなrevisions再検証PASS | Job状態は不変，別系統の採用記録のみ作成 | ポリシーpending／undefinedは拒否／failed／cancelled／lostは拒否／未受理artifactのアップロードのみでは採用不可／Jobをadoptedへ遷移させる操作は存在しない／WorkerのKarte書き込みは禁止 |
