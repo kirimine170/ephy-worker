@@ -26,6 +26,7 @@ from ephy_worker.discord_runtime import (
     RuntimeGateway,
     run_discord,
     safe_final,
+    split_discord_text,
 )
 
 
@@ -307,12 +308,82 @@ async def test_bad_stream_or_identity_is_explicit_failure(tmp_path, fault):
         await gateway.aclose()
 
 
-def test_final_redacts_secrets_and_thinking_and_bounds_utf16():
+def test_final_redacts_secrets_and_thinking_and_preserves_complete_answer():
     secret = "fake-discord-token-" + "private"
-    text = safe_final("<think>internal-only</think>わたしの回答。 " + secret + "😀" * 3000, (secret,))
+    text = safe_final("<think>internal-only</think>わたしの回答。 " + secret + "😀" * 3000 + "最後の結論。", (secret,))
     assert "internal-only" not in text and secret not in text and "[redacted]" in text
-    assert len(text.encode("utf-16-le")) <= 3600 and "回答．" in text
+    assert text == "わたしの回答． [redacted]" + "😀" * 3000 + "最後の結論．"
+    parts = split_discord_text(text)
+    assert "".join(parts) == text and all(len(part.encode("utf-16-le")) <= 3600 for part in parts)
     with pytest.raises(BridgeError): safe_final("<analysis>unfinished secret")
+
+
+@pytest.mark.parametrize("text", ["", "\n\t", "x" * 32769, "answer\x00", "answer\r\n", "<|analysis|>private"],
+    ids=["empty", "blank", "raw_length", "nul", "cr", "internal"])
+def test_complete_answer_keeps_raw_length_control_and_internal_output_guards(text):
+    with pytest.raises(BridgeError):
+        safe_final(text)
+
+
+@pytest.mark.parametrize("text", ["短い回答です．", "日本語の文章です．" * 700 + "最後の結論．",
+    "😀" * 2000, "a" * 6000, "日本語😀" * 1000], ids=["short", "japanese", "emoji", "unbroken", "mixed"])
+def test_plain_discord_chunks_preserve_all_text_and_utf16_characters(text):
+    parts = split_discord_text(text)
+    assert parts and "".join(parts) == text
+    assert all(part and len(part.encode("utf-16-le")) <= 3600 for part in parts)
+    assert all(part.encode("utf-8").decode("utf-8") == part for part in parts)
+    if len(text.encode("utf-16-le")) <= 3600:
+        assert parts == [text]
+
+
+@pytest.mark.parametrize("boundary", ["\n\n", "\n", "．", "。", ". ", "！", "? "])
+def test_discord_chunks_prefer_natural_boundaries(boundary):
+    first = "あ" * 1700 + boundary
+    text = first + "い" * 300
+    parts = split_discord_text(text)
+    assert parts[0] == first and "".join(parts) == text
+    assert all(len(part.encode("utf-16-le")) <= 3600 for part in parts)
+
+
+@pytest.mark.parametrize("marker", ["```", "~~~"])
+def test_discord_code_fences_close_and_reopen_without_losing_lines(marker):
+    lines = [f"print('公開😀-{index:04d}')" for index in range(300)]
+    opening = marker + "python"
+    text = "公開の例です．\n\n" + opening + "\n" + "\n".join(lines) + "\n" + marker + "\n\n最後の結論です．"
+    parts = split_discord_text(text)
+    assert len(parts) > 1 and all(len(part.encode("utf-16-le")) <= 3600 for part in parts)
+    assert all(sum(line.startswith(marker) for line in part.splitlines()) % 2 == 0 for part in parts)
+    actual = [line for part in parts for line in part.splitlines() if line not in {opening, marker}]
+    expected = [line for line in text.splitlines() if line not in {opening, marker}]
+    assert actual == expected
+    assert parts[0].startswith("公開の例です．") and parts[-1].endswith("最後の結論です．")
+
+
+def test_discord_fence_wrappers_preserve_a_long_unbroken_code_line():
+    text = "```text\n" + "😀日本語" * 1000 + "\n```"
+    parts = split_discord_text(text)
+    payloads = []
+    for index, part in enumerate(parts):
+        assert len(part.encode("utf-16-le")) <= 3600
+        if index:
+            assert part.startswith("```text\n")
+            part = part.removeprefix("```text\n")
+        if index < len(parts) - 1:
+            assert part.endswith("```")
+            # The first chunk may contain just the original opening line．
+            part = part.removesuffix("```" if part == "```text\n```" else "\n```")
+        payloads.append(part)
+    assert "".join(payloads) == text
+
+
+def test_discord_split_accepts_custom_utf16_budget_and_rejects_impossible_limits():
+    assert split_discord_text("😀ab😀", limit=3) == ["😀a", "b😀"]
+    assert split_discord_text("") == []
+    for limit in (0, -1, True):
+        with pytest.raises(ValueError):
+            split_discord_text("answer", limit=limit)
+    with pytest.raises(ValueError):
+        split_discord_text("😀", limit=1)
 
 
 def event(**updates):
@@ -367,6 +438,85 @@ async def test_receipt_progress_final_duplicate_restart_and_own_reply_context(tm
         assert len(fixture.calls) == before
         with sqlite3.connect(ledger.path) as db:
             assert db.execute("SELECT count(*) FROM requests").fetchone()[0] == 2
+    finally:
+        await gateway.aclose()
+
+
+@pytest.mark.asyncio
+async def test_complete_answer_sends_sequential_parts_and_each_is_an_owned_followup(tmp_path):
+    config = settings(tmp_path)
+    answer = "最初の説明です．" + "公開の事実😀です．" * 700 + "最後の結論です．"
+    fixture = RuntimeFixture(response=final_stream(answer))
+    gateway = RuntimeGateway(config, transport=httpx.MockTransport(fixture))
+    ledger = BridgeLedger(config)
+    bridge, sent = RuntimeDiscordBridge(config, gateway, ledger), []
+    sending = False
+    async def send(text):
+        nonlocal sending
+        assert not sending
+        sending = True
+        await asyncio.sleep(0)
+        sent.append(text)
+        sending = False
+        return 200 + len(sent)
+    try:
+        await bridge.handle(event(), send)
+        parts = sent[1:]
+        assert sent[0] == RECEIPT and len(parts) > 1 and "".join(parts) == answer
+        assert parts[-1].endswith("最後の結論です．")
+        assert all(len(part.encode("utf-16-le")) <= 3600 for part in parts)
+        fixture.response = None
+        for index, part in enumerate(parts):
+            reply = event(message_id=1000 + index, mentioned=False, reply_to=202 + index,
+                content="それを詳しく説明してください")
+            context = ledger.previous(reply)
+            assert context and len(context.encode("utf-16-le")) <= 2400
+            assert context.startswith(part[:100])
+            assert ledger.previous(replace(reply, user_id=31)) is None
+            assert ledger.previous(replace(reply, channel_id=21)) is None
+            assert ledger.previous(replace(reply, guild_id=12)) is None
+            before = len(fixture.calls)
+            await bridge.handle(reply, send)
+            assert fixture.calls[before][1] == {"query": reply.content, "context": context}
+            assert sent[-2:] == [RECEIPT, "わたしは公開資料を確認しました．"]
+        with sqlite3.connect(ledger.path) as db:
+            assert db.execute("SELECT count(*) FROM answers").fetchone()[0] <= 128
+    finally:
+        await gateway.aclose()
+
+
+@pytest.mark.asyncio
+async def test_partial_final_delivery_keeps_sent_reply_context_and_never_replays(tmp_path, caplog):
+    answer = "最初の段落です．" * 300 + "\n\n" + "次の段落です．" * 300 + "最後の結論です．"
+    fixture = RuntimeFixture(response=final_stream(answer))
+    config = settings(tmp_path)
+    gateway = RuntimeGateway(config, transport=httpx.MockTransport(fixture))
+    ledger = BridgeLedger(config)
+    bridge, sent, attempts = RuntimeDiscordBridge(config, gateway, ledger), [], []
+    parts = split_discord_text(answer)
+    assert len(parts) > 2
+    async def send(text):
+        attempts.append(text)
+        if len(attempts) == 3:
+            raise RuntimeError("fixture-private-send-error")
+        sent.append(text)
+        return 200 + len(sent)
+    try:
+        await bridge.handle(event(), send)
+        assert attempts[:3] == [RECEIPT, parts[0], parts[1]]
+        assert sent == [RECEIPT, parts[0], "処理に失敗しました．結果を確認できていません．"]
+        assert "fixture-private-send-error" not in caplog.text
+        reply = event(message_id=2, mentioned=False, reply_to=202, content="その説明を補足してください")
+        assert ledger.previous(reply).startswith(parts[0][:100])
+        assert ledger.previous(replace(reply, reply_to=203)) is None
+        before = len(fixture.calls), len(attempts)
+        await bridge.handle(event(), send)
+        restarted = RuntimeDiscordBridge(config, gateway, BridgeLedger(config))
+        await restarted.handle(event(), send)
+        assert (len(fixture.calls), len(attempts)) == before and bridge.inflight == 0
+        fixture.response = None
+        await restarted.handle(reply, send)
+        assert sent[-2:] == [RECEIPT, "わたしは公開資料を確認しました．"]
     finally:
         await gateway.aclose()
 
@@ -742,5 +892,162 @@ async def test_published_formatted_context_requires_owned_bounded_reply_scope(tm
             assert sent == [RECEIPT, "わたしは公開資料を確認しました．"]
         else:
             assert not fixture.calls and not sent
+    finally:
+        await gateway.aclose()
+
+
+def _pathological_fence_cases():
+    return [
+        pytest.param("`" * 2001 + "\n公開😀の本文\n" + "`" * 2001, id="oversized-marker"),
+        pytest.param("```" + "language" * 400 + "\n公開😀の本文\n```", id="oversized-info"),
+        pytest.param("~~~" + "語" * 4000, id="no-newline-info"),
+        pytest.param("`" * 5000, id="no-newline-marker"),
+        pytest.param("~~~" + "😀" * 1200 + "\n公開の本文\n~~~", id="emoji-info-utf16"),
+        pytest.param("```" + "x" * 1792 + "\n" + "😀" * 20 + "\n```", id="reopening-overhead"),
+        pytest.param("```python\n公開😀の本文\n" + "`" * 2500, id="oversized-closing-marker"),
+        pytest.param("```" + "x" * 800 + "\n公開の本文\n" + "`" * 1100, id="closing-prefix-overhead"),
+        pytest.param("公開の導入．\n   ~~~" + "語" * 1790 + "\n公開の本文\n~~~", id="indented-overhead"),
+        pytest.param("~~~text\n公開の本文\n~~~" + " " * 2000 + "\n最後の結論．", id="closing-whitespace"),
+        pytest.param("公開の導入😀\n```" + "info" * 600 + "\n本文😀\n```\n最後の結論．", id="nonzero-start"),
+        pytest.param("```" + "😀" * 32765, id="maximum-sanitized-character-count"),
+    ]
+
+
+@pytest.mark.parametrize("answer", _pathological_fence_cases())
+def test_pathological_fence_delimiters_fall_back_to_complete_bounded_text(answer):
+    text = safe_final(answer)
+    assert len(text) <= 32768
+    parts = split_discord_text(text)
+    assert len(parts) > 1 and "".join(parts) == text
+    assert all(part and len(part.encode("utf-16-le")) <= 3600 for part in parts)
+    assert all(part.encode("utf-8").decode("utf-8") == part for part in parts)
+
+
+@pytest.mark.parametrize("limit", [8, 16, 32, 1800])
+def test_pathological_fence_wrapper_overhead_always_makes_progress_with_custom_limits(limit):
+    text = "```" + "a" * (limit - 6) + "\n😀😀😀\n```"
+    parts = split_discord_text(text, limit=limit)
+    assert "".join(parts) == text
+    assert all(part and len(part.encode("utf-16-le")) <= limit * 2 for part in parts)
+
+
+def test_pathological_fence_does_not_disable_other_normal_fence_wrappers():
+    pathological = "~~~" + "info" * 600 + "\n公開😀の本文\n~~~\n"
+    lines = [f"print('公開-{index:04d}')" for index in range(300)]
+    normal = "```python\n" + "\n".join(lines) + "\n```\n最後の結論．"
+    parts = split_discord_text(pathological + normal)
+    assert all(part and len(part.encode("utf-16-le")) <= 3600 for part in parts)
+    assert "".join(parts).startswith(pathological)
+    assert [line for part in parts for line in part.splitlines() if line.startswith("print(")] == lines
+    assert all(part.count("```") % 2 == 0 for part in parts)
+    assert parts[-1].endswith("最後の結論．")
+
+
+@pytest.mark.parametrize("answer", ["```" + "info" * 700, "`" * 2001 + "\n公開😀の本文\n" + "`" * 2001,
+    "~~~" + "x" * 1792 + "\n" + "😀" * 20 + "\n~~~", "```" + "😀" * 32765],
+    ids=["no-newline", "marker", "prefix-overhead", "max-emoji"])
+@pytest.mark.asyncio
+async def test_pathological_fence_final_delivery_is_complete_and_each_part_remains_owned(tmp_path, answer):
+    text = safe_final(answer)
+    config = settings(tmp_path)
+    fixture = RuntimeFixture(response=final_stream(answer))
+    gateway = RuntimeGateway(config, transport=httpx.MockTransport(fixture))
+    ledger = BridgeLedger(config)
+    bridge, sent = RuntimeDiscordBridge(config, gateway, ledger), []
+
+    async def send(part):
+        sent.append(part)
+        return 500 + len(sent)
+
+    try:
+        await bridge.handle(event(), send)
+        assert sent[0] == RECEIPT and len(sent) > 2 and "".join(sent[1:]) == text
+        assert all(part and len(part.encode("utf-16-le")) <= 3600 for part in sent)
+        for index, part in enumerate(sent[1:], 502):
+            reply = event(message_id=1000 + index, mentioned=False, reply_to=index)
+            assert ledger.previous(reply).startswith(part[:100])
+            assert ledger.previous(replace(reply, user_id=31)) is None
+        before = len(fixture.calls), len(sent)
+        await bridge.handle(event(), send)
+        assert (len(fixture.calls), len(sent)) == before
+    finally:
+        await gateway.aclose()
+
+
+def _maximum_fenced_answer(opening, marker, character):
+    return opening + "\n" + character * (32768 - len(opening) - len(marker) - 2) + "\n" + marker
+
+
+@pytest.mark.parametrize("opening,marker", [
+    ("```" + "x" * 1790, "```"), ("~~~" + "😀" * 895, "~~~"),
+    ("`" * 898, "`" * 898), ("```" + "x" * 893, "```"),
+], ids=["one-codepoint-info", "utf16-info", "one-codepoint-marker", "half-budget-threshold"])
+@pytest.mark.parametrize("character", ["a", "😀"], ids=["ascii", "emoji"])
+def test_bounded_fence_overhead_maximum_answer_has_proportional_lossless_chunks(opening, marker, character):
+    text = safe_final(_maximum_fenced_answer(opening, marker, character))
+    assert len(text) == 32768
+    parts = split_discord_text(text)
+    units = len(text.encode("utf-16-le")) // 2
+    count = len(parts)
+    assert count <= 2 * ((units + 1799) // 1800) + 4
+    assert "".join(parts) == text
+    assert all(part and len(part.encode("utf-16-le")) <= 3600 for part in parts)
+    assert all(part.encode("utf-8").decode("utf-8") == part for part in parts)
+
+
+@pytest.mark.parametrize("info_length,wrapped", [(892, True), (893, False)])
+@pytest.mark.parametrize("character", ["a", "😀"], ids=["ascii", "emoji"])
+def test_bounded_fence_overhead_half_budget_boundary_preserves_ordinary_wrapping(info_length, wrapped, character):
+    marker = "```"
+    opening = marker + "x" * info_length
+    text = opening + "\n" + character * 8192 + "\n" + marker
+    parts = split_discord_text(text)
+    units = len(text.encode("utf-16-le")) // 2
+    assert len(parts) <= 2 * ((units + 1799) // 1800) + 4
+    assert all(part and len(part.encode("utf-16-le")) <= 3600 for part in parts)
+    if not wrapped:
+        assert "".join(parts) == text
+        return
+    assert parts[0] == opening + "\n" + marker
+    restored = []
+    for index, part in enumerate(parts):
+        assert part.count(marker) % 2 == 0
+        if index:
+            assert part.startswith(opening + "\n")
+            part = part.removeprefix(opening + "\n")
+        if index < len(parts) - 1:
+            suffix = marker if part == opening + "\n" + marker else "\n" + marker
+            assert part.endswith(suffix)
+            part = part.removesuffix(suffix)
+        restored.append(part)
+    assert "".join(restored) == text
+
+
+@pytest.mark.asyncio
+async def test_near_threshold_fence_final_delivery_is_proportional_and_all_parts_are_owned(tmp_path):
+    text = safe_final(_maximum_fenced_answer("```" + "x" * 1790, "```", "😀"))
+    config = settings(tmp_path)
+    fixture = RuntimeFixture(response=final_stream(text))
+    gateway = RuntimeGateway(config, transport=httpx.MockTransport(fixture))
+    ledger = BridgeLedger(config)
+    bridge, sent = RuntimeDiscordBridge(config, gateway, ledger), []
+
+    async def send(part):
+        sent.append(part)
+        return 700 + len(sent)
+
+    try:
+        await bridge.handle(event(), send)
+        assert sent[0] == RECEIPT and "".join(sent[1:]) == text
+        units = len(text.encode("utf-16-le")) // 2
+        assert len(sent) - 1 <= 2 * ((units + 1799) // 1800) + 4
+        assert all(part and len(part.encode("utf-16-le")) <= 3600 for part in sent)
+        for answer_id, part in enumerate(sent[1:], 702):
+            reply = event(message_id=2000 + answer_id, mentioned=False, reply_to=answer_id)
+            assert ledger.previous(reply).startswith(part[:100])
+            assert ledger.previous(replace(reply, user_id=31)) is None
+        before = len(fixture.calls), len(sent)
+        await bridge.handle(event(), send)
+        assert (len(fixture.calls), len(sent)) == before
     finally:
         await gateway.aclose()
