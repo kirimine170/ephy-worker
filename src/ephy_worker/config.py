@@ -69,8 +69,16 @@ def _resolve(value: str | None, env: str | None, label: str) -> str:
     return resolved.strip()
 
 
+class SearchRequestPolicy(StrictModel):
+    min_interval_seconds: float = Field(2, ge=0, le=300, allow_inf_nan=False)
+    cache_ttl_seconds: float = Field(300, ge=0, le=3600, allow_inf_nan=False)
+    cache_max_entries: int = Field(128, ge=1, le=256)
+    cache_max_bytes: int = Field(2 * 1024**2, ge=1024, le=16 * 1024**2)
+    cooldown_seconds: float = Field(300, gt=0, le=86400, allow_inf_nan=False)
+
+
 class SearchConfig(StrictModel):
-    provider: Literal["searxng", "tavily"] = "searxng"
+    provider: Literal["searxng", "tavily", "duckduckgo_html", "tavily_keyless"] = "searxng"
     base_url: str | None = None
     base_url_env: str | None = None
     api_key_env: str | None = None
@@ -81,6 +89,7 @@ class SearchConfig(StrictModel):
     retries: int = Field(1, ge=0, le=1)
     response_bytes: int = Field(2 * 1024**2, ge=1024, le=8 * 1024**2)
     max_credits_per_job: int = Field(10, ge=1, le=10)
+    request_policy: SearchRequestPolicy | None = None
 
     @model_validator(mode="after")
     def consistent(self):
@@ -98,11 +107,32 @@ class SearchConfig(StrictModel):
             if self.retries:
                 raise ValueError("Tavily validation does not retry potentially charged searches")
             self.api_key_env = self.api_key_env or "TAVILY_API_KEY"
+        elif self.provider == "tavily_keyless":
+            if self.base_url or self.base_url_env or self.api_key_env:
+                raise ValueError("Tavily keyless uses a fixed endpoint without API keys")
+            if "engine" in self.model_fields_set and self.engine != "tavily":
+                raise ValueError("Tavily keyless requires engine: tavily")
+            self.engine = "tavily"
+            if "retries" not in self.model_fields_set:
+                self.retries = 0
+            if self.retries:
+                raise ValueError("Tavily keyless does not retry searches")
+        elif self.provider == "duckduckgo_html":
+            if self.base_url or self.base_url_env or self.api_key_env:
+                raise ValueError("DuckDuckGo HTML uses a fixed endpoint without API keys")
+            if self.engine != "duckduckgo":
+                raise ValueError("DuckDuckGo HTML requires engine: duckduckgo")
+            if self.language != "auto":
+                raise ValueError("DuckDuckGo HTML currently supports language: auto only")
         elif self.api_key_env:
             raise ValueError("search API keys are supported only by the Tavily provider")
         return self
 
     def endpoint(self) -> str:
+        if self.provider == "tavily_keyless":
+            return "https://api.tavily.com"
+        if self.provider == "duckduckgo_html":
+            return "https://html.duckduckgo.com/html/"
         if self.provider == "tavily":
             value = (
                 _resolve(self.base_url, self.base_url_env, "Tavily base URL")
