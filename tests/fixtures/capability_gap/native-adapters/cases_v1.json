@@ -1,0 +1,370 @@
+{
+  "schema": "ephy.capability-native-test-cases.v1",
+  "source_origin": "test_fixture",
+  "description": "Hand-authored shapes plus exact saved synthetic P0 CLI reports; source_origin is fixture, not real-model evidence.",
+  "base_reports": {
+    "plan_completion": {
+      "schema": "ephy.plan-completion-result.v1",
+      "status": "complete",
+      "passed": true,
+      "assurance": "structural_only",
+      "semantic_correctness": "not_assessed",
+      "checks_executed": false,
+      "contract_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "response_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "plan_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "diagnostics": []
+    },
+    "planner_completion": {
+      "schema": "ephy.planner-completion-evidence.v1",
+      "status": "complete",
+      "completed": true,
+      "source_bindings_valid": true,
+      "assurance": "structural_only",
+      "semantic_correctness": "not_assessed",
+      "workflow_validity": "not_assessed",
+      "provenance": "not_assessed",
+      "formal_adoption": "not_assessed",
+      "checks_executed": false,
+      "job_id": "private-job-marker",
+      "job_contract_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "snapshot_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "source_files": {
+        "completion-contract": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "bytes": 100
+        },
+        "job.json": {
+          "sha256": "9999999999999999999999999999999999999999999999999999999999999999",
+          "bytes": 100
+        },
+        "planner-session.jsonl": {
+          "sha256": "8888888888888888888888888888888888888888888888888888888888888888",
+          "bytes": 100
+        },
+        "lead-plan.txt": {
+          "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "bytes": 100
+        },
+        "planner-stop.json": {
+          "sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+          "bytes": 100
+        }
+      },
+      "terminal_record_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "terminal_line": 1,
+      "checker_input_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "original_text_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "lead_plan_representation": "exact_utf8",
+      "checker": {
+        "schema": "ephy.plan-completion-result.v1",
+        "status": "complete",
+        "passed": true,
+        "assurance": "structural_only",
+        "semantic_correctness": "not_assessed",
+        "checks_executed": false,
+        "contract_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "response_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "plan_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "diagnostics": []
+      },
+      "diagnostics": []
+    },
+    "trial_reconciliation": {
+      "schema_version": 1,
+      "ok": true,
+      "plan_id": "private-plan-marker",
+      "plan_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "execution_ledger_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "axis": "variant",
+      "evidence_kind": "synthetic",
+      "expected_runs": 2,
+      "supplied_runs": 2,
+      "missing_run_ids": [],
+      "unexpected_run_ids": [],
+      "duplicate_run_ids": [],
+      "duplicate_trials": [],
+      "mismatches": [],
+      "validation_unexecuted_run_ids": [],
+      "missing_execution_record_ids": [],
+      "unexpected_execution_record_ids": [],
+      "not_executed_run_ids": [],
+      "missing_raw_result_ids": [],
+      "unexpected_raw_result_ids": [],
+      "duplicate_raw_result_ids": [],
+      "evidence_mismatches": [],
+      "record_integrity_verified": true,
+      "execution_verified": false,
+      "comparison": {
+        "schema_version": 1,
+        "axis": "variant",
+        "evidence_kind": "synthetic",
+        "coverage": "supplied_records_only; not attestation of a predeclared complete plan",
+        "fixed_conditions": {
+          "private-task-marker": {}
+        },
+        "summaries": [
+          {
+            "group": "private-group-marker",
+            "task_id": "private-task-marker",
+            "failure_counts": {
+              "private-failure-marker": 1
+            }
+          }
+        ],
+        "run_ids": [
+          "private-run-a",
+          "private-run-b"
+        ],
+        "interpretation": "Descriptive pipeline statistics only; no ranking, causal claim, or adoption decision."
+      },
+      "coverage": "exact records/raw results match to committed plan and ledger",
+      "interpretation": "Integrity relative to trusted plan/recorder commitments only; not proof of chronology, execution, budget enforcement, model improvement, formal workflow or adoption."
+    }
+  },
+  "acceptance_vectors": [
+    {
+      "id": "trial_integrity_not_success",
+      "test": "test_trial_integrity_not_success"
+    },
+    {
+      "id": "trial_missing_all_conditions",
+      "test": "test_trial_missing_all_conditions"
+    },
+    {
+      "id": "trial_duplicate_or_mismatch",
+      "test": "test_trial_duplicate_or_mismatch"
+    },
+    {
+      "id": "trial_explicit_not_executed",
+      "test": "test_trial_explicit_not_executed"
+    },
+    {
+      "id": "trial_missing_receipt_or_raw",
+      "test": "test_trial_missing_receipt_or_raw"
+    },
+    {
+      "id": "trial_contradictory_report",
+      "test": "test_trial_contradictory_report"
+    },
+    {
+      "id": "plan_complete_structural_only",
+      "test": "test_plan_complete_structural_only"
+    },
+    {
+      "id": "plan_incomplete_ack_read_truncation",
+      "test": "test_plan_incomplete_ack_read_truncation"
+    },
+    {
+      "id": "plan_no_hypothesis",
+      "test": "test_plan_no_hypothesis"
+    },
+    {
+      "id": "plan_invalid_contract",
+      "test": "test_plan_invalid_contract"
+    },
+    {
+      "id": "plan_invalid_input",
+      "test": "test_plan_invalid_input"
+    },
+    {
+      "id": "plan_unknown_or_conflicting_assurance",
+      "test": "test_plan_unknown_or_conflicting_assurance"
+    },
+    {
+      "id": "cross_evidence_basis",
+      "test": "test_cross_evidence_basis"
+    },
+    {
+      "id": "cross_raw_bytes_and_order",
+      "test": "test_cross_raw_bytes_and_order"
+    },
+    {
+      "id": "saved_output_binding_failure",
+      "test": "test_saved_output_binding_failure"
+    },
+    {
+      "id": "saved_output_last_record",
+      "test": "test_saved_output_last_record"
+    },
+    {
+      "id": "saved_output_windows_encoding",
+      "test": "test_saved_output_windows_encoding"
+    },
+    {
+      "id": "saved_output_contract_projection",
+      "test": "test_saved_output_contract_projection"
+    },
+    {
+      "id": "saved_output_assurance",
+      "test": "test_saved_output_assurance"
+    },
+    {
+      "id": "saved_output_legacy",
+      "test": "test_saved_output_legacy"
+    }
+  ],
+  "saved_p0_reports": [
+    {
+      "id": "planner-02-valid-exact-utf8",
+      "source_family": "planner_completion",
+      "source_origin": "test_fixture",
+      "upstream_basename": "verifier-synthetic-02-valid-exact-utf8-cli.stdout.log",
+      "upstream_caller_pins_basename": "verifier-synthetic-02-valid-exact-utf8-cli.command.json",
+      "upstream_caller_pins_raw_sha256": "87672403c2418563c641a0d08b5e79e7822a5b29664c0c61b7eeb0e5b38e5e3a",
+      "raw_sha256": "566d13bddbbf829b81e9bcec0bdb03568faef474e7b9a2708c906ea641d0d666",
+      "raw_byte_length": 1887,
+      "raw_report_utf8": "{\"assurance\":\"structural_only\",\"checker\":{\"assurance\":\"structural_only\",\"checks_executed\":false,\"contract_sha256\":\"2eb4e723cdd5a7e4d2d9ceca1b36a059d1202640bbc03ab2c2d94817d0d3d8a9\",\"diagnostics\":[],\"passed\":true,\"plan_sha256\":\"efeb5222ff1a910c339cca8055d2f95ba335f14de61ba9d6b73a9c7b4e68476c\",\"response_sha256\":\"3bafc71f10a1e792548650b6928e6c164bb66afabff2363f03be63fd8e6b81b6\",\"schema\":\"ephy.plan-completion-result.v1\",\"semantic_correctness\":\"not_assessed\",\"status\":\"complete\"},\"checker_input_sha256\":\"3bafc71f10a1e792548650b6928e6c164bb66afabff2363f03be63fd8e6b81b6\",\"checks_executed\":false,\"completed\":true,\"diagnostics\":[],\"formal_adoption\":\"not_assessed\",\"job_contract_sha256\":\"e3b30516560837aa785947cd569f9addb196aecbf61f6c8f2554fa702498b367\",\"job_id\":\"verifier-synthetic-independent-20261013\",\"lead_plan_representation\":\"exact_utf8\",\"original_text_sha256\":\"efeb5222ff1a910c339cca8055d2f95ba335f14de61ba9d6b73a9c7b4e68476c\",\"provenance\":\"not_assessed\",\"schema\":\"ephy.planner-completion-evidence.v1\",\"semantic_correctness\":\"not_assessed\",\"snapshot_sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"source_bindings_valid\":true,\"source_files\":{\"completion-contract\":{\"bytes\":1142,\"sha256\":\"2eb4e723cdd5a7e4d2d9ceca1b36a059d1202640bbc03ab2c2d94817d0d3d8a9\"},\"job.json\":{\"bytes\":1964,\"sha256\":\"c6ba340ac501d0218e951026313c8906a196b04ad0d5e66c850611199135ab5b\"},\"lead-plan.txt\":{\"bytes\":691,\"sha256\":\"efeb5222ff1a910c339cca8055d2f95ba335f14de61ba9d6b73a9c7b4e68476c\"},\"planner-session.jsonl\":{\"bytes\":1499,\"sha256\":\"b64fddd3ab8a125f942200a76fa2444977a66072e8e2cf9aaee5f3e077bfe0fa\"},\"planner-stop.json\":{\"bytes\":391,\"sha256\":\"c44db2b1d21d30710cf5f478d4bff3753ed5d7c055127f3efb48915e1705fbca\"}},\"status\":\"complete\",\"terminal_line\":4,\"terminal_record_sha256\":\"9b8d9b43bc8fd89af029dee3a88a4fb0cffd103eafde6b499f0475afb6f4455e\",\"workflow_validity\":\"not_assessed\"}\r\n",
+      "expected": {
+        "job_id": "verifier-synthetic-independent-20261013",
+        "job_contract_sha256": "e3b30516560837aa785947cd569f9addb196aecbf61f6c8f2554fa702498b367",
+        "contract_sha256": "2eb4e723cdd5a7e4d2d9ceca1b36a059d1202640bbc03ab2c2d94817d0d3d8a9"
+      },
+      "expected_candidate_count": 0
+    },
+    {
+      "id": "planner-16-incomplete-plan-structure",
+      "source_family": "planner_completion",
+      "source_origin": "test_fixture",
+      "upstream_basename": "verifier-synthetic-16-incomplete-plan-structure-cli.stdout.log",
+      "upstream_caller_pins_basename": "verifier-synthetic-16-incomplete-plan-structure-cli.command.json",
+      "upstream_caller_pins_raw_sha256": "047a2f119dd16df529aadd954e39a67127974ca3b6d07fda4974f1fd5ef4c6d5",
+      "raw_sha256": "20b3dcf1b90db204cfc657de092c62e84495d32b6a77edc827d05cd529ecf57f",
+      "raw_byte_length": 2068,
+      "raw_report_utf8": "{\"assurance\":\"structural_only\",\"checker\":{\"assurance\":\"structural_only\",\"checks_executed\":false,\"contract_sha256\":\"2eb4e723cdd5a7e4d2d9ceca1b36a059d1202640bbc03ab2c2d94817d0d3d8a9\",\"diagnostics\":[{\"code\":\"missing_field\",\"message\":\"Missing required fields: verification\",\"path\":\"plan\"}],\"passed\":false,\"plan_sha256\":\"33ef54449d17eaee3226db806d6f852f7f7f6d65bc9dac85248b1060da806233\",\"response_sha256\":\"24c200169e05b4af6899e42adc3970a7b6d42739108420dbd453b37c3f79f456\",\"schema\":\"ephy.plan-completion-result.v1\",\"semantic_correctness\":\"not_assessed\",\"status\":\"incomplete\"},\"checker_input_sha256\":\"24c200169e05b4af6899e42adc3970a7b6d42739108420dbd453b37c3f79f456\",\"checks_executed\":false,\"completed\":false,\"diagnostics\":[{\"code\":\"missing_field\",\"message\":\"Missing required fields: verification\",\"path\":\"plan\"}],\"formal_adoption\":\"not_assessed\",\"job_contract_sha256\":\"e3b30516560837aa785947cd569f9addb196aecbf61f6c8f2554fa702498b367\",\"job_id\":\"verifier-synthetic-independent-20261013\",\"lead_plan_representation\":\"exact_utf8\",\"original_text_sha256\":\"33ef54449d17eaee3226db806d6f852f7f7f6d65bc9dac85248b1060da806233\",\"provenance\":\"not_assessed\",\"schema\":\"ephy.planner-completion-evidence.v1\",\"semantic_correctness\":\"not_assessed\",\"snapshot_sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"source_bindings_valid\":true,\"source_files\":{\"completion-contract\":{\"bytes\":1142,\"sha256\":\"2eb4e723cdd5a7e4d2d9ceca1b36a059d1202640bbc03ab2c2d94817d0d3d8a9\"},\"job.json\":{\"bytes\":1964,\"sha256\":\"c6ba340ac501d0218e951026313c8906a196b04ad0d5e66c850611199135ab5b\"},\"lead-plan.txt\":{\"bytes\":356,\"sha256\":\"33ef54449d17eaee3226db806d6f852f7f7f6d65bc9dac85248b1060da806233\"},\"planner-session.jsonl\":{\"bytes\":939,\"sha256\":\"8687d8963c1ef203f84b5557e2d9510c6a0ef81a9dba4fc58b406e8113ef203c\"},\"planner-stop.json\":{\"bytes\":391,\"sha256\":\"2a858d380101d23d83085817319c44c90fcd930dc018107ab74d5e8f72945fa7\"}},\"status\":\"incomplete\",\"terminal_line\":4,\"terminal_record_sha256\":\"1fc9b34e4e1374f1dd2043791c6b5fae1f6e16d1d31c29acc5f0dc2b847f29e7\",\"workflow_validity\":\"not_assessed\"}\r\n",
+      "expected": {
+        "job_id": "verifier-synthetic-independent-20261013",
+        "job_contract_sha256": "e3b30516560837aa785947cd569f9addb196aecbf61f6c8f2554fa702498b367",
+        "contract_sha256": "2eb4e723cdd5a7e4d2d9ceca1b36a059d1202640bbc03ab2c2d94817d0d3d8a9"
+      },
+      "expected_candidate_count": 1
+    },
+    {
+      "id": "planner-40-no-hypothesis",
+      "source_family": "planner_completion",
+      "source_origin": "test_fixture",
+      "upstream_basename": "verifier-synthetic-40-no-hypothesis-cli.stdout.log",
+      "upstream_caller_pins_basename": "verifier-synthetic-40-no-hypothesis-cli.command.json",
+      "upstream_caller_pins_raw_sha256": "c31ba6cc516611ede4be3a29abba739161ed553e6eff4a861fb51f5269ee8e1a",
+      "raw_sha256": "9d049fe5dfe90ca8362f24439c0e8d0c81321f58f18a32f51f6a9b14d116cf6f",
+      "raw_byte_length": 2089,
+      "raw_report_utf8": "{\"assurance\":\"structural_only\",\"checker\":{\"assurance\":\"structural_only\",\"checks_executed\":false,\"contract_sha256\":\"2eb4e723cdd5a7e4d2d9ceca1b36a059d1202640bbc03ab2c2d94817d0d3d8a9\",\"diagnostics\":[{\"code\":\"no_hypothesis\",\"message\":\"Planner explicitly declined a hypothesis.\",\"path\":\"plan\"}],\"passed\":false,\"plan_sha256\":\"7a6d2c24502c7a7adeb1a2fed844a0892032d71e73e2e9f3af518e2ece9d8e20\",\"response_sha256\":\"fce39bb9d5e17290378840d6529d83601d51f9dcb3e1db8a9f296be04665672f\",\"schema\":\"ephy.plan-completion-result.v1\",\"semantic_correctness\":\"not_assessed\",\"status\":\"no_hypothesis\"},\"checker_input_sha256\":\"fce39bb9d5e17290378840d6529d83601d51f9dcb3e1db8a9f296be04665672f\",\"checks_executed\":false,\"completed\":false,\"diagnostics\":[{\"code\":\"no_hypothesis\",\"message\":\"Planner explicitly declined a hypothesis.\",\"path\":\"plan\"}],\"formal_adoption\":\"not_assessed\",\"job_contract_sha256\":\"e3b30516560837aa785947cd569f9addb196aecbf61f6c8f2554fa702498b367\",\"job_id\":\"verifier-synthetic-independent-20261013\",\"lead_plan_representation\":\"windows_write_text\",\"original_text_sha256\":\"7a6d2c24502c7a7adeb1a2fed844a0892032d71e73e2e9f3af518e2ece9d8e20\",\"provenance\":\"not_assessed\",\"schema\":\"ephy.planner-completion-evidence.v1\",\"semantic_correctness\":\"not_assessed\",\"snapshot_sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"source_bindings_valid\":true,\"source_files\":{\"completion-contract\":{\"bytes\":1142,\"sha256\":\"2eb4e723cdd5a7e4d2d9ceca1b36a059d1202640bbc03ab2c2d94817d0d3d8a9\"},\"job.json\":{\"bytes\":1965,\"sha256\":\"3166df8c7b3729c4d1d27078dfb60b7daa5a3e40391ad12e443fffff6d5c7e20\"},\"lead-plan.txt\":{\"bytes\":19,\"sha256\":\"333a509882dba63c9d09b25e63d59a7d9fdefba0026428dfa6f78b4feee2c2d7\"},\"planner-session.jsonl\":{\"bytes\":560,\"sha256\":\"c01b20a33265d4fbfbc478f5ba8578d203ddd8deb785d8830fc5d130eb561766\"},\"planner-stop.json\":{\"bytes\":391,\"sha256\":\"13914414cbbc8de8e1a363a97bba14b3eb3449e8044eeed3b87c21a8fdc0fc16\"}},\"status\":\"no_hypothesis\",\"terminal_line\":4,\"terminal_record_sha256\":\"19d62b0b6045b529b9bd78dd5e7ac480ca6069e62fbe1261cb546f7a906da0f5\",\"workflow_validity\":\"not_assessed\"}\r\n",
+      "expected": {
+        "job_id": "verifier-synthetic-independent-20261013",
+        "job_contract_sha256": "e3b30516560837aa785947cd569f9addb196aecbf61f6c8f2554fa702498b367",
+        "contract_sha256": "2eb4e723cdd5a7e4d2d9ceca1b36a059d1202640bbc03ab2c2d94817d0d3d8a9"
+      },
+      "expected_candidate_count": 0
+    },
+    {
+      "id": "planner-01-valid-windows-no-terminal-lf",
+      "source_family": "planner_completion",
+      "source_origin": "test_fixture",
+      "upstream_basename": "verifier-synthetic-01-valid-windows-no-terminal-lf-cli.stdout.log",
+      "upstream_caller_pins_basename": "verifier-synthetic-01-valid-windows-no-terminal-lf-cli.command.json",
+      "upstream_caller_pins_raw_sha256": "2ab3e86fc9331abfda9bc69f8185d87e6965e384798d0b04f5e1088aa1c8270b",
+      "raw_sha256": "01e9714a60ecbed733428f81084443090c72a3506ea67aa289fa597224554cac",
+      "raw_byte_length": 1895,
+      "raw_report_utf8": "{\"assurance\":\"structural_only\",\"checker\":{\"assurance\":\"structural_only\",\"checks_executed\":false,\"contract_sha256\":\"2eb4e723cdd5a7e4d2d9ceca1b36a059d1202640bbc03ab2c2d94817d0d3d8a9\",\"diagnostics\":[],\"passed\":true,\"plan_sha256\":\"efeb5222ff1a910c339cca8055d2f95ba335f14de61ba9d6b73a9c7b4e68476c\",\"response_sha256\":\"3bafc71f10a1e792548650b6928e6c164bb66afabff2363f03be63fd8e6b81b6\",\"schema\":\"ephy.plan-completion-result.v1\",\"semantic_correctness\":\"not_assessed\",\"status\":\"complete\"},\"checker_input_sha256\":\"3bafc71f10a1e792548650b6928e6c164bb66afabff2363f03be63fd8e6b81b6\",\"checks_executed\":false,\"completed\":true,\"diagnostics\":[],\"formal_adoption\":\"not_assessed\",\"job_contract_sha256\":\"e3b30516560837aa785947cd569f9addb196aecbf61f6c8f2554fa702498b367\",\"job_id\":\"verifier-synthetic-independent-20261013\",\"lead_plan_representation\":\"windows_write_text\",\"original_text_sha256\":\"efeb5222ff1a910c339cca8055d2f95ba335f14de61ba9d6b73a9c7b4e68476c\",\"provenance\":\"not_assessed\",\"schema\":\"ephy.planner-completion-evidence.v1\",\"semantic_correctness\":\"not_assessed\",\"snapshot_sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"source_bindings_valid\":true,\"source_files\":{\"completion-contract\":{\"bytes\":1142,\"sha256\":\"2eb4e723cdd5a7e4d2d9ceca1b36a059d1202640bbc03ab2c2d94817d0d3d8a9\"},\"job.json\":{\"bytes\":1964,\"sha256\":\"c6ba340ac501d0218e951026313c8906a196b04ad0d5e66c850611199135ab5b\"},\"lead-plan.txt\":{\"bytes\":730,\"sha256\":\"8d5950c5767c7c0bbc94d40744be764af5dfae7305d8e72e4a94b98baf3d2519\"},\"planner-session.jsonl\":{\"bytes\":1499,\"sha256\":\"b64fddd3ab8a125f942200a76fa2444977a66072e8e2cf9aaee5f3e077bfe0fa\"},\"planner-stop.json\":{\"bytes\":391,\"sha256\":\"c44db2b1d21d30710cf5f478d4bff3753ed5d7c055127f3efb48915e1705fbca\"}},\"status\":\"complete\",\"terminal_line\":4,\"terminal_record_sha256\":\"9b8d9b43bc8fd89af029dee3a88a4fb0cffd103eafde6b499f0475afb6f4455e\",\"workflow_validity\":\"not_assessed\"}\r\n",
+      "expected": {
+        "job_id": "verifier-synthetic-independent-20261013",
+        "job_contract_sha256": "e3b30516560837aa785947cd569f9addb196aecbf61f6c8f2554fa702498b367",
+        "contract_sha256": "2eb4e723cdd5a7e4d2d9ceca1b36a059d1202640bbc03ab2c2d94817d0d3d8a9"
+      },
+      "expected_candidate_count": 0
+    },
+    {
+      "id": "planner-27-saved-plan-byte-mismatch",
+      "source_family": "planner_completion",
+      "source_origin": "test_fixture",
+      "upstream_basename": "verifier-synthetic-27-saved-plan-byte-mismatch-cli.stdout.log",
+      "upstream_caller_pins_basename": "verifier-synthetic-27-saved-plan-byte-mismatch-cli.command.json",
+      "upstream_caller_pins_raw_sha256": "0ba060524ef17a5f3e7066e8a6814f05b95dbb81b694e11ad4508cc1c431952d",
+      "raw_sha256": "f9dc09380539b7b8a00daafb8de6508f23a1b93430c131b28ccb7bf9b4a8342d",
+      "raw_byte_length": 2003,
+      "raw_report_utf8": "{\"assurance\":\"structural_only\",\"checker\":{\"assurance\":\"structural_only\",\"checks_executed\":false,\"contract_sha256\":\"2eb4e723cdd5a7e4d2d9ceca1b36a059d1202640bbc03ab2c2d94817d0d3d8a9\",\"diagnostics\":[],\"passed\":true,\"plan_sha256\":\"efeb5222ff1a910c339cca8055d2f95ba335f14de61ba9d6b73a9c7b4e68476c\",\"response_sha256\":\"3bafc71f10a1e792548650b6928e6c164bb66afabff2363f03be63fd8e6b81b6\",\"schema\":\"ephy.plan-completion-result.v1\",\"semantic_correctness\":\"not_assessed\",\"status\":\"complete\"},\"checker_input_sha256\":\"3bafc71f10a1e792548650b6928e6c164bb66afabff2363f03be63fd8e6b81b6\",\"checks_executed\":false,\"completed\":false,\"diagnostics\":[{\"code\":\"lead_plan_mismatch\",\"message\":\"Saved plan does not match either exact writer form.\",\"path\":\"lead-plan.txt\"}],\"formal_adoption\":\"not_assessed\",\"job_contract_sha256\":\"e3b30516560837aa785947cd569f9addb196aecbf61f6c8f2554fa702498b367\",\"job_id\":\"verifier-synthetic-independent-20261013\",\"lead_plan_representation\":null,\"original_text_sha256\":\"efeb5222ff1a910c339cca8055d2f95ba335f14de61ba9d6b73a9c7b4e68476c\",\"provenance\":\"not_assessed\",\"schema\":\"ephy.planner-completion-evidence.v1\",\"semantic_correctness\":\"not_assessed\",\"snapshot_sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"source_bindings_valid\":false,\"source_files\":{\"completion-contract\":{\"bytes\":1142,\"sha256\":\"2eb4e723cdd5a7e4d2d9ceca1b36a059d1202640bbc03ab2c2d94817d0d3d8a9\"},\"job.json\":{\"bytes\":1964,\"sha256\":\"c6ba340ac501d0218e951026313c8906a196b04ad0d5e66c850611199135ab5b\"},\"lead-plan.txt\":{\"bytes\":689,\"sha256\":\"3b2db4e03e9d0b0e6c7f47355e4f6f56ae7b4c3e5898894776257565b31adb1a\"},\"planner-session.jsonl\":{\"bytes\":1499,\"sha256\":\"b64fddd3ab8a125f942200a76fa2444977a66072e8e2cf9aaee5f3e077bfe0fa\"},\"planner-stop.json\":{\"bytes\":391,\"sha256\":\"c44db2b1d21d30710cf5f478d4bff3753ed5d7c055127f3efb48915e1705fbca\"}},\"status\":\"invalid_source\",\"terminal_line\":4,\"terminal_record_sha256\":\"9b8d9b43bc8fd89af029dee3a88a4fb0cffd103eafde6b499f0475afb6f4455e\",\"workflow_validity\":\"not_assessed\"}\r\n",
+      "expected": {
+        "job_id": "verifier-synthetic-independent-20261013",
+        "job_contract_sha256": "e3b30516560837aa785947cd569f9addb196aecbf61f6c8f2554fa702498b367",
+        "contract_sha256": "2eb4e723cdd5a7e4d2d9ceca1b36a059d1202640bbc03ab2c2d94817d0d3d8a9"
+      },
+      "expected_candidate_count": 0
+    },
+    {
+      "id": "trial-complete",
+      "source_family": "trial_reconciliation",
+      "source_origin": "test_fixture",
+      "upstream_basename": "complete.stdout.json",
+      "upstream_caller_pins_basename": "trusted-synthetic-commitments.json",
+      "upstream_caller_pins_raw_sha256": "4926de8aadccc469cc4fa0e03f77d37d77f8d8bcbe77cf9a39ecfc799e425b89",
+      "raw_sha256": "1b517fb0aeb19d89b596cc919d56382e5348c9c9530d8262e39a23abd7e0c354",
+      "raw_byte_length": 4685,
+      "raw_report_utf8": "{\r\n  \"schema_version\": 1,\r\n  \"ok\": true,\r\n  \"plan_id\": \"synthetic-control\",\r\n  \"plan_sha256\": \"8be2d58eac5ed5c1a520711e9298102071a7889f45c95b940a3d839f18891b70\",\r\n  \"execution_ledger_sha256\": \"ddaef012ebeca789b682658c0df51f867e396e96390f0b7c4babff88fb73e7fb\",\r\n  \"axis\": \"model\",\r\n  \"evidence_kind\": \"synthetic\",\r\n  \"expected_runs\": 8,\r\n  \"supplied_runs\": 8,\r\n  \"missing_run_ids\": [],\r\n  \"unexpected_run_ids\": [],\r\n  \"duplicate_run_ids\": [],\r\n  \"duplicate_trials\": [],\r\n  \"mismatches\": [],\r\n  \"validation_unexecuted_run_ids\": [],\r\n  \"missing_execution_record_ids\": [],\r\n  \"unexpected_execution_record_ids\": [],\r\n  \"not_executed_run_ids\": [],\r\n  \"missing_raw_result_ids\": [],\r\n  \"unexpected_raw_result_ids\": [],\r\n  \"duplicate_raw_result_ids\": [],\r\n  \"evidence_mismatches\": [],\r\n  \"record_integrity_verified\": true,\r\n  \"execution_verified\": false,\r\n  \"comparison\": {\r\n    \"schema_version\": 1,\r\n    \"axis\": \"model\",\r\n    \"evidence_kind\": \"synthetic\",\r\n    \"coverage\": \"supplied_records_only; not attestation of a predeclared complete plan\",\r\n    \"fixed_conditions\": {\r\n      \"task-a\": {\r\n        \"suite_id\": \"synthetic-suite\",\r\n        \"suite_sha256\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\r\n        \"task_sha256\": \"961fb2ebc28ccff34c72db9e0ae0356acea400eee2486b7b0ca21219a54c41dd\",\r\n        \"checker_sha256\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\r\n        \"environment_sha256\": \"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\r\n        \"budget_sha256\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\r\n        \"variant_sha256\": \"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"\r\n      },\r\n      \"task-b\": {\r\n        \"suite_id\": \"synthetic-suite\",\r\n        \"suite_sha256\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\r\n        \"task_sha256\": \"8182f5272a1b5b622588f3e4357878620b7626553854b4a8200548a6ed7fb0c0\",\r\n        \"checker_sha256\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\r\n        \"environment_sha256\": \"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\r\n        \"budget_sha256\": \"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\r\n        \"variant_sha256\": \"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"\r\n      }\r\n    },\r\n    \"summaries\": [\r\n      {\r\n        \"group\": \"model-a\",\r\n        \"variable_sha256\": \"a36cd1c134b3ea75f93cb7677de481c304da7f2a4bc643c365c11817fa51e9b8\",\r\n        \"task_id\": \"task-a\",\r\n        \"runs\": 2,\r\n        \"succeeded\": 2,\r\n        \"pipeline_success_rate\": 1.0,\r\n        \"validation_unexecuted\": 0,\r\n        \"median_wall_time_all_seconds\": 1.5,\r\n        \"median_wall_time_success_seconds\": 1.5,\r\n        \"failure_counts\": {}\r\n      },\r\n      {\r\n        \"group\": \"model-a\",\r\n        \"variable_sha256\": \"a36cd1c134b3ea75f93cb7677de481c304da7f2a4bc643c365c11817fa51e9b8\",\r\n        \"task_id\": \"task-b\",\r\n        \"runs\": 2,\r\n        \"succeeded\": 2,\r\n        \"pipeline_success_rate\": 1.0,\r\n        \"validation_unexecuted\": 0,\r\n        \"median_wall_time_all_seconds\": 3.5,\r\n        \"median_wall_time_success_seconds\": 3.5,\r\n        \"failure_counts\": {}\r\n      },\r\n      {\r\n        \"group\": \"model-b\",\r\n        \"variable_sha256\": \"e74eda57b09dcec09a4699a5310325b157046eff3e6d8b10de2a090a7790f502\",\r\n        \"task_id\": \"task-a\",\r\n        \"runs\": 2,\r\n        \"succeeded\": 2,\r\n        \"pipeline_success_rate\": 1.0,\r\n        \"validation_unexecuted\": 0,\r\n        \"median_wall_time_all_seconds\": 5.5,\r\n        \"median_wall_time_success_seconds\": 5.5,\r\n        \"failure_counts\": {}\r\n      },\r\n      {\r\n        \"group\": \"model-b\",\r\n        \"variable_sha256\": \"e74eda57b09dcec09a4699a5310325b157046eff3e6d8b10de2a090a7790f502\",\r\n        \"task_id\": \"task-b\",\r\n        \"runs\": 2,\r\n        \"succeeded\": 2,\r\n        \"pipeline_success_rate\": 1.0,\r\n        \"validation_unexecuted\": 0,\r\n        \"median_wall_time_all_seconds\": 7.5,\r\n        \"median_wall_time_success_seconds\": 7.5,\r\n        \"failure_counts\": {}\r\n      }\r\n    ],\r\n    \"run_ids\": [\r\n      \"model-a-task-a-1\",\r\n      \"model-a-task-a-2\",\r\n      \"model-a-task-b-1\",\r\n      \"model-a-task-b-2\",\r\n      \"model-b-task-a-1\",\r\n      \"model-b-task-a-2\",\r\n      \"model-b-task-b-1\",\r\n      \"model-b-task-b-2\"\r\n    ],\r\n    \"interpretation\": \"Descriptive pipeline statistics only; no ranking, causal claim, or adoption decision.\"\r\n  },\r\n  \"coverage\": \"exact records/raw results match to committed plan and ledger\",\r\n  \"interpretation\": \"Integrity relative to trusted plan/recorder commitments only; not proof of chronology, execution, budget enforcement, model improvement, formal workflow or adoption.\"\r\n}\r\n",
+      "expected": {
+        "plan_id": "synthetic-control",
+        "axis": "model",
+        "evidence_kind": "synthetic",
+        "plan_sha256": "8be2d58eac5ed5c1a520711e9298102071a7889f45c95b940a3d839f18891b70",
+        "execution_ledger_sha256": "ddaef012ebeca789b682658c0df51f867e396e96390f0b7c4babff88fb73e7fb"
+      },
+      "expected_candidate_count": 0
+    },
+    {
+      "id": "trial-all-results-missing",
+      "source_family": "trial_reconciliation",
+      "source_origin": "test_fixture",
+      "upstream_basename": "all-results-missing.stdout.json",
+      "upstream_caller_pins_basename": "trusted-synthetic-commitments.json",
+      "upstream_caller_pins_raw_sha256": "4926de8aadccc469cc4fa0e03f77d37d77f8d8bcbe77cf9a39ecfc799e425b89",
+      "raw_sha256": "55ea9fd5380af6d83aa2f6a5174a72c4139d73f5e4cb8c7ff8a0e8b68439c025",
+      "raw_byte_length": 1522,
+      "raw_report_utf8": "{\r\n  \"schema_version\": 1,\r\n  \"ok\": false,\r\n  \"plan_id\": \"synthetic-control\",\r\n  \"plan_sha256\": \"8be2d58eac5ed5c1a520711e9298102071a7889f45c95b940a3d839f18891b70\",\r\n  \"execution_ledger_sha256\": \"ddaef012ebeca789b682658c0df51f867e396e96390f0b7c4babff88fb73e7fb\",\r\n  \"axis\": \"model\",\r\n  \"evidence_kind\": \"synthetic\",\r\n  \"expected_runs\": 8,\r\n  \"supplied_runs\": 0,\r\n  \"missing_run_ids\": [\r\n    \"model-a-task-a-1\",\r\n    \"model-a-task-a-2\",\r\n    \"model-a-task-b-1\",\r\n    \"model-a-task-b-2\",\r\n    \"model-b-task-a-1\",\r\n    \"model-b-task-a-2\",\r\n    \"model-b-task-b-1\",\r\n    \"model-b-task-b-2\"\r\n  ],\r\n  \"unexpected_run_ids\": [],\r\n  \"duplicate_run_ids\": [],\r\n  \"duplicate_trials\": [],\r\n  \"mismatches\": [],\r\n  \"validation_unexecuted_run_ids\": [],\r\n  \"missing_execution_record_ids\": [],\r\n  \"unexpected_execution_record_ids\": [],\r\n  \"not_executed_run_ids\": [],\r\n  \"missing_raw_result_ids\": [\r\n    \"model-a-task-a-1\",\r\n    \"model-a-task-a-2\",\r\n    \"model-a-task-b-1\",\r\n    \"model-a-task-b-2\",\r\n    \"model-b-task-a-1\",\r\n    \"model-b-task-a-2\",\r\n    \"model-b-task-b-1\",\r\n    \"model-b-task-b-2\"\r\n  ],\r\n  \"unexpected_raw_result_ids\": [],\r\n  \"duplicate_raw_result_ids\": [],\r\n  \"evidence_mismatches\": [],\r\n  \"record_integrity_verified\": false,\r\n  \"execution_verified\": false,\r\n  \"comparison\": null,\r\n  \"coverage\": \"incomplete or mismatched evidence\",\r\n  \"interpretation\": \"Integrity relative to trusted plan/recorder commitments only; not proof of chronology, execution, budget enforcement, model improvement, formal workflow or adoption.\"\r\n}\r\n",
+      "expected": {
+        "plan_id": "synthetic-control",
+        "axis": "model",
+        "evidence_kind": "synthetic",
+        "plan_sha256": "8be2d58eac5ed5c1a520711e9298102071a7889f45c95b940a3d839f18891b70",
+        "execution_ledger_sha256": "ddaef012ebeca789b682658c0df51f867e396e96390f0b7c4babff88fb73e7fb"
+      },
+      "expected_candidate_count": 1
+    },
+    {
+      "id": "trial-same-id-substitution",
+      "source_family": "trial_reconciliation",
+      "source_origin": "test_fixture",
+      "upstream_basename": "same-id-substitution.stdout.json",
+      "upstream_caller_pins_basename": "trusted-synthetic-commitments.json",
+      "upstream_caller_pins_raw_sha256": "4926de8aadccc469cc4fa0e03f77d37d77f8d8bcbe77cf9a39ecfc799e425b89",
+      "raw_sha256": "982f2e1632df889a2e29e4056eae1fd65baf8edd7bb54ab1370ffcc87b57b253",
+      "raw_byte_length": 1340,
+      "raw_report_utf8": "{\r\n  \"schema_version\": 1,\r\n  \"ok\": false,\r\n  \"plan_id\": \"synthetic-control\",\r\n  \"plan_sha256\": \"8be2d58eac5ed5c1a520711e9298102071a7889f45c95b940a3d839f18891b70\",\r\n  \"execution_ledger_sha256\": \"ddaef012ebeca789b682658c0df51f867e396e96390f0b7c4babff88fb73e7fb\",\r\n  \"axis\": \"model\",\r\n  \"evidence_kind\": \"synthetic\",\r\n  \"expected_runs\": 8,\r\n  \"supplied_runs\": 8,\r\n  \"missing_run_ids\": [],\r\n  \"unexpected_run_ids\": [],\r\n  \"duplicate_run_ids\": [],\r\n  \"duplicate_trials\": [],\r\n  \"mismatches\": [],\r\n  \"validation_unexecuted_run_ids\": [],\r\n  \"missing_execution_record_ids\": [],\r\n  \"unexpected_execution_record_ids\": [],\r\n  \"not_executed_run_ids\": [],\r\n  \"missing_raw_result_ids\": [],\r\n  \"unexpected_raw_result_ids\": [],\r\n  \"duplicate_raw_result_ids\": [],\r\n  \"evidence_mismatches\": [\r\n    {\r\n      \"run_id\": \"model-a-task-a-1\",\r\n      \"fields\": [\r\n        \"execution.record_sha256\",\r\n        \"execution.result_sha256\",\r\n        \"raw_result.result_sha256\",\r\n        \"raw_result.wall_time\"\r\n      ]\r\n    }\r\n  ],\r\n  \"record_integrity_verified\": false,\r\n  \"execution_verified\": false,\r\n  \"comparison\": null,\r\n  \"coverage\": \"incomplete or mismatched evidence\",\r\n  \"interpretation\": \"Integrity relative to trusted plan/recorder commitments only; not proof of chronology, execution, budget enforcement, model improvement, formal workflow or adoption.\"\r\n}\r\n",
+      "expected": {
+        "plan_id": "synthetic-control",
+        "axis": "model",
+        "evidence_kind": "synthetic",
+        "plan_sha256": "8be2d58eac5ed5c1a520711e9298102071a7889f45c95b940a3d839f18891b70",
+        "execution_ledger_sha256": "ddaef012ebeca789b682658c0df51f867e396e96390f0b7c4babff88fb73e7fb"
+      },
+      "expected_candidate_count": 1
+    },
+    {
+      "id": "trial-raw-body-substitution",
+      "source_family": "trial_reconciliation",
+      "source_origin": "test_fixture",
+      "upstream_basename": "raw-body-substitution.stdout.json",
+      "upstream_caller_pins_basename": "trusted-synthetic-commitments.json",
+      "upstream_caller_pins_raw_sha256": "4926de8aadccc469cc4fa0e03f77d37d77f8d8bcbe77cf9a39ecfc799e425b89",
+      "raw_sha256": "68b769ca7d7fec0bc7e63d5b61784b59542926b65c22edd03d96c6df7f4b50ea",
+      "raw_byte_length": 1275,
+      "raw_report_utf8": "{\r\n  \"schema_version\": 1,\r\n  \"ok\": false,\r\n  \"plan_id\": \"synthetic-control\",\r\n  \"plan_sha256\": \"8be2d58eac5ed5c1a520711e9298102071a7889f45c95b940a3d839f18891b70\",\r\n  \"execution_ledger_sha256\": \"ddaef012ebeca789b682658c0df51f867e396e96390f0b7c4babff88fb73e7fb\",\r\n  \"axis\": \"model\",\r\n  \"evidence_kind\": \"synthetic\",\r\n  \"expected_runs\": 8,\r\n  \"supplied_runs\": 8,\r\n  \"missing_run_ids\": [],\r\n  \"unexpected_run_ids\": [],\r\n  \"duplicate_run_ids\": [],\r\n  \"duplicate_trials\": [],\r\n  \"mismatches\": [],\r\n  \"validation_unexecuted_run_ids\": [],\r\n  \"missing_execution_record_ids\": [],\r\n  \"unexpected_execution_record_ids\": [],\r\n  \"not_executed_run_ids\": [],\r\n  \"missing_raw_result_ids\": [],\r\n  \"unexpected_raw_result_ids\": [],\r\n  \"duplicate_raw_result_ids\": [],\r\n  \"evidence_mismatches\": [\r\n    {\r\n      \"run_id\": \"model-a-task-a-1\",\r\n      \"fields\": [\r\n        \"execution.raw_result_sha256\",\r\n        \"raw_result.result_sha256\"\r\n      ]\r\n    }\r\n  ],\r\n  \"record_integrity_verified\": false,\r\n  \"execution_verified\": false,\r\n  \"comparison\": null,\r\n  \"coverage\": \"incomplete or mismatched evidence\",\r\n  \"interpretation\": \"Integrity relative to trusted plan/recorder commitments only; not proof of chronology, execution, budget enforcement, model improvement, formal workflow or adoption.\"\r\n}\r\n",
+      "expected": {
+        "plan_id": "synthetic-control",
+        "axis": "model",
+        "evidence_kind": "synthetic",
+        "plan_sha256": "8be2d58eac5ed5c1a520711e9298102071a7889f45c95b940a3d839f18891b70",
+        "execution_ledger_sha256": "ddaef012ebeca789b682658c0df51f867e396e96390f0b7c4babff88fb73e7fb"
+      },
+      "expected_candidate_count": 1
+    }
+  ]
+}
