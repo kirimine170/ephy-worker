@@ -303,13 +303,11 @@ class WorkerService:
                 )
                 if cancel_event.is_set() or lost_event.is_set():
                     code = "cancelled_by_requester" if cancel_event.is_set() else "worker_lease_lost"
-                    recorded = {entry["query_id"] for entry in stage.queries}
-                    for entry in job["input"]["queries"]:
-                        if entry["query_id"] not in recorded:
-                            stage.queries.append({"query_id": entry["query_id"], "text": entry["text"],
-                                "role": entry["role"], "reason": entry["reason"], "status": "failed",
-                                "result_count": 0, "diagnostic": {"code": code, "result_count": 0}})
-                            stage.failures.append({"stage": "search", "query_id": entry["query_id"], "code": code})
+                    for entry in job["input"]["queries"][len(stage.queries):]:
+                        stage.queries.append({"query_id": entry["query_id"], "text": entry["text"],
+                            "role": entry["role"], "reason": entry["reason"], "status": "failed",
+                            "result_count": 0, "diagnostic": {"code": code, "result_count": 0}})
+                        stage.failures.append({"stage": "search", "query_id": entry["query_id"], "code": code})
                 return stage
             finally:
                 if owned:
