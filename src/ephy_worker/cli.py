@@ -84,6 +84,13 @@ def parser() -> argparse.ArgumentParser:
     evaluation_run.add_argument("--repeat", type=int, default=1)
     evaluation_run.add_argument("--profiles", type=Path, help="coding model profile YAML")
     evaluation_run.add_argument("--output-dir", type=Path, help="Git外のevaluation artifact root")
+    discord = sub.add_parser("discord", help="許可制Discord調査adapter（実接続はopt-in）")
+    discord_sub = discord.add_subparsers(dest="discord_command", required=True)
+    for name in ("check", "run", "register"):
+        command = discord_sub.add_parser(name)
+        command.add_argument("--config", required=True, type=Path)
+        if name != "check":
+            command.add_argument("--connect", action="store_true", help="実Discord接続を明示的に許可")
     return root
 
 
@@ -239,6 +246,10 @@ async def _run_job_command(config, args) -> int:
 
 
 async def dispatch(args) -> int:
+    if args.command == "discord":
+        from .discord_cli import run_command
+
+        return await run_command(args)
     if args.command == "coding":
         from .coding_cli import run_coding_command, run_coding_verify_command
 
