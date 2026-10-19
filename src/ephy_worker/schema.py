@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from typing import Literal
 
@@ -207,9 +208,125 @@ class Review(ProseModel):
     gaps: list[str] = Field(default_factory=list, max_length=8)
 
 
+class Coverage(StrictModel):
+    subquestion: int = Field(ge=0, le=7)
+    claim_ids: list[str] = Field(min_length=1, max_length=10)
+
+
+class GapResolution(StrictModel):
+    gap: str = Field(min_length=1, max_length=2000)
+    claim_ids: list[str] = Field(min_length=1, max_length=10)
+
+
+class AdaptiveReview(Review):
+    coverage: list[Coverage] = Field(default_factory=list, max_length=8)
+    resolutions: list[GapResolution] = Field(default_factory=list, max_length=8)
+
+    @classmethod
+    def model_wire_type(cls) -> type[BaseModel]:
+        return AdaptiveReviewWire
+
+    @classmethod
+    def model_from_wire(cls, value: BaseModel, *, prompt: str) -> AdaptiveReview:
+        """Bind every flat row to the actual request before canonical review gates．"""
+        wire = AdaptiveReviewWire.model_validate(value.model_dump(), strict=True)
+        try:
+            data = json.loads(prompt.split("INPUT_DATA_JSON:\n", 1)[1])
+            claims, evidence = data["claims"], data["evidence"]
+            claim_ids = [c["claim_id"] for c in claims]
+            evidence_ids = [e["evidence_id"] for e in evidence]
+            owners = [(key, c["claim_id"]) for c in claims for key in c["evidence_ids"]]
+            if (len(claim_ids) != len(set(claim_ids)) or len(evidence_ids) != len(set(evidence_ids))
+                    or len(owners) != len({key for key, _ in owners})
+                    or {key for key, _ in owners} != set(evidence_ids)):
+                raise ValueError
+            expected = dict(owners)
+            actual_claims = [c.claim_id for c in wire.claim_checks]
+            actual_evidence = [e.evidence_id for e in wire.evidence_checks]
+            if (len(actual_claims) != len(set(actual_claims)) or set(actual_claims) != set(claim_ids)
+                    or len(actual_evidence) != len(set(actual_evidence)) or set(actual_evidence) != set(evidence_ids)
+                    or any(expected[e.evidence_id] != e.claim_id for e in wire.evidence_checks)):
+                raise ValueError
+            # References cannot introduce owners，passages or source identities absent from input．
+            source_ids = [s["source_id"] for s in data["sources"]]
+            passage_ids = [p["passage_id"] for p in data["passages"]]
+            sources = set(source_ids)
+            passages = {p["passage_id"]: p for p in data["passages"]}
+            if (len(source_ids) != len(sources) or len(passage_ids) != len(passages)
+                    or any(e["source_id"] not in sources or e["passage_id"] not in passages
+                   or passages[e["passage_id"]]["source_id"] != e["source_id"] for e in evidence)):
+                raise ValueError
+            previous_ids = [c["claim_id"] for c in data.get("previous_claims_reference", [])]
+            if len(previous_ids) != len(set(previous_ids)) or set(previous_ids) & set(claim_ids):
+                raise ValueError
+            known = set(claim_ids) | set(previous_ids)
+            if any(len(c.inference_from) != len(set(c.inference_from))
+                   or not set(c.inference_from) <= known for c in wire.claim_checks):
+                raise ValueError
+            if len(wire.coverage) != len({c.subquestion for c in wire.coverage}):
+                raise ValueError
+            if any(c.subquestion >= len(data["subquestions"]) or len(c.claim_ids) != len(set(c.claim_ids))
+                   or not set(c.claim_ids) <= known for c in wire.coverage):
+                raise ValueError
+            if len(wire.resolutions) != len({r.gap for r in wire.resolutions}):
+                raise ValueError
+            if any(r.gap not in data["previous_gaps"] or len(r.claim_ids) != len(set(r.claim_ids))
+                   or not set(r.claim_ids) <= set(claim_ids) for r in wire.resolutions):
+                raise ValueError
+        except (KeyError, IndexError, TypeError, ValueError):
+            raise ValueError("adaptive_review_wire_invalid") from None
+        return cls(checks=[ClaimCheck(**c.model_dump(), evidence_checks=[
+            EvidenceCheck(**e.model_dump(exclude={"claim_id"}))
+            for e in wire.evidence_checks if e.claim_id == c.claim_id]) for c in wire.claim_checks],
+            coverage=wire.coverage, resolutions=wire.resolutions,
+            gaps=wire.gaps, additional_queries=wire.additional_queries)
+
+
+class AdaptiveClaimCheck(ProseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    claim_id: str
+    status: ClaimStatus
+    reason: str = Field(min_length=1, max_length=2000)
+    conditions: str = ""
+    uncertainty: list[str] = Field(default_factory=list, max_length=8)
+    inference_from: list[str] = Field(default_factory=list, max_length=8)
+
+
+class AdaptiveEvidenceCheck(EvidenceCheck):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    claim_id: str
+
+
+class AdaptiveReviewWire(ProseModel):
+    """Flat provider schema；canonical public callers continue to use AdaptiveReview．"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    claim_checks: list[AdaptiveClaimCheck] = Field(max_length=10)
+    evidence_checks: list[AdaptiveEvidenceCheck] = Field(max_length=80)
+    coverage: list[Coverage] = Field(default_factory=list, max_length=8)
+    resolutions: list[GapResolution] = Field(default_factory=list, max_length=8)
+    additional_queries: list[Query] = Field(default_factory=list, max_length=3)
+    gaps: list[str] = Field(default_factory=list, max_length=8)
+
+
 class Selection(StrictModel):
     urls: list[str] = Field(min_length=1, max_length=6)
     reason: str = Field(max_length=1500)
+
+
+class AcquisitionResolution(StrictModel):
+    """Worker-issued dependency decision；never an extract/review model output．"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    version: Literal["unused-html-v1"] = "unused-html-v1"
+    failure_index: int = Field(ge=0)
+    stage: Literal["fetch"] = "fetch"
+    code: str
+    source_id: str
+    source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    supporting_claim_ids: list[str] = Field(min_length=1, max_length=10)
+    round_number: int = Field(ge=0, le=5)
+    resolved_at: str
 
 
 class Report(StrictModel):
@@ -232,6 +349,7 @@ class Report(StrictModel):
     claims: list[Claim] = Field(default_factory=list)
     gaps: list[str] = Field(default_factory=list)
     failures: list[dict] = Field(default_factory=list)
+    acquisition_resolutions: list[AcquisitionResolution] = Field(default_factory=list, max_length=30)
     rounds: list[dict] = Field(default_factory=list)
     metrics: dict = Field(default_factory=dict)
     activity_summary: str = ""

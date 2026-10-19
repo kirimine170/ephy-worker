@@ -32,6 +32,8 @@ Coding Evaluation MVPは，Pi RPC adapter，detached worktree，deterministic mo
 
 無料枠向けのTavily検索providerを追加しました．無料プラン・使用量・残量を検索前に確認し，basic検索を最大10credit／Jobに制限します．利用者実行のdoctorで使用量API・実検索1回・Qwen接続の成功を確認しました．`paygo_limit`のnullは未報告として保持し，無料枠の残量で制限します．設定・`doctor --usage-only`の診断手順と検証範囲は[Tavily検証](docs/tavily-validation.md)を参照してください．
 
+Discordの公開情報調査を受け付けるopt-inの実mention adapterを試作しています．設定，オフライン検証，実接続前の判断は[Discord adapter](docs/discord-chat.md)を参照してください．継続会話・会計承認はRuntimeの責務であり，本試作には含まれません．
+
 ## Architecture
 
 `config`／`models`／`search`／`fetch`／`extraction`／`evidence`／`research`／`report`／`store`をCLIから分離しています．Phase 2では`collector`／`manager`／`worker_service`を追加し，調査判断と資料収集を契約0.4で分けます．[Phase 1設計](docs/adr/0001-phase1-public-research.md)，[Phase 2設計](docs/adr/0003-phase2-distributed-collection.md)，[処理境界](docs/architecture.md)を参照してください．Workerはモデルにshell・ファイル・credential・URL取得のtoolを渡しません．

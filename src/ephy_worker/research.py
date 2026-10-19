@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import platform
+import re
 import time
 from importlib.metadata import version
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from .budget import Budget, BudgetExceeded
-from .schema import Candidate, Extraction, Plan, Report, Review, Selection, utc_now
+from .schema import AdaptiveReview, Candidate, Extraction, Plan, Report, Review, Selection, utc_now
 from .store import JobStore
 
 SAFETY = """日本語の公開資料調査です．句読点は，と．を使います．
@@ -38,14 +39,18 @@ def prompt(task: str, data: dict) -> str:
 
 class ResearchExecutor:
     def __init__(
-        self, config, profile_id: str, store: JobStore, *, model=None, search=None, fetcher=None, collector=None
+        self, config, profile_id: str, store: JobStore, *, model=None, search=None, fetcher=None, collector=None,
+        budget: Budget | None = None, adaptive: bool = False, final_reserve_seconds: float = 0,
     ):
         from .fetch import PublicFetcher
         from .models import ModelRunner
         from .search import create_search_provider
 
         self.config = config
-        self.budget = Budget(config.limits)
+        self.budget = budget if budget is not None else Budget(config.limits)
+        self.adaptive = adaptive and collector is None
+        self.final_reserve_seconds = final_reserve_seconds if self.adaptive else 0
+        self.coverage: dict[str, list[str]] = {}
         self.store = store
         self.profile_id = profile_id
         self.model = model or ModelRunner(config.model_profiles[profile_id], self.budget)
@@ -65,17 +70,100 @@ class ResearchExecutor:
     def event(self, kind: str, **details) -> None:
         self.store.event(kind, **details)
 
+    def adaptive_passages(self, ranked, relevance: str):
+        """Collapse identical usable bodies only in the selection view，then refill．"""
+        from .evidence import _tokens, select_passages
+
+        groups, representatives, by_body = [], [], {}
+        for source in self.report.sources:
+            usable = (source.status == "ok" and source.kind in {"html", "pdf"}
+                and source.http_status is not None and 200 <= source.http_status < 300
+                and source.bytes_received > 0 and source.extractor and source.body_hash
+                and re.fullmatch(r"[a-f0-9]{64}", source.body_hash) and source.passages
+                and all(p.source_id == source.source_id and p.text.strip() for p in source.passages))
+            key = (source.body_hash, source.kind, source.extractor,
+                   tuple((p.page, p.text) for p in source.passages)) if usable else None
+            if key is not None and key in by_body:
+                groups[by_body[key]]["source_ids"].append(source.source_id)
+            else:
+                if key is not None:
+                    by_body[key] = len(groups)
+                representatives.append(source)
+                groups.append({"representative_id": source.source_id, "source_ids": [source.source_id]})
+        limit = min(4, self.config.limits.selected_passages)
+        duplicates = any(len(group["source_ids"]) > 1 for group in groups)
+        if not duplicates:
+            selected = ranked[:limit]
+            reasons = [{"passage_id": p.passage_id, "reason": "general_relevance",
+                        "query_id": None, "role": None} for p in selected]
+        else:
+            distinct = select_passages(representatives, relevance, self.config.limits.selected_passages)
+            # Existing ranking puts one best passage per distinct source first．
+            selected = distinct[:min(limit, len({p.source_id for p in distinct}))]
+            reasons = [{"passage_id": p.passage_id, "reason": "distinct_body_coverage",
+                        "query_id": None, "role": None} for p in selected]
+            source_map = {s.source_id: s for s in self.report.sources}
+            provenance = {g["representative_id"]: {query_id for sid in g["source_ids"]
+                          for query_id in source_map[sid].query_ids} for g in groups}
+            queries = sorted(enumerate(self.report.queries), key=lambda item: (item[1]["role"] != "primary", item[0]))
+            for _, query in queries:
+                if len(selected) >= limit:
+                    break
+                eligible = [s for s in representatives if query["query_id"] in provenance[s.source_id]]
+                for passage in select_passages(eligible, query["text"], self.config.limits.selected_passages):
+                    if (passage.passage_id not in {p.passage_id for p in selected}
+                            and _tokens(passage.text).keys() & _tokens(query["text"]).keys()):
+                        selected.append(passage)
+                        reasons.append({"passage_id": passage.passage_id, "reason": "query_role_relevance",
+                                        "query_id": query["query_id"], "role": query["role"]})
+                        if len(selected) >= limit:
+                            break
+            for passage in distinct:
+                if len(selected) >= limit:
+                    break
+                if passage.passage_id not in {p.passage_id for p in selected}:
+                    selected.append(passage)
+                    reasons.append({"passage_id": passage.passage_id, "reason": "general_relevance",
+                                    "query_id": None, "role": None})
+        self.event("passage_selection", stage="extract", version="body-representative-query-role-v1",
+                   representative_groups=groups, selection=reasons,
+                   selected_passage_ids=[p.passage_id for p in selected])
+        return selected
+
     async def call(self, output_type, task: str, data: dict, stage: str):
         self.budget.check()
+        if self.adaptive:
+            if self.budget.remaining_seconds <= self.final_reserve_seconds:
+                raise BudgetExceeded("research_time_reserved_for_answer")
+            if self.budget.counts["model_requests"] >= self.budget.limits.model_requests - 1:
+                raise BudgetExceeded("model_requests_reserved_for_answer")
         self.current_stage = stage
         self.event("stage_started", stage=stage)
-        from .models import estimate_tokens
+        from .models import estimate_tokens, model_wire_type
+
+        if self.adaptive and stage == "review":
+            omitted = {"claims": {"checked", "status", "reason"},
+                       "evidence": {"checked", "check_reason", "conditions_match", "is_primary", "quote_start", "quote_end", "quote_match"},
+                       "passages": {"start", "end"}}
+            data = dict(data)
+            for name, fields in omitted.items():
+                projected = []
+                for row in data[name]:
+                    remove = set(fields)
+                    if name == "claims" and row.get("reason") != "照合未完了．":
+                        remove.discard("reason")
+                    projected.append({key: value for key, value in row.items() if key not in remove})
+                data[name] = projected
+            projection = {"version": "adaptive-review-semantic-v1",
+                          "omitted_fields": {name: sorted(fields) for name, fields in omitted.items()}}
+            data["projection"] = projection
+            self.event("input_projection", stage=stage, **projection)
 
         metadata = self.model.metadata
         context = metadata.get("context_tokens")
         key = "passages" if stage == "extract" else "candidates" if stage == "select" else None
         if context and key:
-            schema_tokens = estimate_tokens(json.dumps(output_type.model_json_schema(), ensure_ascii=False))
+            schema_tokens = estimate_tokens(json.dumps(model_wire_type(output_type).model_json_schema(), ensure_ascii=False))
             reserve = metadata.get("max_output_tokens", 4096) + schema_tokens + 3072
             original_size = len(data[key])
             while len(data[key]) > 1 and estimate_tokens(prompt(task, data)) + reserve > context:
@@ -89,8 +177,17 @@ class ResearchExecutor:
                 )
         if stage == "extract":
             self.extraction_passage_ids = {p["passage_id"] for p in data["passages"]}
+            if self.adaptive:
+                self.event("passages_submitted", stage=stage, passage_ids=sorted(self.extraction_passage_ids),
+                           retained_count=len(self.extraction_passage_ids))
         started = time.monotonic()
         try:
+            if self.adaptive:
+                tokens = {"plan": 768, "select": 512, "extract": 1536, "repair_quotes": 1536, "review": 1536}[stage]
+                return await self.model.run(output_type, prompt(task, data), stage=stage,
+                    max_output_tokens=min(tokens, self.config.model_profiles[self.profile_id].max_output_tokens),
+                    timeout_seconds=min(self.config.model_profiles[self.profile_id].timeout_seconds,
+                        self.budget.remaining_seconds - self.final_reserve_seconds), schema_retries=0)
             return await self.model.run(output_type, prompt(task, data), stage=stage)
         finally:
             self.budget.stage_seconds[stage] += round(time.monotonic() - started, 3)
@@ -152,21 +249,30 @@ class ResearchExecutor:
         if not available:
             return []
         remaining = self.config.limits.max_sources - len(self.budget.source_keys)
-        target = min(self.config.limits.initial_sources if first else 3, remaining, len(available))
+        target = min((4 if self.adaptive else self.config.limits.initial_sources) if first else 3, remaining, len(available))
         if not target:
             return []
         # Prioritize explicit supplemental references and preserve their provenance．
         selected = [c for c in available if c.supplied][:target]
         others = [c for c in available if c not in selected]
         if others and len(selected) < target:
+            if self.adaptive and len(others) > 12:
+                self.event("input_bounded", stage="select", original_count=len(others), retained_count=12,
+                           reason="ranked_candidate_preview")
+            preview = others[:12] if self.adaptive else others[:40]
+            if self.adaptive and any(len(c.snippet) > 240 for c in preview):
+                self.event("input_bounded", stage="select", reason="snippet_character_cap", cap=240,
+                           affected_count=sum(len(c.snippet) > 240 for c in preview))
             selection = await self.call(
                 Selection,
                 f"問いに関連する一次資料，対象の相違点，制約を調べるため，候補から最大{target - len(selected)}件のURLを選んでください．"
-                "HTMLとテキストPDFが候補にあれば両方を含めます．URLを新規作成しないでください．snippetは選択のみに利用します．",
+                "HTMLとテキストPDFが候補にあれば両方を含めます．URLを新規作成しないでください．snippetは選択のみに利用します．"
+                + ("reasonは20字程度の短文で返します．" if self.adaptive else ""),
                 {
                     "question": self.report.question,
                     "subquestions": self.report.subquestions,
-                    "candidates": [c.model_dump() for c in others[:40]],
+                    "candidates": [{**c.model_dump(), "snippet": c.snippet[:240]} for c in preview]
+                    if self.adaptive else [c.model_dump() for c in preview],
                 },
                 "select",
             )
@@ -216,25 +322,37 @@ class ResearchExecutor:
     async def examine(self, round_number: int):
         from .evidence import apply_review, group_origins, select_passages, validate_extraction
 
-        passages = select_passages(
-            self.report.sources,
-            self.report.question
+        relevance = (self.report.question
             + " "
             + " ".join(
                 self.report.subquestions + self.report.gaps + [q["text"] for q in self.report.queries]
-            ),
-            self.config.limits.selected_passages,
-        )
+            ))
+        passages = select_passages(self.report.sources, relevance, self.config.limits.selected_passages)
+        if self.adaptive:
+            original_count = len(passages)
+            passage_limit = min(4, self.config.limits.selected_passages)
+            passages = self.adaptive_passages(passages, relevance)
+            self.event("input_bounded", stage="extract", original_count=original_count,
+                retained_count=len(passages), limit=passage_limit,
+                reason="adaptive_complete_passage_limit")
         if not passages:
             self.report.gaps.append("取得できた本文がなく，主張を検証できません．")
             return None
         self.report.origin_groups = group_origins(self.report.sources)
         extraction = await self.call(
             Extraction,
-            "問いに答える主要主張を最大5件抽出してください．日本語の短い主張ごとに実在するsource_id，passage_id，"
+            ("問いに答える主要主張を最大3件抽出してください．" if self.adaptive
+             else "問いに答える主要主張を最大5件抽出してください．")
+            + "日本語の短い主張ごとに実在するsource_id，passage_id，"
             "quoteは英語資料なら英語の原文のまま，50〜120文字の連続部分をコピーします．翻訳・省略記号・空白や改行の変更は禁止です．条件，版，日時，反証も残します．"
             "PDFの図表の画像理解・OCRは未対応です．資料末尾まで全文を確認済みと主張しないでください．"
-            "数値を丸めたりモデル名から推定したりしないでください．本文が小数を示すならその精度を維持します．資料ごとに値が異なる場合はどちらも残します．直接の根拠がない事項はclaimsへ断定せずgapsへ入れます．前roundと対立する本文があれば同じclaimに支持・反対の両方を対応させます．",
+            "数値を丸めたりモデル名から推定したりしないでください．本文が小数を示すならその精度を維持します．資料ごとに値が異なる場合はどちらも残します．直接の根拠がない事項はclaimsへ断定せずgapsへ入れます．前roundと対立する本文があれば同じclaimに支持・反対の両方を対応させます．"
+            + ("各確認項目へ直接答える根拠を優先します．各主張は70字以内の短文にします．"
+               "依頼に直接関係する主要主張だけを抽出し，周辺的な導入説明は追加しません．"
+               "直接支持する最も強い一次資料の短い引用をまず1件選びます．同じ内容の引用を重ねません．"
+               "一次資料がない場合の独立した裏取りや，条件差・反証の保持に必要な引用は省きません．"
+               "空のconditions/uncertainty，既定のimportanceは出力から省略できます．"
+               "主張・引用・条件の実在性は短さより優先します．" if self.adaptive else ""),
             {
                 "question": self.report.question,
                 "subquestions": self.report.subquestions,
@@ -304,7 +422,8 @@ class ResearchExecutor:
                 self.failure("repair_quotes", exc.code)
         # Newly proposed claims stay insufficient until separate review finishes successfully．
         # Preserve a prior completed round if a later model call fails or is cancelled．
-        if not self.report.claims:
+        initially_empty = not self.report.claims
+        if initially_empty:
             self.report.claims, self.report.evidence = claims, evidence
         self.report.gaps = list(dict.fromkeys(self.report.gaps + extraction.gaps + errors))
         for error in errors:
@@ -315,16 +434,33 @@ class ResearchExecutor:
         previous_evidence = self.report.evidence if previous_claims else []
         review_passage_ids = {e.passage_id for e in evidence + previous_evidence}
         review = await self.call(
-            Review,
+            AdaptiveReview if self.adaptive else Review,
             "前段とは別の照合です．各claimを漏れなく検査し，対応する全evidence_idを検査してください．"
             "引用の存在だけでは支持としません．主張と本文の条件・日時・versionの一致，支持・反証・文脈のみ，"
             "当該主張について一次資料と判断できるかを理由付きで判定します．数値の差を勝手に許容範囲や丸め誤差として消さないでください．精度の異なる値は条件不一致または未解決の差として明記します．"
             "同じ発行者や転載は独立した裏取りではありません．独立性unknownでcorroboratedにしません．"
             "矛盾を多数決で消しません．前roundの参考claimと新claimの矛盾も理由とgapsへ明記します．根拠がない場合は「今回の読取範囲で未確認」とし，資料全体に記載がないとは断定しません．図表画像が必要な主張はinsufficientです．"
             "不足や矛盾があれば具体的理由に対応する追加query（role=gap）を最大3件提案します．"
-            "statusはsupported_primary/corroborated/conflicting/insufficient/refuted/inferenceのいずれかです．",
+            "statusはsupported_primary/corroborated/conflicting/insufficient/refuted/inferenceのいずれかです．"
+            + ("各reasonは15〜25字の短い判定理由にします．引用本文やpassageを出力へ繰り返しません．"
+               "空のconditions/uncertainty/inference_from，空のgaps/additional_queries/resolutionsは省略できます．"
+               "実在する条件・不確実性・矛盾や必要な追加queryは省略しません．"
+               "短くしても全claimと全evidence_idを個別に検査し，evidence_checksを漏らしません．"
+               "coverageに各subquestionsの0始まりsubquestion番号と，その問いを直接支持する"
+               "今回または過去のpositive claim_idsを対応付けます．未確認の問いは対応を作りません．"
+               "resolutionsは解決したprevious_gapsの完全一致gapと，今回新たに支持されたclaim_idsだけを指定します．"
+               "引用や関連があるだけでcoverage/解決としません．"
+               '出力は次のflat形だけです：{"claim_checks":[{"claim_id":"入力ID","status":"判定",'
+               '"reason":"短い理由"}],"evidence_checks":[{"claim_id":"所有claimの入力ID",'
+               '"evidence_id":"入力ID","relation":"supports/contradicts/context_only",'
+               '"conditions_match":true,"is_primary":false,"reason":"短い理由"}],'
+               '"coverage":[{"subquestion":0,"claim_ids":["入力ID"]}]}．'
+               "claim_checksの中へevidence_checksを入れません．全claimとその全evidenceを一度ずつ返します．"
+               "conditions/uncertainty/inference_fromは該当claim_checks行に保持します．"
+               "resolutions/additional_queries/gapsは必要ならtop-levelへ追加します．" if self.adaptive else ""),
             {
                 "question": self.report.question,
+                **({"subquestions": self.report.subquestions, "previous_gaps": self.report.gaps} if self.adaptive else {}),
                 "claims": [c.model_dump() for c in claims],
                 "evidence": [e.model_dump() for e in evidence],
                 "passages": [
@@ -343,6 +479,9 @@ class ResearchExecutor:
                         "publisher": s.publisher,
                         "published_at": s.published_at,
                         "limitations": s.limitations,
+                        **({"requested_url": s.requested_url, "final_url": s.final_url, "kind": s.kind,
+                            "author": s.author, "metadata_evidence": s.metadata_evidence,
+                            "origin_urls": s.origin_urls} if self.adaptive else {}),
                     }
                     for s in self.report.sources
                 ],
@@ -351,7 +490,7 @@ class ResearchExecutor:
             "review",
         )
         checked = apply_review(claims, evidence, review, self.report.origin_groups)
-        if round_number == 0:
+        if round_number == 0 or self.adaptive and initially_empty:
             self.report.claims, self.report.evidence = checked, evidence
         else:
             # A later round cannot silently erase earlier contradictions or citations．
@@ -366,6 +505,9 @@ class ResearchExecutor:
     async def _execute(self, supplemental_urls: list[str]) -> None:
         if self.collector is not None:
             await self._execute_via_collector(supplemental_urls)
+            return
+        if self.adaptive:
+            await self._execute_adaptive(supplemental_urls)
             return
         plan = await self.call(
             Plan,
@@ -420,6 +562,129 @@ class ResearchExecutor:
             self.report.stop_reason = "additional_round_limit" if acquired else "no_new_evidence"
         elif not any(s.passages for s in self.report.sources):
             self.report.stop_reason = "no_readable_sources"
+
+    def _verified_coverage(self) -> bool:
+        from .answer_cache import positive_facts, verified_main_coverage
+
+        facts, _ = positive_facts(self.report)
+        return verified_main_coverage(self.report, facts)
+
+    def _adaptive_complete(self) -> bool:
+        from .answer_cache import complete_support, positive_facts, unresolved_failure_code
+
+        facts, reason = positive_facts(self.report)
+        return (reason == "ok" and complete_support(self.report, facts) and self._verified_coverage()
+                and unresolved_failure_code(self.report, facts) == "ok"
+                and all(c.checked and c.status in {"supported_primary", "corroborated"} for c in self.report.claims)
+                and not any(e.checked and e.relation == "contradicts" for e in self.report.evidence))
+
+    def _positive_material(self) -> dict[str, tuple]:
+        from .answer_cache import positive_facts
+
+        evidence = {e.evidence_id: e for e in self.report.evidence}
+        sources = {s.source_id: s for s in self.report.sources}
+        claims = {c.claim_id: c for c in self.report.claims}
+        material = {}
+        for fact in positive_facts(self.report)[0]:
+            refs = [evidence[key] for key in claims[fact.claim_id].evidence_ids if key in evidence
+                    and evidence[key].checked and evidence[key].relation == "supports"
+                    and evidence[key].conditions_match]
+            spans = tuple(sorted((sources[e.source_id].body_hash or sources[e.source_id].requested_url,
+                                  e.quote, e.quote_start, e.quote_end, e.page or 0) for e in refs))
+            material[fact.claim_id] = (fact.text, fact.conditions, fact.uncertainty, spans)
+        return material
+
+    async def _execute_adaptive(self, supplemental_urls: list[str]) -> None:
+        from .answer_cache import build_acquisition_resolutions, positive_facts
+        from .search import validate_query
+
+        plan = await self.call(Plan,
+            "質問の主な確認項目を漏れなく短く列挙し，検索語は正確に3本，overview/primary/limitationsを各1本．"
+            "利用者が明示した依頼と，回答に不可欠な前提だけを確認項目にします．"
+            "短い説明・比較の依頼では主要な違いや要点へ絞り，求められていない内部実装・性能測定・"
+            "定量ベンチマークへ調査を広げません．明示された場合はその依頼を保持します．"
+            "limitationsもその依頼の適用条件・制約に限定し，別の研究課題を追加しません．"
+            "各reasonは20字程度．公式資料と具体的な確認項目を優先します．",
+            {"question": self.report.question, "as_of": self.report.created_at}, "plan")
+        if (len(plan.queries) != 3 or {q.role for q in plan.queries} != {"overview", "primary", "limitations"}
+                or len({" ".join(q.text.casefold().split()) for q in plan.queries}) != 3):
+            raise ValueError("adaptive_plan_requires_three_distinct_roles")
+        self.report.subquestions = plan.subquestions
+        self.event("plan_ready", subquestions=plan.subquestions, query_count=3)
+        queries, stalled = plan.queries, 0
+        for round_number in range(self.config.answer_policy.max_rounds):
+            before = set(self._positive_material().values())
+            previous_gaps = list(self.report.gaps)
+            fresh = await self.gather(queries)
+            if round_number == 0:
+                for url in supplemental_urls:
+                    key = normalize_url(url)
+                    if key not in self.candidates:
+                        candidate = Candidate(url=url, title="指定された追加公開資料", supplied=True)
+                        self.candidates[key] = candidate
+                        fresh.insert(0, candidate)
+                    else:
+                        self.candidates[key].supplied = True
+            acquired = await self.acquire(fresh, first=round_number == 0)
+            review = await self.examine(round_number) if acquired else None
+            positive = {f.claim_id for f in positive_facts(self.report)[0]}
+            material = self._positive_material()
+            new_material = set(material.values()) - before
+            new_positive = {key for key, signature in material.items() if signature in new_material}
+            resolutions = []
+            if review is not None:
+                for item in review.coverage:
+                    refs = item.claim_ids
+                    if (item.subquestion >= len(self.report.subquestions) or len(refs) != len(set(refs))
+                            or not set(refs) <= positive):
+                        self.failure("coverage", "unknown_or_unverified_claim_reference")
+                        continue
+                    self.coverage[str(item.subquestion)] = list(dict.fromkeys(self.coverage.get(str(item.subquestion), []) + refs))
+                for item in review.resolutions:
+                    refs = item.claim_ids
+                    if (item.gap not in previous_gaps or len(refs) != len(set(refs))
+                            or not refs or not set(refs) <= new_positive):
+                        self.failure("gap_resolution", "requires_new_positive_fact_references")
+                        continue
+                    self.report.gaps = [gap for gap in self.report.gaps if gap != item.gap]
+                    resolutions.append(item.model_dump())
+            self.report.metrics["adaptive_coverage"] = dict(self.coverage)
+            record = {"round": round_number, "new_readable_sources": acquired,
+                      "new_verified_material_count": len(new_material),
+                      "new_positive_claim_ids": sorted(new_positive), "previous_gaps": previous_gaps,
+                      "remaining_gaps": list(self.report.gaps), "resolutions": resolutions,
+                      "coverage": dict(self.coverage), "claim_ids": [c.claim_id for c in self.report.claims],
+                      "conflicting_claim_ids": [c.claim_id for c in self.report.claims if c.status == "conflicting"],
+                      "failure_count": len(self.report.failures)}
+            self.report.rounds.append(record)
+            self.event("round_completed", **record)
+            resolutions = build_acquisition_resolutions(self.report)
+            self.report.acquisition_resolutions.extend(resolutions)
+            for resolution in resolutions:
+                self.event("acquisition_failure_resolved", **resolution.model_dump())
+            if self._adaptive_complete():
+                self.report.stop_reason = "verified_coverage_complete"
+                return
+            stalled = 0 if new_positive else stalled + 1
+            if stalled >= 2:
+                self.report.stop_reason = "two_stalled_rounds"
+                return
+            if round_number + 1 == self.config.answer_policy.max_rounds:
+                self.report.stop_reason = "adaptive_round_limit"
+                return
+            queries = []
+            if review is not None:
+                for query in review.additional_queries:
+                    if query.role != "gap" or not query.reason.strip():
+                        continue
+                    validated = validate_query(query.text)
+                    if " ".join(validated.casefold().split()) not in self.budget.query_keys:
+                        queries.append(query)
+            if not queries:
+                self.report.stop_reason = "no_actionable_fresh_query"
+                return
+            if self.budget.limits.max_queries - len(self.budget.query_keys) < len(queries):
+                raise BudgetExceeded("max_queries")
 
     async def _execute_via_collector(self, supplemental_urls: list[str]) -> None:
         """collector 経由の収集（契約 0.4）：plan/search/select/extract/review は research 側で実行し，
@@ -616,12 +881,14 @@ class ResearchExecutor:
         self.store.status(self.report)
         self.event("started", profile_id=self.profile_id)
         try:
-            async with asyncio.timeout(self.budget.remaining_seconds):
+            async with asyncio.timeout(max(0, self.budget.remaining_seconds - self.final_reserve_seconds)):
                 await self._execute(supplemental_urls or [])
             usable = any(c.checked and c.status != "insufficient" for c in self.report.claims)
             self.report.state = (
                 "completed" if usable and not self.report.failures else "partial" if usable else "failed"
             )
+            if self.adaptive:
+                self.report.state = "completed" if self._adaptive_complete() else "partial" if usable else "failed"
             if not usable and self.report.stop_reason == "no_actionable_gaps":
                 self.report.stop_reason = "no_verified_claims"
         except asyncio.CancelledError:
@@ -654,9 +921,10 @@ class ResearchExecutor:
                 c.status in {"insufficient", "conflicting"} for c in self.report.claims
             )
             self.report.answerability = "limited" if checked else "unresolved"
-            if checked and not unresolved and self.report.state == "completed":
+            if checked and not unresolved and self.report.state == "completed" and (not self.adaptive or self._adaptive_complete()):
                 self.report.answerability = "sufficient"
             self.report.metrics = {
+                **({"adaptive_coverage": dict(self.coverage)} if self.adaptive else {}),
                 **self.budget.snapshot(),
                 "model": self.model.metadata,
                 "platform": {
