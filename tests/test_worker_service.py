@@ -618,3 +618,173 @@ async def test_remote_collector_times_out(tmp_path):
         assert excinfo.value.code == "extract_timeout"
     finally:
         await backend.stop()
+
+
+class InterruptedSearch(FixtureSearch):
+    def __init__(self, completed=0):
+        super().__init__()
+        self.completed, self.calls = completed, 0
+        self.entered, self.cancelled = asyncio.Event(), False
+
+    async def search(self, text, query_id):
+        self.calls += 1
+        if self.calls == self.completed + 1:
+            self.entered.set()
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+        return await super().search(text, query_id)
+
+
+@pytest.mark.parametrize("completed", [0, 1])
+async def test_search_cancel_records_unexecuted_queries_and_worker_continues(tmp_path, completed):
+    search = InterruptedSearch(completed)
+    backend = make_backend(tmp_path, search, FixtureFetcher(), lease_ttl_seconds=0.4)
+    try:
+        await backend.start_worker("worker-a")
+        submit = make_search_submit("cancel-first-search", query_texts=("公開、仕様の確認", "public untouched query"))
+        view, _ = backend.manager.submit(submit)
+        assert await wait_for(search.entered.is_set)
+        backend.manager.cancel(view["job_id"])
+        assert await wait_terminal(backend, view["job_id"])
+        result = flat_result(backend.manager, view["job_id"])
+        assert backend.manager.job_view(view["job_id"])["state"] == "cancelled"
+        assert result["status"] == "cancelled" and result["stop_reason"] == "cancelled_by_requester"
+        assert len(result["queries"]) == 2 and search.cancelled
+        assert [row["query_id"] for row in result["queries"]] == ["Q1", "Q2"]
+        assert all(row["status"] == "ok" for row in result["queries"][:completed])
+        assert len(result["candidates"]) == completed * len(DEFAULT_URLS)
+        originals = submit.model_dump()["input"]["queries"]
+        for row, original in zip(result["queries"][completed:], originals[completed:], strict=True):
+            assert {key: row[key] for key in ("query_id", "text", "role", "reason")} == original
+            assert row["status"] == "failed" and row["result_count"] == 0
+            assert row["diagnostic"]["code"] == "cancelled_by_requester"
+        assert [f["query_id"] for f in result["failures"] if f["code"] == "cancelled_by_requester"] == [
+            row["query_id"] for row in originals[completed:]]
+        followup, _ = backend.manager.submit(make_search_submit("after-cancel-search"))
+        assert await wait_terminal(backend, followup["job_id"])
+        assert backend.manager.job_view(followup["job_id"])["state"] == "completed"
+        assert all(row["status"] == "ok" for row in flat_result(backend.manager, followup["job_id"])["queries"])
+        assert not backend._tasks[0].done()
+    finally:
+        await backend.stop()
+
+
+async def test_search_lease_loss_before_first_result_preserves_queries_without_crash(tmp_path):
+    search = InterruptedSearch()
+    backend = make_backend(tmp_path, search, FixtureFetcher(), lease_ttl_seconds=0.4)
+    captured = []
+    class RecordingClient(InProcessManagerClient):
+        async def upload_artifact(self, *args):
+            captured.append(json.loads(args[7]))
+            return await super().upload_artifact(*args)
+    try:
+        service = await backend.start_worker("worker-a")
+        service.client = RecordingClient(backend.manager, "worker-a-secret")
+        submit = make_search_submit("lease-lost-before-result")
+        view, _ = backend.manager.submit(submit)
+        assert await wait_for(search.entered.is_set)
+        backend.manager._conn.execute("UPDATE attempts SET lease_expires_at=0 WHERE job_id=?", (view["job_id"],))
+        backend.manager._conn.commit()
+        assert backend.manager.sweep_once()["lost"] == 1
+        assert await wait_for(lambda: bool(captured))
+        assert await wait_for(lambda: not service.job_in_flight)
+        result = captured[0]
+        assert result["status"] == "failed" and result["stop_reason"] == "worker_lease_lost"
+        assert result["payload"]["candidates"] == [] and search.cancelled
+        for row, original in zip(result["payload"]["queries"], submit.model_dump()["input"]["queries"], strict=True):
+            assert {key: row[key] for key in ("query_id", "text", "role", "reason")} == original
+            assert row["status"] == "failed" and row["result_count"] == 0
+            assert row["diagnostic"]["code"] == "worker_lease_lost"
+        assert backend.manager.job_view(view["job_id"])["state"] == "lost"
+        assert not backend._tasks[0].done()  # Manager's409 rejection is an expected terminal race．
+        followup, _ = backend.manager.submit(make_search_submit("after-lease-loss"))
+        assert await wait_terminal(backend, followup["job_id"])
+        assert backend.manager.job_view(followup["job_id"])["state"] == "completed"
+    finally:
+        await backend.stop()
+
+
+@pytest.mark.parametrize("cause", ["cancelled_by_requester", "worker_lease_lost"])
+@pytest.mark.parametrize("completed", [0, 1, 2])
+async def test_interrupted_search_preserves_duplicate_query_ids_by_input_position(tmp_path, cause, completed):
+    texts = ("public overview specification", "public primary reference", "public limitations reference")
+    roles = ("overview", "primary", "limitations")
+    raw = make_search_submit("duplicate-input-interruption", query_texts=texts).model_dump()
+    for index, entry in enumerate(raw["input"]["queries"]):
+        entry.update(query_id="shared", role=roles[index], reason=f"public provenance position {index}")
+    submit = SubmitJob.model_validate(raw)
+    originals = submit.model_dump()["input"]["queries"]
+    results = {text: [f"https://example.org/position-{index}"] for index, text in enumerate(texts)}
+    emitted_candidates = []
+
+    class RecordingInterruptedSearch(InterruptedSearch):
+        async def search(self, text, query_id):
+            candidates = await super().search(text, query_id)
+            emitted_candidates.extend(candidate.model_dump(mode="json") for candidate in candidates)
+            return candidates
+
+    search = RecordingInterruptedSearch(completed)
+    search.results.update(results)
+    backend = make_backend(tmp_path, search, FixtureFetcher(), lease_ttl_seconds=0.4)
+    captured = []
+
+    class RecordingClient(InProcessManagerClient):
+        async def upload_artifact(self, *args):
+            captured.append(json.loads(args[7]))
+            return await super().upload_artifact(*args)
+
+    try:
+        service = await backend.start_worker("worker-a")
+        service.client = RecordingClient(backend.manager, "worker-a-secret")
+        view, _ = backend.manager.submit(submit)
+        job_id = view["job_id"]
+        assert await wait_for(search.entered.is_set)
+        if cause == "cancelled_by_requester":
+            backend.manager.cancel(job_id)
+            assert await wait_terminal(backend, job_id)
+        else:
+            backend.manager._conn.execute("UPDATE attempts SET lease_expires_at=0 WHERE job_id=?", (job_id,))
+            backend.manager._conn.commit()
+            assert backend.manager.sweep_once()["lost"] == 1
+        assert await wait_for(lambda: bool(captured))
+        assert await wait_for(lambda: not service.job_in_flight)
+
+        pack = captured[0]
+        payload = pack["payload"]
+        expected_status = "cancelled" if cause == "cancelled_by_requester" else "failed"
+        expected_state = "cancelled" if cause == "cancelled_by_requester" else "lost"
+        assert pack["status"] == expected_status and pack["stop_reason"] == cause
+        assert backend.manager.job_view(job_id)["state"] == expected_state
+        assert len(payload["queries"]) == len(originals) == 3
+        assert search.calls == completed + 1 and search.requests == completed and search.cancelled
+        for index, (row, original) in enumerate(zip(payload["queries"], originals, strict=True)):
+            assert {key: row[key] for key in ("query_id", "text", "role", "reason")} == original
+            if index < completed:
+                assert row == {
+                    **original, "status": "ok", "result_count": 1,
+                    "diagnostic": {"engine": "fixture", "unresponsive": False, "reasons": [], "result_count": 0, "code": None},
+                }
+            else:
+                assert row == {
+                    **original, "status": "failed", "result_count": 0,
+                    "diagnostic": {"engine": "unknown", "unresponsive": False, "reasons": [], "result_count": 0, "code": cause},
+                }
+        assert payload["candidates"] == emitted_candidates
+        assert [candidate["url"] for candidate in payload["candidates"]] == [
+            url for text in texts[:completed] for url in results[text]
+        ]
+        assert payload["failures"] == [
+            {"stage": "search", "query_id": "shared", "source_id": None, "code": cause, "detail": None}
+            for _ in originals[completed:]
+        ]
+        assert not backend._tasks[0].done()
+        followup, _ = backend.manager.submit(make_search_submit("after-duplicate-input-interruption"))
+        assert await wait_terminal(backend, followup["job_id"])
+        assert backend.manager.job_view(followup["job_id"])["state"] == "completed"
+        assert all(row["status"] == "ok" for row in flat_result(backend.manager, followup["job_id"])["queries"])
+        assert not backend._tasks[0].done()
+    finally:
+        await backend.stop()

@@ -219,6 +219,8 @@ class WorkerService:
             status, stop_reason = _stage_status(job["mode"], stage)
             if cancel_event.is_set():
                 status, stop_reason = "cancelled", "cancelled_by_requester"
+            elif job["mode"] == "search" and lost_event.is_set():
+                status, stop_reason = "failed", "worker_lease_lost"
             failures = _stage_failures(stage)
             for error in self._hook_errors:
                 failures.append(Failure(stage="artifact", code="artifact_upload_failed", detail=error[:1000]))
@@ -287,7 +289,7 @@ class WorkerService:
                 self._search = search
             result = SearchStageResult()
             try:
-                return await self._run_cancellable(
+                stage = await self._run_cancellable(
                     run_search_stage(
                         search,
                         budget,
@@ -299,6 +301,14 @@ class WorkerService:
                     cancel_event,
                     lost_event,
                 )
+                if cancel_event.is_set() or lost_event.is_set():
+                    code = "cancelled_by_requester" if cancel_event.is_set() else "worker_lease_lost"
+                    for entry in job["input"]["queries"][len(stage.queries):]:
+                        stage.queries.append({"query_id": entry["query_id"], "text": entry["text"],
+                            "role": entry["role"], "reason": entry["reason"], "status": "failed",
+                            "result_count": 0, "diagnostic": {"code": code, "result_count": 0}})
+                        stage.failures.append({"stage": "search", "query_id": entry["query_id"], "code": code})
+                return stage
             finally:
                 if owned:
                     with suppress(Exception):  # preserve the stage result if cleanup fails．

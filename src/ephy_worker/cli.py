@@ -19,6 +19,13 @@ class CLIError(ValueError):
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="ephy-worker", description="調査・収集・coding Jobを実行するWorker")
     sub = root.add_subparsers(dest="command", required=True)
+    discord_runtime = sub.add_parser("discord-runtime", help="Runtime経由のopt-in Discord transport")
+    discord_sub = discord_runtime.add_subparsers(dest="discord_runtime_command", required=True)
+    for name in ("check", "run"):
+        discord_command = discord_sub.add_parser(name)
+        discord_command.add_argument("--config", required=True, type=Path)
+        if name == "run":
+            discord_command.add_argument("--connect", action="store_true", help="Discordへの接続を明示的に許可")
     doctor = sub.add_parser("doctor", help="設定・接続・型付き出力を確認")
     doctor.add_argument("--config", required=True, type=Path)
     doctor.add_argument("--profile", help="未指定なら全profileを診断")
@@ -239,6 +246,10 @@ async def _run_job_command(config, args) -> int:
 
 
 async def dispatch(args) -> int:
+    if args.command == "discord-runtime":
+        from .discord_runtime import command
+
+        return await command(args)
     if args.command == "coding":
         from .coding_cli import run_coding_command, run_coding_verify_command
 
