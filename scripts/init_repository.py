@@ -11,12 +11,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from pathlib import Path
 import re
 import sys
 import tempfile
-from typing import Mapping, Sequence
-
+from collections.abc import Mapping, Sequence
+from pathlib import Path
 
 PROJECT_TYPES = (
     "meta",

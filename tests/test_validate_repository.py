@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
-
+from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 VALIDATE_SCRIPT = REPOSITORY_ROOT / "scripts" / "validate_repository.py"
