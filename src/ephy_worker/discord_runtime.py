@@ -175,7 +175,7 @@ class RuntimeGateway:
         try:
             timeout = httpx.Timeout(connect=10, read=self.settings.read_idle_timeout_seconds, write=30, pool=30)
             async with self.client.stream("POST", self.settings.runtime_url + "/v1/chat/completions",
-                    json=payload, timeout=timeout) as response:
+                    json=payload, headers={"Prefer": "respond-async"}, timeout=timeout) as response:
                 if response.status_code == 202:
                     return 202, await self._json(response)
                 if response.status_code != 200:
@@ -261,9 +261,10 @@ class RuntimeGateway:
                 raise BridgeError("runtime_plan_invalid")
             if plan["decision"] != "allow":
                 raise BridgeError("search_confirmation_required" if plan["decision"] == "confirm" else "search_blocked")
-            plan_id = plan.get("plan_id")
-            if not isinstance(plan_id, str) or not _ID.fullmatch(plan_id):
+            proposed_plan_id = plan.get("plan_id")
+            if not isinstance(proposed_plan_id, str) or not _ID.fullmatch(proposed_plan_id):
                 raise BridgeError("runtime_plan_invalid")
+            plan_id = proposed_plan_id
             messages = [{"role": "system", "content": PERSONA}]
             if previous:
                 messages.append({"role": "assistant", "content": previous})
@@ -294,6 +295,10 @@ class RuntimeGateway:
                     raise BridgeError("runtime_answer_invalid") from None
                 return safe_final(content, self.secrets)
             raise BridgeError("runtime_pending_limit")
+        except BridgeError:
+            if plan_id:
+                await self._cancel(plan_id)
+            raise
         except TimeoutError:
             if plan_id:
                 await self._cancel(plan_id)

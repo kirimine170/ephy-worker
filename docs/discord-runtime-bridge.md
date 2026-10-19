@@ -20,7 +20,7 @@ Runtime URLはliteralのloopback IPだけを許可します．環境proxyとredi
 
 受理後すぐに「分かりました，調べてみますね．」と返信し，120秒たっても終わらなければ「もう少し調べるのに時間がかかりそうです．」を1回返信します．最終回答まで利用者の続行操作は不要です．一人称を「わたし」とし，事実と意見を分けて意見を添え，不確実性を明記するsystem messageをRuntimeへ渡します．自然言語の品質はRuntime側のモデルにも依存します．
 
-まず`POST /v1/web-search/plan`へ公開の質問を送り，`allow`の場合だけ`web_search=true`と同じplan IDを付けてchatを開始します．`confirm`／`block`は検索していないことを明示して終了し，自動承認はしません．HTTP202は同じchat payloadとplan IDを繰り返して再開します．pending／finalのJobとplanの不一致，失敗，接続断，未完のstreamを成功にはしません．
+まず`POST /v1/web-search/plan`へ公開の質問を送り，`allow`の場合だけ`web_search=true`と同じplan IDを付けてchatを開始します．`confirm`／`block`は検索していないことを明示して終了し，自動承認はしません．chatには`Prefer: respond-async`を明示してHTTP202への対応を通知し，202の場合は同じpayload／plan ID／headerを繰り返して再開します．このheaderを送らない既存のRuntime clientは通常のcompletion／SSE接続を保ったまま待機します．pending／finalのJobとplanの不一致，失敗，接続断，未完のstreamを成功にはしません．
 
 最終生成はSSEです．`delta.content`だけを集め，`reasoning_content`やroute／source eventを会話本文へ混ぜません．完了reasonと`[DONE]`を確認してから最終回答を送ります．thinking tagを除去し，不完全な内部出力を拒否します．streamには600秒のread idle timeoutがあり，活動が続く生成に経過時間の締切は設けません．検索のpending回数，stream byte数，回答長は別に制限します．意味上の反復を判定するモデルやloop watchdogは追加していません．
 
@@ -30,6 +30,6 @@ Runtime URLはliteralのloopback IPだけを許可します．環境proxyとredi
 
 SQLiteへmessage IDをHTTPより前に確保し，並行配信や再起動後の重複を実行しません．確保後のcrashや返信の成否不明も自動再送しません．request IDは最大10000件を保持し，上限で新規受理を停止します．古いIDを削除して重複実行を許すpruneは行いません．stateを削除するとこの保証を失います．生の利用者質問やtokenをledgerへ保存しません．Windowsでは親directoryのACLを継承するため，利用者専用のlocal directoryを使います．
 
-同時調査は最大2件です．取消時はローカルtaskとHTTP接続を解放し，Runtimeへ取消をbest effortで送ります．遠隔Workerの停止完了をtransportだけで保証するものではありません．失敗は固定した短い説明で返し，例外本文やHTTP response本文をlogへ出しません．全てのDiscord返信で`allowed_mentions=none`とembed抑制を指定し，UTF-16で1800単位以内に制限します．
+同時調査は最大2件です．取消時はローカルtaskとHTTP接続を解放し，Runtimeへ取消をbest effortで送ります．検証済みの`allow` planでpending回数の上限に達した場合や，chatの通信・protocol・回答検査が失敗した場合も，同じplanの取消を1回試みてから元の失敗を返します．取消requestが失敗しても元の失敗理由を置き換えず，新しいplanやJobを作り直しません．正常完了や未承認・不正なplanには取消を送りません．遠隔Workerの停止完了をtransportだけで保証するものではありません．失敗は固定した短い説明で返し，例外本文やHTTP response本文をlogへ出しません．全てのDiscord返信で`allowed_mentions=none`とembed抑制を指定し，UTF-16で1800単位以内に制限します．
 
 offline testsはSDKの有無によらず許可，pending再開，SSE，重複，返信contextと失敗を確認します．実Discord投稿や本番Bot restartはtestに含めません．

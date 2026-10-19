@@ -346,3 +346,98 @@ async def test_sdk_boundary_uses_inert_mentions_no_history_and_explicit_content_
     assert constructed[0]["max_messages"] is None and constructed[0]["allowed_mentions"] is inert
     assert constructed[0]["intents"].message_content is True
     assert closed == ["discord", "gateway"]
+
+
+@pytest.mark.parametrize("cancel_mode", ["accepted", "http_failure", "transport_failure"])
+@pytest.mark.asyncio
+async def test_pending_poll_exhaustion_cancels_known_plan_once_and_keeps_original_failure(tmp_path, cancel_mode):
+    calls = []
+    async def handler(request):
+        path, data = request.url.path, json.loads(request.content)
+        calls.append((path, data, request.headers.get("Prefer")))
+        if path.endswith("/plan"):
+            return httpx.Response(200, json={"decision": "allow", "plan_id": "plan1"})
+        if path.endswith("/completions"):
+            assert request.headers["Prefer"] == "respond-async"
+            return httpx.Response(202, json={"status": "pending", "job_id": "job1", "plan_id": "plan1"})
+        assert path == "/v1/web-search/cancel" and data == {"plan_id": "plan1"}
+        if cancel_mode == "http_failure":
+            return httpx.Response(503, text="untrusted cancellation response")
+        if cancel_mode == "transport_failure":
+            raise httpx.ReadTimeout("untrusted cancellation exception", request=request)
+        return httpx.Response(200, json={"status": "cancel_requested"})
+    gateway = RuntimeGateway(settings(tmp_path, max_polls=2), transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(BridgeError) as error:
+            await gateway.answer("公開の質問")
+        assert error.value.code == "runtime_pending_limit" and str(error.value) == "runtime_pending_limit"
+        assert [path for path, _, _ in calls] == ["/v1/web-search/plan", "/v1/chat/completions",
+            "/v1/chat/completions", "/v1/web-search/cancel"]
+        assert calls[1][1] == calls[2][1]
+        assert calls[1][1]["metadata"] == {"web_search": True, "web_search_plan_id": "plan1"}
+        assert calls[0][2] is None and calls[-1][2] is None
+    finally:
+        await gateway.aclose()
+
+
+@pytest.mark.parametrize(("fault", "code"), [("transport", "runtime_unavailable_or_invalid_response"),
+    ("pending_identity", "runtime_pending_identity_mismatch"), ("truncated_stream", "runtime_stream_incomplete"),
+    ("empty_answer", "runtime_answer_invalid")])
+@pytest.mark.asyncio
+async def test_post_submit_terminal_failures_cancel_validated_plan_without_resubmission(tmp_path, fault, code):
+    calls = []
+    async def handler(request):
+        path = request.url.path
+        calls.append((path, json.loads(request.content)))
+        if path.endswith("/plan"):
+            return httpx.Response(200, json={"decision": "allow", "plan_id": "plan1"})
+        if path.endswith("/cancel"):
+            assert calls[-1][1] == {"plan_id": "plan1"}
+            return httpx.Response(502)
+        assert path.endswith("/completions") and request.headers["Prefer"] == "respond-async"
+        if fault == "transport":
+            raise httpx.ReadError("private backend error", request=request)
+        if fault == "pending_identity":
+            return httpx.Response(202, json={"status": "pending", "job_id": "job1", "plan_id": "different"})
+        return final_stream(done=fault != "truncated_stream", content="" if fault == "empty_answer" else "回答")
+    gateway = RuntimeGateway(settings(tmp_path), transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(BridgeError) as error:
+            await gateway.answer("公開の質問")
+        assert error.value.code == code
+        assert [path for path, _ in calls] == ["/v1/web-search/plan", "/v1/chat/completions", "/v1/web-search/cancel"]
+    finally:
+        await gateway.aclose()
+
+
+@pytest.mark.parametrize("plan_id", [None, 42, "unvalidated plan"])
+@pytest.mark.asyncio
+async def test_invalid_allow_plan_never_cancels_unvalidated_identity(tmp_path, plan_id):
+    calls = []
+    async def handler(request):
+        calls.append(request.url.path)
+        return httpx.Response(200, json={"decision": "allow", "plan_id": plan_id})
+    gateway = RuntimeGateway(settings(tmp_path), transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(BridgeError) as error:
+            await gateway.answer("公開の質問")
+        assert error.value.code == "runtime_plan_invalid" and calls == ["/v1/web-search/plan"]
+    finally:
+        await gateway.aclose()
+
+
+@pytest.mark.parametrize("pending", [0, 1])
+@pytest.mark.asyncio
+async def test_success_negotiates_async_on_every_chat_and_never_cancels(tmp_path, pending):
+    fixture, headers = RuntimeFixture(pending=pending), []
+    async def handler(request):
+        headers.append((request.url.path, request.headers.get("Prefer")))
+        return await fixture(request)
+    gateway = RuntimeGateway(settings(tmp_path, max_polls=2), transport=httpx.MockTransport(handler))
+    try:
+        assert await gateway.answer("公開の質問") == "わたしは公開資料を確認しました．"
+        assert headers == [("/v1/web-search/plan", None)] + [("/v1/chat/completions", "respond-async")] * (pending + 1)
+        chats = [payload for path, payload, _ in fixture.calls if path.endswith("/completions")]
+        assert all(payload == chats[0] for payload in chats)
+    finally:
+        await gateway.aclose()
