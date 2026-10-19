@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "files": [
+    {
+      "path": ".pi/extensions/governance-gate.ts",
+      "sha256": "2b30673ac73b9d861f67f00caba981c4bd677915be2082bd53fe008135e46da1",
+      "bytes": 26875
+    },
+    {
+      "path": "tools/pi-local/strata-provider.ts",
+      "sha256": "37f0d110f1395755bfb07d1df4733f78b5d8a9ef2f9d0b3e604c6df982ac80a0",
+      "bytes": 1993
+    },
+    {
+      "path": "tools/pi-local/formal-stage-guard.ts",
+      "sha256": "8665a2ee041e6de01a9e4b500583b46ab3dad3ee932e59e6c9942de440c3433b",
+      "bytes": 7019
+    },
+    {
+      "path": "tools/pi-local/formal-stage-stop.ts",
+      "sha256": "fd953b62358b95ccf327c0b497ea5353ad12a26654835c793e68a5a95c43ef0f",
+      "bytes": 552
+    },
+    {
+      "path": "docs/system-development-governance.md",
+      "sha256": "182a113709764e505c25e37909ce685333c9bc513688b0845ec3520d680229b1",
+      "bytes": 22841
+    },
+    {
+      "path": "docs/self-improvement-mvp.md",
+      "sha256": "58f6ede28428ab6ea3daf8b0115d875eaaeb153a2a9d86769e968f55fbddf618",
+      "bytes": 7899
+    },
+    {
+      "path": ".agents/skills/ephy-worker-self-improvement/SKILL.md",
+      "sha256": "64dc0b0b87d853746391897b852b22cf282d28abbf1ad645dd7066fefac4b0f4",
+      "bytes": 6647
+    },
+    {
+      "path": ".agents/skills/ephy-worker-self-improvement/references/eval-contract.md",
+      "sha256": "5581be75186e3757871b14f819ab7b3eaca75642ab2ebc3de18d9953c1b7f5f4",
+      "bytes": 5264
+    },
+    {
+      "path": ".agents/skills/ephy-worker-self-improvement/references/audit-contract.md",
+      "sha256": "d16437ac92a56210a2a797a022a88ea1a58b215d69cdbf8fea1d8215ed6e770d",
+      "bytes": 13805
+    },
+    {
+      "path": ".pi/prompts/audit-ephy-worker.md",
+      "sha256": "3d96ee749e4ccbd0f98bf67afa21d04fe78a03fae79d3ca5a6f0358b532db69b",
+      "bytes": 4972
+    }
+  ]
+}
