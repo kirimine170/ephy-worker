@@ -1,0 +1,16 @@
+# Copy outside Git．Experimental，explicit backend without fallback．
+search:
+  provider: ddgs
+  backend: duckduckgo
+  region: jp-jp
+  retries: 0
+  max_results: 5
+  timeout_seconds: 20
+  request_policy:
+    min_interval_seconds: 3
+    cache_ttl_seconds: 300
+    cache_max_entries: 128
+    cache_max_bytes: 2097152
+    cooldown_seconds: 600
+    # An absolute path outside every Git checkout enables SQLite persistence．
+    # sqlite_path: C:/Users/you/ephy-worker-private/search-cache.sqlite3
