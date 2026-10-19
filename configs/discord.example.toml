@@ -1,0 +1,16 @@
+# Mention entrypoint. Copy outside Git; set the guild and operator user IDs.
+entrypoint = "mention"
+read_message_content = false # bot mentions work without the privileged Message Content intent
+application_id = 1560577412540932136
+guild_id = 0 # required: actual server ID
+# Work and all replies are allowed only in this test channel.
+# Receiving ordinary messages from Discord-permitted channels is a separate capability.
+allowed_channel_ids = [1560630456070967386]
+allowed_user_ids = [] # required: operator Discord user ID(s); empty fails closed
+token_env = "EPHY_DISCORD_BOT_TOKEN" # environment variable name only; never the token value
+
+worker_config = "worker.yaml" # real existing Worker configuration, not the offline smoke fixture
+profile = "qwen-local"
+output_dir = "discord-results"
+state_dir = "discord-state"
+timeout_seconds = 300
