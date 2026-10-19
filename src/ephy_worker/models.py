@@ -5,23 +5,84 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-from typing import TypeVar
+from typing import Protocol, TypeVar, get_args
 
 import httpx
 from anyio import ClosedResourceError
 from openai import APIError, AsyncOpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from pydantic_ai import Agent, NativeOutput, PromptedOutput, ToolOutput
-from pydantic_ai.exceptions import AgentRunError, UnexpectedModelBehavior, UserError
+from pydantic_ai.exceptions import AgentRunError, ToolRetryError, UnexpectedModelBehavior, UserError
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.usage import UsageLimits
+from pydantic_core import ErrorType
 
 from .budget import Budget, BudgetExceeded
 from .config import ModelProfile, ResolvedProfile
 
 T = TypeVar("T", bound=BaseModel)
+
+
+class OutputWireAdapter(Protocol):
+    """Optional output-class protocol；provider schemas may differ from public results．"""
+
+    @classmethod
+    def model_wire_type(cls) -> type[BaseModel]: ...
+
+    @classmethod
+    def model_from_wire(cls, value: BaseModel, *, prompt: str) -> BaseModel: ...
+
+
+def model_wire_type(output_type: type[BaseModel]) -> type[BaseModel]:
+    method = getattr(output_type, "model_wire_type", None)
+    return method() if method is not None else output_type
+
+
+def _declared_path(schema: dict, location: tuple) -> list[str]:
+    """Never copy a model-provided dictionary key into diagnostics．"""
+    node, result = schema, []
+    for part in location[:12]:
+        for _ in range(12):
+            if "$ref" in node:
+                node = schema.get("$defs", {}).get(node["$ref"].split("/")[-1], {})
+            elif "anyOf" in node:
+                node = next((branch for branch in node["anyOf"] if branch.get("type") != "null"), {})
+            else:
+                break
+        if type(part) is int and "items" in node:
+            result.append("[]")
+            node = node["items"]
+        elif isinstance(part, str) and part in node.get("properties", {}):
+            result.append(part)
+            node = node["properties"][part]
+        else:
+            break
+    return result
+
+
+def _schema_diagnostic(error: BaseException, schema: dict) -> dict:
+    pending, seen, classes, issues = [error], set(), [], []
+    known = (UnexpectedModelBehavior, ToolRetryError, ValidationError, UserError, AgentRunError, ValueError)
+    error_types = set(get_args(ErrorType))
+    while pending and len(seen) < 8:
+        current = pending.pop(0)
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        label = next((kind.__name__ for kind in known if isinstance(current, kind)), "other")
+        if label not in classes:
+            classes.append(label)
+        if isinstance(current, ValidationError):
+            for row in current.errors(include_url=False, include_context=False, include_input=False)[:24]:
+                issue = {"type": row["type"] if row["type"] in error_types else "other",
+                         "path": _declared_path(schema, row["loc"])}
+                if issue not in issues and len(issues) < 24:
+                    issues.append(issue)
+        pending.extend(link for link in (current.__cause__, current.__context__)
+                       if link is not None and id(link) not in seen)
+    return {"error_classes": classes, "validation": issues}
 
 
 class ModelError(RuntimeError):
@@ -69,6 +130,9 @@ class _BudgetTransport(httpx.AsyncBaseTransport):
         self.usage_unknown_requests = 0
         self.last_budget_error: BudgetExceeded | None = None
         self.last_error: str | None = None
+        self.call_timeout_seconds: float | None = None
+        self.call_max_output_tokens: int | None = None
+        self.call_observation: dict = {}
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         self.last_error = None
@@ -86,7 +150,8 @@ class _BudgetTransport(httpx.AsyncBaseTransport):
                 self.last_error = "model_request_invalid_json"
                 raise ModelError(self.last_error)
             context = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-            estimated = estimate_tokens(context) + 1024 + self.profile.profile.max_output_tokens
+            estimated = estimate_tokens(context) + 1024 + (
+                self.call_max_output_tokens or self.profile.profile.max_output_tokens)
             if estimated > self.profile.profile.context_tokens:
                 self.last_error = f"model_context_limit:{estimated}>{self.profile.profile.context_tokens}"
                 raise ModelError(self.last_error)
@@ -97,6 +162,7 @@ class _BudgetTransport(httpx.AsyncBaseTransport):
             raise
         timeout = min(
             self.profile.profile.timeout_seconds,
+            self.call_timeout_seconds if self.call_timeout_seconds is not None else self.profile.profile.timeout_seconds,
             self.budget.limits.request_seconds,
             self.budget.remaining_seconds,
         )
@@ -122,6 +188,10 @@ class _BudgetTransport(httpx.AsyncBaseTransport):
                 payload = {}
             if not isinstance(payload, dict):
                 payload = {}
+            choices = payload.get("choices")
+            finish = choices[0].get("finish_reason") if isinstance(choices, list) and choices and isinstance(choices[0], dict) else None
+            self.call_observation["finish_reason"] = finish if isinstance(finish, str) and finish in {
+                "stop", "length", "tool_calls", "content_filter", "function_call"} else "unknown"
             error = payload.get("error", payload)
             error_message = error.get("message", "") if isinstance(error, dict) else ""
             if response.status_code == 400 and "failed to parse grammar" in str(error_message).lower():
@@ -139,6 +209,7 @@ class _BudgetTransport(httpx.AsyncBaseTransport):
                     value = usage.get(external)
                     if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
                         setattr(self.budget, internal, (getattr(self.budget, internal) or 0) + value)
+                        self.call_observation[internal] = value
                         known = True
                 if known:
                     self.usage_known_requests += 1
@@ -196,6 +267,7 @@ class ModelRunner:
                 openai_chat_send_back_thinking_parts="field" if settings.family == "deepseek" else False,
             ),
         )
+        self.call_diagnostics: list[dict] = []
 
     @property
     def metadata(self) -> dict:
@@ -204,6 +276,7 @@ class ModelRunner:
             actual_model_ids=sorted(self.transport.actual_model_ids),
             usage_known_requests=self.transport.usage_known_requests,
             usage_unknown_requests=self.transport.usage_unknown_requests,
+            call_diagnostics=list(self.call_diagnostics),
         )
         return result
 
@@ -219,16 +292,33 @@ class ModelRunner:
                 self.transport.last_error or f"model_discovery_failed:{type(exc).__name__}"
             ) from None
 
-    async def run(self, output_type: type[T], prompt: str, *, stage: str) -> T:
+    async def run(
+        self, output_type: type[T], prompt: str, *, stage: str,
+        max_output_tokens: int | None = None, timeout_seconds: float | None = None,
+        schema_retries: int | None = None,
+    ) -> T:
         settings = self.profile.profile
-        schema_text = json.dumps(output_type.model_json_schema(), ensure_ascii=False)
+        updates = {}
+        for name, value in (("max_output_tokens", max_output_tokens), ("timeout_seconds", timeout_seconds),
+                            ("schema_retries", schema_retries)):
+            if value is not None:
+                if (not math.isfinite(value) or value < 0 or value == 0 and name != "schema_retries"
+                        or value > getattr(settings, name)
+                        or name != "timeout_seconds" and type(value) is not int):
+                    raise ValueError("model_call_bounds_must_tighten")
+                updates[name] = value
+        if updates:
+            settings = settings.model_copy(update=updates)
+        wire_type = model_wire_type(output_type)
+        schema = wire_type.model_json_schema()
+        schema_text = json.dumps(schema, ensure_ascii=False)
         estimated = estimate_tokens(prompt) + estimate_tokens(schema_text) + 1024 + settings.max_output_tokens
         if estimated > settings.context_tokens:
             raise ModelError(f"model_context_limit:{estimated}>{settings.context_tokens}")
         output = {
-            "tool": lambda: ToolOutput(output_type, strict=settings.strict_tools),
-            "native_json": lambda: NativeOutput(output_type),
-            "prompted_json": lambda: PromptedOutput(output_type),
+            "tool": lambda: ToolOutput(wire_type, strict=settings.strict_tools),
+            "native_json": lambda: NativeOutput(wire_type),
+            "prompted_json": lambda: PromptedOutput(wire_type),
         }[settings.output_mode]()
         model_settings: dict = {}
         for field in ("temperature", "top_p"):
@@ -262,10 +352,19 @@ class ModelRunner:
         await asyncio.sleep(0)
         task = asyncio.current_task()
         cancellations_before = task.cancelling() if task is not None else 0
+        self.transport.call_timeout_seconds = timeout_seconds
+        self.transport.call_max_output_tokens = settings.max_output_tokens
+        self.transport.call_observation = {}
+        converting = False
+        diagnostic = {}
         try:
             result = await agent.run(
                 prompt, usage_limits=UsageLimits(request_limit=settings.schema_retries + 1)
             )
+            convert = getattr(output_type, "model_from_wire", None)
+            if convert is not None:
+                converting = True
+                return convert(result.output, prompt=prompt)
             return result.output
         except (ClosedResourceError, BaseExceptionGroup) as exc:
             if (
@@ -292,11 +391,18 @@ class ModelRunner:
                 code = self.transport.last_error
             elif getattr(exc, "status_code", None):
                 code = f"model_http_{exc.status_code}"
-            elif isinstance(exc, UnexpectedModelBehavior):
+            elif isinstance(exc, UnexpectedModelBehavior) or converting and isinstance(exc, ValueError):
                 code = "model_schema_invalid"
             else:
                 code = f"model_stage_failed:{type(exc).__name__}"
+            if code == "model_schema_invalid":
+                diagnostic = _schema_diagnostic(exc, schema)
             raise ModelError(code) from None
+        finally:
+            if len(self.call_diagnostics) < 100:
+                self.call_diagnostics.append({**self.transport.call_observation, **diagnostic})
+            self.transport.call_timeout_seconds = None
+            self.transport.call_max_output_tokens = None
 
     async def aclose(self) -> None:
         await self.client.close()
