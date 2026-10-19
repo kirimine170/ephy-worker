@@ -1,0 +1,14 @@
+{
+  "repository_path": "C:/path/to/repository",
+  "base_revision": "HEAD",
+  "pi_executable": "C:/path/to/pi.exe",
+  "provider": "strata-local",
+  "model_id": "your-actual-model-id",
+  "endpoint": "http://127.0.0.1:8080/v1",
+  "context_window": 32768,
+  "timeout_seconds": 240,
+  "artifact_root": "C:/path/to/private/worker-runs",
+  "models_file": null,
+  "karte_binary": null,
+  "karte_root": null
+}
