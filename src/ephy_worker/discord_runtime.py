@@ -169,9 +169,9 @@ def split_discord_text(text: str, limit: int = 1800) -> list[str]:
             if marker.startswith("`") and "`" in info:
                 continue
             fence = (match.group().rstrip("\n"), marker)
-            # Leave room for wrappers and one full UTF-16 code point；otherwise
-            # preserve this fence pair as ordinary text that can always split．
-            wrap_fence = len((fence[0] + "\n\n" + marker).encode("utf-16-le")) // 2 + 2 <= limit
+            # Reserve at least half of each continuation for original text；
+            # excessive wrappers leave the whole fence pair as ordinary text．
+            wrap_fence = len((fence[0] + "\n\n" + marker).encode("utf-16-le")) // 2 + max(2, limit // 2) <= limit
             if not wrap_fence:
                 continue
         elif marker[0] == fence[1][0] and len(marker) >= len(fence[1]) and not info.strip():

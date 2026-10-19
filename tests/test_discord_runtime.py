@@ -972,3 +972,82 @@ async def test_pathological_fence_final_delivery_is_complete_and_each_part_remai
         assert (len(fixture.calls), len(sent)) == before
     finally:
         await gateway.aclose()
+
+
+def _maximum_fenced_answer(opening, marker, character):
+    return opening + "\n" + character * (32768 - len(opening) - len(marker) - 2) + "\n" + marker
+
+
+@pytest.mark.parametrize("opening,marker", [
+    ("```" + "x" * 1790, "```"), ("~~~" + "😀" * 895, "~~~"),
+    ("`" * 898, "`" * 898), ("```" + "x" * 893, "```"),
+], ids=["one-codepoint-info", "utf16-info", "one-codepoint-marker", "half-budget-threshold"])
+@pytest.mark.parametrize("character", ["a", "😀"], ids=["ascii", "emoji"])
+def test_bounded_fence_overhead_maximum_answer_has_proportional_lossless_chunks(opening, marker, character):
+    text = safe_final(_maximum_fenced_answer(opening, marker, character))
+    assert len(text) == 32768
+    parts = split_discord_text(text)
+    units = len(text.encode("utf-16-le")) // 2
+    count = len(parts)
+    assert count <= 2 * ((units + 1799) // 1800) + 4
+    assert "".join(parts) == text
+    assert all(part and len(part.encode("utf-16-le")) <= 3600 for part in parts)
+    assert all(part.encode("utf-8").decode("utf-8") == part for part in parts)
+
+
+@pytest.mark.parametrize("info_length,wrapped", [(892, True), (893, False)])
+@pytest.mark.parametrize("character", ["a", "😀"], ids=["ascii", "emoji"])
+def test_bounded_fence_overhead_half_budget_boundary_preserves_ordinary_wrapping(info_length, wrapped, character):
+    marker = "```"
+    opening = marker + "x" * info_length
+    text = opening + "\n" + character * 8192 + "\n" + marker
+    parts = split_discord_text(text)
+    units = len(text.encode("utf-16-le")) // 2
+    assert len(parts) <= 2 * ((units + 1799) // 1800) + 4
+    assert all(part and len(part.encode("utf-16-le")) <= 3600 for part in parts)
+    if not wrapped:
+        assert "".join(parts) == text
+        return
+    assert parts[0] == opening + "\n" + marker
+    restored = []
+    for index, part in enumerate(parts):
+        assert part.count(marker) % 2 == 0
+        if index:
+            assert part.startswith(opening + "\n")
+            part = part.removeprefix(opening + "\n")
+        if index < len(parts) - 1:
+            suffix = marker if part == opening + "\n" + marker else "\n" + marker
+            assert part.endswith(suffix)
+            part = part.removesuffix(suffix)
+        restored.append(part)
+    assert "".join(restored) == text
+
+
+@pytest.mark.asyncio
+async def test_near_threshold_fence_final_delivery_is_proportional_and_all_parts_are_owned(tmp_path):
+    text = safe_final(_maximum_fenced_answer("```" + "x" * 1790, "```", "😀"))
+    config = settings(tmp_path)
+    fixture = RuntimeFixture(response=final_stream(text))
+    gateway = RuntimeGateway(config, transport=httpx.MockTransport(fixture))
+    ledger = BridgeLedger(config)
+    bridge, sent = RuntimeDiscordBridge(config, gateway, ledger), []
+
+    async def send(part):
+        sent.append(part)
+        return 700 + len(sent)
+
+    try:
+        await bridge.handle(event(), send)
+        assert sent[0] == RECEIPT and "".join(sent[1:]) == text
+        units = len(text.encode("utf-16-le")) // 2
+        assert len(sent) - 1 <= 2 * ((units + 1799) // 1800) + 4
+        assert all(part and len(part.encode("utf-16-le")) <= 3600 for part in sent)
+        for answer_id, part in enumerate(sent[1:], 702):
+            reply = event(message_id=2000 + answer_id, mentioned=False, reply_to=answer_id)
+            assert ledger.previous(reply).startswith(part[:100])
+            assert ledger.previous(replace(reply, user_id=31)) is None
+        before = len(fixture.calls), len(sent)
+        await bridge.handle(event(), send)
+        assert (len(fixture.calls), len(sent)) == before
+    finally:
+        await gateway.aclose()
