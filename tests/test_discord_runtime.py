@@ -894,3 +894,81 @@ async def test_published_formatted_context_requires_owned_bounded_reply_scope(tm
             assert not fixture.calls and not sent
     finally:
         await gateway.aclose()
+
+
+def _pathological_fence_cases():
+    return [
+        pytest.param("`" * 2001 + "\n公開😀の本文\n" + "`" * 2001, id="oversized-marker"),
+        pytest.param("```" + "language" * 400 + "\n公開😀の本文\n```", id="oversized-info"),
+        pytest.param("~~~" + "語" * 4000, id="no-newline-info"),
+        pytest.param("`" * 5000, id="no-newline-marker"),
+        pytest.param("~~~" + "😀" * 1200 + "\n公開の本文\n~~~", id="emoji-info-utf16"),
+        pytest.param("```" + "x" * 1792 + "\n" + "😀" * 20 + "\n```", id="reopening-overhead"),
+        pytest.param("```python\n公開😀の本文\n" + "`" * 2500, id="oversized-closing-marker"),
+        pytest.param("```" + "x" * 800 + "\n公開の本文\n" + "`" * 1100, id="closing-prefix-overhead"),
+        pytest.param("公開の導入．\n   ~~~" + "語" * 1790 + "\n公開の本文\n~~~", id="indented-overhead"),
+        pytest.param("~~~text\n公開の本文\n~~~" + " " * 2000 + "\n最後の結論．", id="closing-whitespace"),
+        pytest.param("公開の導入😀\n```" + "info" * 600 + "\n本文😀\n```\n最後の結論．", id="nonzero-start"),
+        pytest.param("```" + "😀" * 32765, id="maximum-sanitized-character-count"),
+    ]
+
+
+@pytest.mark.parametrize("answer", _pathological_fence_cases())
+def test_pathological_fence_delimiters_fall_back_to_complete_bounded_text(answer):
+    text = safe_final(answer)
+    assert len(text) <= 32768
+    parts = split_discord_text(text)
+    assert len(parts) > 1 and "".join(parts) == text
+    assert all(part and len(part.encode("utf-16-le")) <= 3600 for part in parts)
+    assert all(part.encode("utf-8").decode("utf-8") == part for part in parts)
+
+
+@pytest.mark.parametrize("limit", [8, 16, 32, 1800])
+def test_pathological_fence_wrapper_overhead_always_makes_progress_with_custom_limits(limit):
+    text = "```" + "a" * (limit - 6) + "\n😀😀😀\n```"
+    parts = split_discord_text(text, limit=limit)
+    assert "".join(parts) == text
+    assert all(part and len(part.encode("utf-16-le")) <= limit * 2 for part in parts)
+
+
+def test_pathological_fence_does_not_disable_other_normal_fence_wrappers():
+    pathological = "~~~" + "info" * 600 + "\n公開😀の本文\n~~~\n"
+    lines = [f"print('公開-{index:04d}')" for index in range(300)]
+    normal = "```python\n" + "\n".join(lines) + "\n```\n最後の結論．"
+    parts = split_discord_text(pathological + normal)
+    assert all(part and len(part.encode("utf-16-le")) <= 3600 for part in parts)
+    assert "".join(parts).startswith(pathological)
+    assert [line for part in parts for line in part.splitlines() if line.startswith("print(")] == lines
+    assert all(part.count("```") % 2 == 0 for part in parts)
+    assert parts[-1].endswith("最後の結論．")
+
+
+@pytest.mark.parametrize("answer", ["```" + "info" * 700, "`" * 2001 + "\n公開😀の本文\n" + "`" * 2001,
+    "~~~" + "x" * 1792 + "\n" + "😀" * 20 + "\n~~~", "```" + "😀" * 32765],
+    ids=["no-newline", "marker", "prefix-overhead", "max-emoji"])
+@pytest.mark.asyncio
+async def test_pathological_fence_final_delivery_is_complete_and_each_part_remains_owned(tmp_path, answer):
+    text = safe_final(answer)
+    config = settings(tmp_path)
+    fixture = RuntimeFixture(response=final_stream(answer))
+    gateway = RuntimeGateway(config, transport=httpx.MockTransport(fixture))
+    ledger = BridgeLedger(config)
+    bridge, sent = RuntimeDiscordBridge(config, gateway, ledger), []
+
+    async def send(part):
+        sent.append(part)
+        return 500 + len(sent)
+
+    try:
+        await bridge.handle(event(), send)
+        assert sent[0] == RECEIPT and len(sent) > 2 and "".join(sent[1:]) == text
+        assert all(part and len(part.encode("utf-16-le")) <= 3600 for part in sent)
+        for index, part in enumerate(sent[1:], 502):
+            reply = event(message_id=1000 + index, mentioned=False, reply_to=index)
+            assert ledger.previous(reply).startswith(part[:100])
+            assert ledger.previous(replace(reply, user_id=31)) is None
+        before = len(fixture.calls), len(sent)
+        await bridge.handle(event(), send)
+        assert (len(fixture.calls), len(sent)) == before
+    finally:
+        await gateway.aclose()

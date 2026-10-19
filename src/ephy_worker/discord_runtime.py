@@ -162,14 +162,27 @@ def split_discord_text(text: str, limit: int = 1800) -> list[str]:
     # Track original delimiter lines so a split cannot turn one into code text．
     spans, ends, states = [], [], []
     fence = None
+    wrap_fence = False
     for match in re.finditer(r"(?m)^ {0,3}(`{3,}|~{3,})([^\n]*)(?:\n|$)", text):
         marker, info = match.group(1, 2)
         if fence is None:
             if marker.startswith("`") and "`" in info:
                 continue
             fence = (match.group().rstrip("\n"), marker)
+            # Leave room for wrappers and one full UTF-16 code point；otherwise
+            # preserve this fence pair as ordinary text that can always split．
+            wrap_fence = len((fence[0] + "\n\n" + marker).encode("utf-16-le")) // 2 + 2 <= limit
+            if not wrap_fence:
+                continue
         elif marker[0] == fence[1][0] and len(marker) >= len(fence[1]) and not info.strip():
+            if wrap_fence and len((fence[0] + "\n" + match.group()).encode("utf-16-le")) // 2 > limit:
+                spans.pop()
+                ends.pop()
+                states.pop()
+                wrap_fence = False
             fence = None
+            if not wrap_fence:
+                continue
         else:
             continue
         spans.append(match.span())
