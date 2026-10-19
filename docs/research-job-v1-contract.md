@@ -22,7 +22,7 @@
 
 `src/ephy_worker/contracts.py` が定義する `web.collect` 0.4 は，`CONTRACT_VERSION = "0.4"`，`SubmitJob`（`submit_key`，`parent_job_id`，`input`，`target_worker_id`，`budget`，`deadline_seconds`）と，Managerが付加する `JobEnvelope`（`job_id`，`input_hash`，`created_at`），`Attempt` の `lease_token`，terminal状態 `completed`／`partial`／`failed`／`cancelled`／`lost` を持つ実装済み契約である．`src/ephy_worker/manager.py` は submit_key の一意制約と `submit_key_conflict`，`UPDATE ... WHERE state = 'queued'` によるatomicなlease claim，parentの残budget・残時間からのchild予算導出，queuedへのcancel即時確定とrunningへのcancel記録を実装している．
 
-ResearchJob v1 はこの0.4とは別系統の将来プロトコルであり，`protocol_version` と `job_type` を明示することで混同を防ぐ．0.4 の既存フィールド・状態・挙動を変更せず，同一Manager上で job type を discriminator として共存させることを設計方針とする．本書の語彙（`submitted`，`leased`，`running`，`succeeded`，`failed`，`cancelled`，`lost`）は0.4の実装済み語彙とは独立であり，0.4側への読み替えは行わない．AdoptionはJob状態ではなく§5.7の別系統記録である．
+ResearchJob v1 はこの0.4とは別系統の将来プロトコルであり，`protocol_version` と `job_type` を明示することで混同を防ぐ．0.4 の既存フィールド・状態・挙動を変更せず，同一Manager上で job type を discriminator として共存させることを設計方針とする．本書のJob状態語彙（`submitted`，`running`，`succeeded`，`failed`，`cancelled`，`lost`）は0.4の実装済み語彙とは独立であり，`leased` はJob状態ではなくleased envelopeのviewを表す語としてのみ用いる．0.4側への読み替えは行わない．AdoptionはJob状態ではなく§5.7の別系統記録である．
 
 ## 3. 依存関係と未解決事項
 
@@ -79,34 +79,36 @@ ResearchJob v1 はこの0.4とは別系統の将来プロトコルであり，`p
 - Workerがleaseをclaimすると，Managerは **atomicな単一のclaim操作** で `attempt_id` と `lease_generation` を発行する．有効なleaseがない `submitted` 作業に対しては，複数のclaim試行のうち高々1つだけが勝つ．2人目のclaimantを「単純に先行者を置換する」とは扱わず，`lease_conflict` で拒否する．
 - heartbeat（lease renew）は有効期限内のみ延長可能で，期限切れ後の延長は不可（`lease_expired`）．期限切れはsweeperがJobを `lost` へ遷移させることがある．
 - artifactは許可されたmedia typeとSHA-256・サイズ検証を受け，`job_id` と `attempt_id` に紐づく．
-- lease claimが `running` へのatomic遷移を兼ねる場合，leased envelopeは追加のJob状態ではなく **view** である．状態グラフ上の状態はJobの実状態のみとする（§6）．
+- lease claimは常に `submitted` から `running` へのatomicな単一遷移であり，中間のJob状態は存在しない．leased envelopeは追加のJob状態ではなく **view** であり，`leased` を状態として扱う選択肢は本提案には存在しない．状態グラフ上の状態はJobの実状態のみとする（§6）．
 
 ### 5.4 結果の冪等（Idempotency）とfencingの優先
 
-- 新しい結果の受け付けは，**現在の `running` かつ有効leaseのattempt** からの送信だけである．受け付け前に，exactな `job_id`／`attempt_id`／`lease_generation` tuple，有効lease，独立に凍結された `target_revision`／`policy_revision` の一致，遷移を許す現在の状態をManagerがatomicに検証する．
-- 一度受け付けた結果と **完全一致** する同一 `attempt_id` からの再送は，確定済みのreceiptを返すだけである．新しい取り込み，Adoption，状態変化は起こらない（positive case）．
-- 同一receipt identityで **異なる内容** の結果は拒否（`result_conflict`）．
-- fencingと取消は冪等より優先する．`cancelled` または `lost` のJobに対する結果送信は，古い `attempt_id`／`lease_generation` が一致しても，本文が過去と完全一致しても，常に拒否する（`stale_lease`／`job_terminal`）．
+- 新しい結果の受け付け（Finalize）は，**現在の `running` かつ有効leaseのattempt** からの送信だけである．受け付け前に，exactな `job_id`／`attempt_id`／`lease_generation` tuple，有効lease，独立に凍結された `target_revision`／`policy_revision` の一致，遷移を許す現在の状態をManagerがatomicに検証する．terminal状態に対するFinalizeは，本文が過去と完全一致しても，古いIDが一致しても，常に拒否する（`job_terminal`／`stale_lease`）．同一receipt identityで **異なる内容** の結果は拒否（`result_conflict`）．
+- 読み取り専用の **ReceiptLookup** 操作を，Finalizeとは別の認証済み操作として定義する．`succeeded` かつ **すでに受理済みのfinal result receipt** があり，exactな `job_id`／`attempt_id`／`lease_generation`／result digestが一致する場合に限り，保存済みのreceiptを返す．lease有効期限切れ後でもよい．これは書き込みを伴わないため現在のactive leaseを要求しないが，認証・caller認可と受理済みreceiptの完全性検証は必須である．ReceiptLookupは取り込み，Adoption，状態変化を一切起こさない．`failed`／`cancelled`／`lost` のReceiptLookupは拒否する．受理済みreceipt identityに対してdigestが異なる照会は拒否する．
+- つまり，安全な読み取り操作（Submitの同一入力current-view replayとReceiptLookup）と，terminal Jobへの禁止された変更操作（terminal Finalize，renew，再queue）を明確に区別する．読み取りreplayは無変更であり，変更操作の例外根拠にはならない．
+- fencingと取消は冪等より優先する．`cancelled` または `lost` のJobに対する結果送信（Finalize）は，古い `attempt_id`／`lease_generation` が一致しても，本文が過去と完全一致しても，常に拒否する（`stale_lease`／`job_terminal`）．
 
 ### 5.5 Cancel と finalize の競合
 
-- Managerのcancel受理（`running` → `cancel_requested` のatomic barrier）は，それ以降の **新しい結果受け付けを直ちにfenceする**．Workerの停止確認（`cancel_requested` → `cancelled`）は後続の別イベントであり，両者を区別する．
+- Managerのcancel受理（`running` → `cancel_requested` のatomic barrier）は，それ以降の **新しい結果受け付けを直ちにfenceする**．Workerの停止確認（`cancel_requested` → `cancelled`）は後続の別イベントであり，両者を区別する．停止確認が確認できないまま期限切れに至った場合は `lost` で終わる．cancel受理barrier以降のsuccess／failure結果は受け付けない．
 - finalizeが先に勝った場合，Jobはterminal（`succeeded`／`failed`）になり，後続のcancelは既にterminalなviewを返すだけで，successを上書きできない．
-- cancel受理が先に勝った場合，後続の success／failure finalize は拒否（`result_conflicts_with_cancel`）．cancel受理後の遅延結果は，古いID一致でも受け付けない．
+- cancel受理が先に勝った場合，後続の success／failure finalize は拒否（`result_conflicts_with_cancel`）．cancel受理後の遅延結果は，古いID一致でも，本文が完全一致でも受け付けない．terminal JobへのFinalizeの再送も常に拒否であり，receiptの読み取りは§5.4のReceiptLookupのみが許される安全な読み取り経路である．
 - `submitted`（queued相当）へのcancelは即 `cancelled` とし，再queueへ戻さない．
 
 ### 5.6 Retry（信頼済みManager/Runtimeのみが発行）
 
 - 自動再実行はない．Workerが自分自身へretryや新しい `attempt_id` を付与することは禁止する．
-- 信頼済みRuntimeの承認を受けたretryは，Managerによる **新しいchild Jobの作成** である．新しい `job_id` に `parent_job_id` を設定し，新しいsubmit key，親の残budgetから導出した **残額のみ** のchild budget，親の残り時間内に収まるdeadlineを与える．親の `failed`／`lost`／`cancelled` レコードを `submitted` へ戻す操作は存在しない．
-- child budgetの予約は，外部台帳（ledger）のatomicな予約として行い，並行または重複のretry要求が同じ残額を二重に消費できないようにする．retry要求のstable identityをchild submit keyへ束縛し，ネットワーク再送は同じchildを返し，別の子を作らない．
+- 信頼済みRuntimeの承認を受けたretryは，Managerによる **新しいchild Jobの作成** である．新しい `job_id` に `parent_job_id` を設定し，新しいsubmit key，権威あるoriginal root-lineage budget台帳から導出した **残額のみ** のchild budget，親の残り時間内に収まるdeadlineを与える．親の `failed`／`lost`／`cancelled` レコードを `submitted` へ戻す操作は存在しない．
+- 親のusageがunknown（失敗またはlostで消費量が不確実）な場合，childの残額budgetは，認証済み・検証済みのusageと，権威あるoriginal root-lineage budget台帳からのみ決定する．unknown usageをゼロでも解放済みのallowanceでもなく扱い，unknownであり得る最大の予約として保守的に消費・確保し続ける．残ったoriginal budgetとoriginal deadlineが **証明可能に利用可能** な場合のみchildを作成し，そうでなければchildを作らずfail closedとする．
+- child budgetの予約は，外部台帳（ledger）のatomicな予約として行い，並行または重複のretry要求が同じ残額を二重に消費できないようにする．台帳のatomic予約は二重割り当ての防止のみを保証し，unknownな消費量の復元は保証しない．retry要求のstable identityをchild submit keyへ束縛し，ネットワーク再送は同じchildを返し，別の子を作らない．
 - 親のcore状態・入力・結果は不変であり，台帳とaudit recordはJobレコードとは別系統の記録とする．
-- `cancelled` のJobは自動的にretryしない．child作成も信頼済みRuntimeの承認が必須である．
+- retry childの対象親は `failed` ／ `lost` のterminalのみであり，`cancelled` のJobは本提案ではretry親にならない．child作成も信頼済みRuntimeの承認が必須である．
 - 新しい `attempt_id` と `lease_generation` は，Managerだけがatomicなlease claim時に1度だけ発行する．Workerはどちらも発行しない．
 
 ### 5.7 Audit と Adoption の境界
 - すべての状態遷移，lease発行，結果受領，cancel受理，retry child作成を監査ログへ記録する．ログへ資格情報を含めない．
-- Runtime Adoption は，terminalなWorker Jobを `adopted` へ遷移させる操作ではなく，**別系統の信頼済みライフサイクル記録／判断** である．Adoption直前にも現在の `target_revision` と `policy_revision` を独立に再検証する．
+- Runtime Adoption は，terminalなWorker Jobを `adopted` へ遷移させる操作ではなく，**別系統の信頼済みライフサイクル記録／判断** である．Adoptionは次のすべてを必須とする：（1）`succeeded` のJobであること，（2）認証済みManagerが受理したfinal result receiptの存在，（3）証拠・provenanceの独立検証完了，（4）T-033／T-122のRuntimeポリシーによる明示的な採用許可，（5）Adoption直前の現在の `target_revision` と `policy_revision` のfreshかつ独立な再検証PASS．
+- ポリシーがpendingまたはundefinedの場合は採用を拒否する．`failed`／`cancelled`／`lost` のJob，およびManagerが受理していないfinal resultのアップロード済みartifactは，本v1提案では採用可能ではない．
 - WorkerはKarteへ一切書き込まない．Karteおよび知識台帳への書き込みはRuntime側の責任とする．
 
 ## 6. 状態グラフと遷移表（提案）
@@ -116,18 +118,15 @@ ResearchJob v1 はこの0.4とは別系統の将来プロトコルであり，`p
 ```mermaid
 stateDiagram-v2
     [*] --> submitted: Submit（Managerがfull-input hash確定）
-    submitted --> leased: lease claim成功（Managerがattempt_id／lease_generation発行）
+    submitted --> running: lease claim成功（Managerがattempt_id／lease_generation発行し実行開始へ直接遷移）
     submitted --> cancelled: cancel受理（即terminal）
     submitted --> lost: deadline経過
-    leased --> running: 実行開始（claimと同一atomic操作の場合はleasedはview）
-    leased --> cancel_requested: cancel受理
-    leased --> lost: lease期限切れ／実行開始前loss
     running --> succeeded: finalize（有効lease・revisions一致）
     running --> failed: finalize
     running --> cancel_requested: cancel受理（atomic barrier）
     running --> lost: lease期限切れ（sweeper）
     cancel_requested --> cancelled: Worker停止確認（status=cancelled）
-    cancel_requested --> failed: Worker停止確認（status=failed）
+    cancel_requested --> lost: 停止確認なきlease期限切れ（sweeper）
     succeeded --> [*]
     failed --> [*]
     cancelled --> [*]
@@ -136,24 +135,25 @@ stateDiagram-v2
 
 - terminal状態（`succeeded`／`failed`／`cancelled`／`lost`）は終端であり，terminalから `submitted` へ戻るretry edgeはこのグラフに存在しない．
 - retryはグラフ内のedgeではなく，信頼済みRuntime承認による **child Jobの新規作成**（別Jobの `[*] → submitted`）として表現する．
-- lease claimが `running` へのatomic遷移を兼ねる実装では，`leased` は追加状態ではなくleased envelopeのviewとし，グラフ上は `submitted → running` の短縮と読み替えてよい．表とグラフで同じ意味を使う．
+- lease claimは `submitted` から `running` へのatomicな単一遷移であり，`leased` はJob状態ではなくleased envelopeのview専用である．グラフ，表，語彙のいずれでも `leased` を状態として扱わない．
 - Adoptionはグラフ外であり，terminal Jobとは別の信頼済みライフサイクル記録として扱う．
 
 ### 6.2 状態遷移表
 | 操作（actor） | 前提条件 | 結果状態 | 不正・遅延遷移の扱い |
 |---|---|---|---|
 | Submit（信頼済みRuntime） | submit_key未使用，full-input hash確定 | submitted（新規） | 同一key・同一immutable入力：既存Jobを **現在の状態のまま** viewで返す（全状態，無変更）／同一key・異なる入力：submit_key_conflict拒否 |
-| lease claim（Worker依頼，Manager発行） | submitted，有効active leaseなし，deadline前，revisions各々凍結期待値と一致 | leased／running（attempt_idとlease_generationをManagerが1度だけ発行） | 並行claimは高々1勝者，敗者はlease_conflict／revisions不一致はrevision_mismatch／terminalなら拒否 |
+| lease claim（Worker依頼，Manager発行） | submitted，有効active leaseなし，deadline前，revisions各々凍結期待値と一致 | running（attempt_idとlease_generationをManagerがclaim時に1度だけ発行，leasedはviewで状態ではない） | 並行claimは高々1勝者，敗者はlease_conflict／revisions不一致はrevision_mismatch／terminalなら拒否 |
 | heartbeat（Worker） | 現在のattempt，有効lease期限内 | 状態不変（lease延長） | 期限切れ後：lease_expired（延長不可，lost化されうる） |
-| 結果finalize（Worker） | running，exact job／attempt／generation tuple，有効lease，revisions一致 | succeeded／failed | cancel受理後またはterminal後：stale_lease／job_terminal拒否（旧ID一致・同一本文でも不可）／完全一致再送：既存receiptのみ返す／同一receipt identityで異なる内容：result_conflict |
-| cancel受理（Runtime→Manager） | submitted | cancelled（即terminal） | 同一入力Submitのview返却とreceipt再送のみ許容，他の新規変更操作は全て拒否 |
-| cancel受理（Runtime→Manager） | leased／running | cancel_requested（atomic barrier，新結果を即fence） | 同上 |
+| 結果finalize（Worker） | 現在のrunning，exact job／attempt／generation tuple，有効lease，revisions一致 | succeeded／failed | cancel受理後またはterminal後：stale_lease／job_terminal拒否（旧ID一致・同一本文でも常に不可，terminal Finalizeの再送も不可）／同一receipt identityで異なる内容：result_conflict |
+| ReceiptLookup（認証済みcaller，読み取り専用） | succeededかつ受理済みfinal result receiptあり，exact job／attempt／generation／result digest一致，identity／caller認可と受理済みreceiptの完全性検証PASS | 状態不変（保存済みreceiptを返すだけ，lease期限切れ後も可，active lease不要） | `failed`／`cancelled`／`lost` は拒否／digest不一致は拒否／取り込み・Adoption・状態変化は一切起こさない |
+| cancel受理（Runtime→Manager） | submitted | cancelled（即terminal） | 同一入力Submitのread-only view返却のみ許容，他の新規変更操作は全て拒否 |
+| cancel受理（Runtime→Manager） | running | cancel_requested（atomic barrier，新結果を即fence） | 同上（barrier以後のsuccess／failure結果は旧ID一致・本文完全一致でも受け付けない） |
 | cancel受理（Runtime→Manager） | cancel_requested | cancel_requested（冪等） | 同上 |
 | cancel受理（Runtime→Manager） | finalizeが先行しterminal | 既存terminal viewを返す（無変更） | successの上書きは不可 |
-| Worker停止確認（Worker） | cancel_requested，現在のattempt | cancelled／failed | 有効leaseとtuple検証はfinalizeと同じ／fence後の新規結果は不可 |
-| deadline／lease loss（Manager sweeper） | runningかつlease期限切れ，またはsubmittedかつdeadline経過 | lost | 以後の結果送信は旧ID一致でも拒否 |
-| retry child作成（信頼済みRuntime承認，Manager実行） | 親がfailed／lostのterminal，残budget・残時間あり，stable retry identity | 新child Jobがsubmitted（parent_job_id設定，残額budget予約） | 親のstate／入力／結果は不変／台帳予約はatomicで二重消費なし／同一retry identityの再送は同一childを返す／cancelled親は対象外 |
-| Adoption（Runtime） | Jobがterminal，revisions再検証PASS | Job状態は不変，別系統の採用記録のみ作成 | Jobをadoptedへ遷移させる操作は存在しない／WorkerのKarte書き込みは禁止 |
+| Worker停止確認（Worker） | cancel_requested，現在のattempt | cancelled／failed | 有効leaseとtuple検証はfinalizeと同じ／fence後の新規結果は不可／停止確認なきlease期限切れはsweeperがlostへ |
+| deadline／lease loss（Manager sweeper） | runningかつlease期限切れ，cancel_requestedかつactive lease期限切れ（停止確認なし），またはsubmittedかつdeadline経過 | lost | 以後の結果送信は旧ID一致でも拒否 |
+| retry child作成（信頼済みRuntime承認，Manager実行） | 親がfailed／lostのterminal，認証済みusageと権威あるroot lineage台帳から残budget・original deadlineが証明可能，stable retry identity | 新child Jobがsubmitted（parent_job_id設定，保守的に予約済みの残額budget） | 親のstate／入力／結果は不変／unknown usageはゼロでも解放額でもなくfull予約として保守的に消費／台帳予約はatomicで二重消費なし／同一retry identityの再送は同一childを返す／cancelled親は対象外 |
+| Adoption（Runtime） | Jobがsucceeded，認証済みManager受理final result receipt，独立検証済み証拠・provenance，T-033／T-122ポリシーの明示許可，freshなrevisions再検証PASS | Job状態は不変，別系統の採用記録のみ作成 | ポリシーpending／undefinedは拒否／failed／cancelled／lostは拒否／未受理artifactのアップロードのみでは採用不可／Jobをadoptedへ遷移させる操作は存在しない／WorkerのKarte書き込みは禁止 |
 
 ## 7. 計画する合成（synthetic）受入ケースと将来の実行可能作業
 
@@ -161,22 +161,26 @@ stateDiagram-v2
 
 ### 7.1 正常系（positive）
 1. 同一submit_key・同一full inputの重複Submitが，terminal状態を含む任意状態で既存Jobの現在viewを無変更で返す（terminalを開かない）．
-2. 信頼済みRuntime承認によるretry child作成：新 `job_id`＋`parent_job_id`＋新submit key＋残額child budgetでchildがsubmittedになり，親はterminal不変．
+2. 信頼済みRuntime承認によるretry child作成：新 `job_id`＋`parent_job_id`＋新submit key＋認証済みusageと権威あるroot lineage台帳から証明された残額child budgetでchildがsubmittedになり，親はterminal不変．
 3. 同一retry要求identityのネットワーク再送が同一childを返し，別childを作らない．並行retryでも台帳予約が残額を二重に予約しない．
-4. 受け付け済み結果と完全一致する再送が，取り込み・Adoption・状態変化なしに既存receiptのみ返す．
+4. lease期限切れ後の `succeeded` Jobに対するReceiptLookupが，受理済みfinal result receiptを保存済みdigestと一致する認証済みcallerへ，active leaseなしで読み取り専用で返すこと（取り込み・Adoption・状態変化なし）．
 5. cancel受理がfinalizeより先：後続のsuccess finalizeは拒否され，Worker停止確認でcancelledが確定する．
 6. finalizeがcancel受理より先：Jobはsucceededでterminal，後続cancelはterminal viewを返しsuccessを上書きしない．
-7. 有効leaseの現在のattemptからの正常なfinalize／heartbeat／artifact受領．
+7. 有効leaseの現在のattemptからの正常なfinalize／heartbeat／artifact受領．lease claimが `submitted` から `running` へ直接遷移し，どの時点にも `leased` というJob状態が観測されないこと．
 
 ### 7.2 拒否系（negative）
-1. terminal Jobへの同一キー・異なるimmutable入力Submitと，terminal Jobへの新規変更操作（結果送信，lease claim，renew）のすべてが拒否され，terminalは不変．
+1. terminal Jobへの同一キー・異なるimmutable入力Submitと，terminal Jobへの新規変更操作（結果送信，terminal Finalizeの再送，lease claim，renew）のすべてが拒否され，terminalは不変．本文が完全一致・古いIDが一致してもterminal Finalizeは常に拒否されること．
 2. 古い `attempt_id`／`lease_generation`，または `cancelled`／`lost` 後の遅延結果が，古いID一致・本文完全一致でも拒否されること．
-3. 同一receipt identityで異なる内容の結果拒否（result_conflict）．
+3. 同一receipt identityで異なる内容の結果拒否（result_conflict），および受理済みreceipt identityに対するdigest不一致のReceiptLookup拒否．
 4. 有効leaseのないsubmitted作業への並行lease claimで勝者が高々1つで，敗者がlease_conflictになること．
 5. `protocol_version` 不一致の拒否（protocol_mismatch）．
 6. `target_revision` 不一致と `policy_revision` 不一致を別々のケースで検証し，互いとの比較では不一致を検出しないこと．
 7. Worker自身によるretry，`attempt_id`／`lease_generation` の自己発行，Karte書き込みの拒否．
-8. Workerの停止確認を伴わないlease期限切れがlostへ遷移し，以後の結果送信を拒否すること．
+8. Workerの停止確認を伴わないlease期限切れがlostへ遷移し，以後の結果送信を拒否すること．`running` と `cancel_requested` のactive lease，および `submitted` のdeadline経過がいずれもsweeperでlostになり，`leased` という独立状態が滞留しないこと．
+9. 親のusageがunknownのretryで，unknownがゼロや名目上の空きbudgetへ丸められず，original budgetとoriginal deadlineが証明できない場合にchildを作らずfail closedすること．
+10. ReceiptLookupの `cancelled`／`lost`／`failed` 拒否，およびterminal JobへのFinalize変更の全面拒否（読み取り専用操作と変更操作の区別が維持されること）．
+11. Adoptionで，受理済み `succeeded` final result receiptと明示的なT-033／T-122ポリシー許可の両方が揃う場合のみ採用記録が作られ，ポリシーpending／undefined，`failed`／`cancelled`／`lost`，未受理artifactのアップロードのみはすべて拒否されること．
+12. cancel競合の両順序：cancel受理先行では以後のfinalizeが全て拒否され，finalize先行では以後のcancelがterminal viewを返すだけであること．barrier以後のreceipt読み取り要求が状態を変えないこと．
 
 ### 7.3 将来の実行可能作業（future work）
 - JSON schemaの確定と，既存0.4スタブへの非干渉な共存テスト．
