@@ -854,3 +854,171 @@ def test_review_revision_direct_and_generated_checker_allow_inert_new_function_s
     result, marker = _review_revision_run_generated_checker(tmp_path, original, original + appended)
     assert result.returncode == 0, result.stderr
     assert marker.read_text(encoding="utf-8") == "reached"
+
+
+@pytest.mark.parametrize("body", [
+    "import os\n    os._exit(0)",
+    "import os as hidden\n    hidden._exit(0)",
+    "from os import _exit as hidden\n    hidden(0)",
+    "if False:\n        import os\n        os._exit(0)\n    assert True",
+    "assert os._exit(0) is None",
+    "assert sys.exit(0) is None",
+    "raise SystemExit(0)",
+    "assert exit(0) is None",
+    "assert eval('1') == 1",
+    "assert getattr(str, 'upper')('x') == 'X'",
+    "assert __import__('os') is None",
+    "fn = os._exit\n    assert fn(0) is None",
+    "fn = len\n    assert fn([]) == 0",
+    "assert (lambda: 1)() == 1",
+    "assert [len][0]([]) == 0",
+    "assert ''.__class__ is str",
+    "global changed\n    changed = 1\n    assert True",
+    "values = []\n    values.append(1)\n    assert values == [1]",
+    "values = [0]\n    values[0] = 1\n    assert values == [1]",
+    "try:\n        assert False\n    except Exception:\n        return",
+    "with open('file', 'w') as stream:\n        assert True",
+    "while True:\n        assert True",
+    "for value in [1]:\n        assert value == 1",
+    "def nested():\n        return 1\n    assert nested() == 1",
+    "class Nested:\n        pass\n    assert True",
+    "assert 2 ** 1000000 > 0",
+    "assert len('x' * 1000000000) > 0",
+    "assert '%1000000000s' % 0",
+    "assert [value for value in range(1000000)]",
+    "assert [[x for x in range(100)] for y in range(100)]",
+])
+def test_review_v11_direct_and_emitted_body_guard_rejects_capabilities_before_acceptance(tmp_path, body):
+    original = "import os\nimport sys\n\ndef test_original():\n    assert 1 == 1\n"
+    candidate = original + "\ndef test_unsafe():\n    " + body + "\n"
+    with pytest.raises(ValueError, match="new_test_body_"):
+        preserve_original_tests(original, candidate)
+    result, marker = _review_revision_run_generated_checker(tmp_path, original, candidate)
+    assert result.returncode != 0 and "new_test_body_" in result.stderr
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("appended", [
+    "def helper_callback(fn):\n    return fn()\n",
+    "def helper_first(value):\n    return helper_second(value)\n\ndef helper_second(value):\n    return helper_first(value)\n",
+    "def helper_async_call(value):\n    return helper_async(value)\n\nasync def helper_async(value):\n    return value\n",
+    "def test_capability_fixture(monkeypatch):\n    assert True\n",
+    "def test_capability_fixture(request):\n    assert True\n",
+    "def pytest_sessionfinish():\n    return 0\n",
+    "def helper_mutate(values):\n    values.clear()\n    return values\n",
+])
+def test_review_v11_helpers_fixtures_and_hooks_cannot_confer_capabilities(tmp_path, appended):
+    original = "def test_original():\n    assert 1 == 1\n"
+    with pytest.raises(ValueError, match="new_test_body_"):
+        preserve_original_tests(original, original + "\n" + appended)
+    result, marker = _review_revision_run_generated_checker(tmp_path, original, original + "\n" + appended)
+    assert result.returncode != 0 and not marker.exists()
+
+
+def test_review_v11_pure_bounded_computation_and_literal_fixture_are_usable(tmp_path):
+    original = "import pytest\n\n@pytest.fixture\ndef stable():\n    return 1\n\ndef test_original(stable):\n    assert stable == 1\n"
+    appended = ("\ndef helper_increment(value):\n    return value + 1\n"
+        "\nasync def helper_async(value):\n    return value\n"
+        "\ndef test_bounded(stable):\n    values = [value + 1 for value in range(3)]\n"
+        "    label = ' value '\n    assert label.strip() == 'value'\n"
+        "    assert values == [1, 2, 3]\n    assert helper_increment(stable) == 2\n")
+    preserve_original_tests(original, original + appended)
+    result, marker = _review_revision_run_generated_checker(tmp_path, original, original + appended)
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text(encoding="utf-8") == "reached"
+
+
+def test_review_v11_registered_subject_calls_are_exact_and_shadowed_imports_reject():
+    from ephy_worker.owner_repair_discovery import registered_test_subjects
+    source = "def answer(value):\n    return value + 1\n"
+    original = "from ephy_worker.feature import answer as feature_answer\n\ndef test_original():\n    assert True\n"
+    subjects = registered_test_subjects(original, {"src/ephy_worker/feature.py": source})
+    assert subjects == ("feature_answer",)
+    candidate = original + "\ndef test_regression():\n    assert feature_answer(1) == 2\n"
+    preserve_original_tests(original, candidate, subjects)
+    with pytest.raises(ValueError, match="capability"):
+        preserve_original_tests(original, candidate)
+    assert registered_test_subjects(original + "feature_answer = None\n", {"src/ephy_worker/feature.py": source}) == ()
+    with pytest.raises(ValueError):
+        preserve_original_tests(original, original + "\ndef test_alias():\n    fn = feature_answer\n    assert fn(1) == 2\n", subjects)
+
+
+def test_review_v11_existing_global_alias_cannot_shadow_a_pure_builtin():
+    original = "from os import _exit as len\n\ndef test_original():\n    assert True\n"
+    with pytest.raises(ValueError, match="capability"):
+        preserve_original_tests(original, original + "\ndef test_unsafe():\n    assert len(0) is None\n")
+
+
+def test_review_v11_actual_prepare_emits_identical_body_guard_and_explicit_feature_bindings(tmp_path, monkeypatch):
+    import inspect
+
+    from ephy_worker.formal_artifacts import GateFailure, file_hash, write_json
+
+    source = tmp_path / "source"
+    source_file = source / "src/ephy_worker/feature.py"
+    test_file = source / "tests/test_feature.py"
+    source_file.parent.mkdir(parents=True)
+    test_file.parent.mkdir(parents=True)
+    source_file.write_text("def answer(value):\n    return value\n", encoding="utf-8")
+    (source_file.parent / "__init__.py").write_text("", encoding="utf-8")
+    original = "from ephy_worker.feature import answer\n\ndef test_original():\n    assert answer(0) >= 0\n"
+    test_file.write_text(original, encoding="utf-8")
+    home = tmp_path / "synthetic-git-home"
+    home.mkdir()
+    for name in ("HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA"):
+        monkeypatch.setenv(name, str(home))
+    subprocess.run(["git", "-C", str(source), "init"], check=True, capture_output=True, timeout=30)
+    subprocess.run(["git", "-C", str(source), "add", "."], check=True, capture_output=True, timeout=30)
+    names = ["src/ephy_worker/feature.py", "tests/test_feature.py"]
+    template = tmp_path / "template.json"
+    write_json(template, {"runtime": {}, "contract": {}})
+    profile = SimpleNamespace(source=source, formal_template=template, formal_template_sha256=file_hash(template),
+        allowed_prefixes=("src/", "tests/"), origin="https://github.com/kirimine170/ephy-worker.git")
+    discovery = LocalDiscovery(SimpleNamespace(repositories={"ephy-worker": profile}))
+    responses = iter([{"repository": "ephy-worker", "allowed_files": names, "semantic_scope": "Correct feature answer"},
+        {"checker_python": "from ephy_worker.feature import answer\nassert answer(1) == 2\n",
+            "known_good": {names[0]: [{"old": "return value", "new": "return value + 1"}],
+                names[1]: [{"append": "\ndef test_regression():\n    assert answer(1) == 2\n"}]},
+            "wrong_answer": {names[0]: [{"old": "return value", "new": "return value - 1"}],
+                names[1]: [{"append": "\ndef test_regression():\n    assert answer(1) == 2\n"}]}}])
+    prompts = []
+    def completion(prompt, _runtime):
+        prompts.append(prompt)
+        return next(responses)
+    monkeypatch.setattr(discovery, "completion", completion)
+    def git(_root, *args):
+        if args[0] == "ls-files":
+            return ("\n".join(names) + "\n").encode()
+        if args[0] == "remote":
+            return profile.origin.encode()
+        return b"" if args[0] == "status" else b"d" * 40
+    monkeypatch.setattr(discovery, "_git", git)
+    observed = []
+    def controls(_profile, directory, prepared, checker, _template):
+        tree = ast.parse(checker.read_text(encoding="utf-8"))
+        emitted = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "preserve_original_tests")
+        assert ast.dump(emitted) == ast.dump(ast.parse(inspect.getsource(preserve_original_tests)).body[0])
+        guard = json.loads((directory / "checker-guard.json").read_text(encoding="utf-8"))
+        assert guard["subjects"] == {names[1]: ["answer"]}
+        for label in ("known_good", "wrong_answer", "unsafe"):
+            root = tmp_path / label
+            for name in ["src/ephy_worker/__init__.py", *names]:
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                replacement = prepared["wrong_answer" if label == "wrong_answer" else "known_good"].get(name)
+                path.write_text((source / name).read_text(encoding="utf-8") if replacement is None else replacement, encoding="utf-8")
+            if label == "unsafe":
+                (root / names[1]).write_text(original + "\ndef test_abort():\n    import os\n    os._exit(0)\n", encoding="utf-8")
+            result = subprocess.run([sys.executable, "-I", "-X", "utf8", "-B", str(checker), str(root)],
+                capture_output=True, text=True, encoding="utf-8", check=False, timeout=30)
+            observed.append((label, result.returncode))
+            assert (result.returncode == 0) == (label == "known_good"), result.stderr
+            if label == "unsafe":
+                assert "new_test_body_unsupported_statement" in result.stderr
+        raise GateFailure("synthetic_prepare_observation_complete")
+    monkeypatch.setattr(discovery, "measure_controls", controls)
+    with pytest.raises(GateFailure, match="synthetic_prepare_observation_complete"):
+        discovery.prepare({"text": "synthetic repair", "previous": None}, tmp_path / "discovery")
+    assert len(observed) == 3
+    assert "No imports anywhere" in prompts[1]
+    assert json.loads(prompts[1])["approved_subject_calls_by_test_file"] == {names[1]: ["answer"]}

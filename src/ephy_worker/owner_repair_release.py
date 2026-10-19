@@ -13,7 +13,7 @@ import httpx
 
 from .formal_artifacts import GateFailure, digest, encode, file_hash, read_json, safe_path, write_json
 from .formal_runtime import command_environment, snapshot
-from .owner_repair import OWNER_USER_ID
+from .owner_repair import OWNER_USER_ID, strict_object
 from .search import QueryPrivacyError, validate_public_text
 
 SHA = re.compile(r"[0-9a-f]{40}\Z")
@@ -241,6 +241,166 @@ class GitHubRelease:
         self.config = config
         self.transport = transport
 
+    @staticmethod
+    def _bind(path: Path, value: dict, *, create: bool) -> str:
+        """A crash may leave the exact record；it may never rebind its inputs．"""
+        raw = encode(value)
+        if not path.exists():
+            if not create:
+                raise GateFailure("release_authorization_missing")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with path.open("xb") as stream:
+                    stream.write(raw)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            except FileExistsError:
+                pass
+        if (not path.is_file() or path.is_symlink() or path.stat().st_nlink != 1
+                or path.read_bytes() != raw):
+            raise GateFailure("release_authorization_binding_changed")
+        return digest(raw)
+
+    def _owner_context(self, store, job: dict) -> dict:
+        """Bind observed private-queue fields, not a signature against local admins．"""
+        current = store.get(job["id"])
+        event = {}
+        for name in ("author", "guild", "channel", "message"):
+            value = current.get(name)
+            if (not isinstance(value, str) or not re.fullmatch(r"[1-9][0-9]{0,19}", value)
+                    or int(value) >= 2**64 or job.get(name) != value):
+                raise GateFailure("release_event_identity_invalid")
+            event[name] = value
+        if (event["author"] != str(OWNER_USER_ID) or type(self.config.guild_id) is not int
+                or event["guild"] != str(self.config.guild_id)
+                or any(type(value) is not int or not 0 < value < 2**64 for value in self.config.channel_ids)
+                or int(event["channel"]) not in self.config.channel_ids):
+            raise GateFailure("release_owner_scope_invalid")
+        expected_id = "repair-" + digest(":".join(event[name] for name in
+            ("guild", "channel", "message", "author")).encode())[:32]
+        text, previous = current.get("text"), current.get("previous")
+        if (current["id"] != expected_id or not isinstance(text, str) or not text.strip() or len(text) > 4000
+                or previous is not None and (not isinstance(previous, str) or len(previous) > 8000)
+                or any(job.get(name) != current.get(name) for name in ("text", "previous"))):
+            raise GateFailure("release_event_payload_invalid")
+        alias = current["data"].get("repository")
+        if alias not in {"ephy-worker", "ephy-runtime"} or alias not in self.config.repositories:
+            raise GateFailure("release_repository_not_registered")
+        profile = self.config.repositories[alias]
+        if (job["data"].get("repository") != alias or profile.github_repository != "kirimine170/" + alias
+                or profile.origin != "https://github.com/" + profile.github_repository + ".git"
+                or profile.branch != "main"):
+            raise GateFailure("release_registry_changed")
+        template = profile.formal_template
+        grant_path = self.config.state_dir / "authorization" / "standing-human-grant.json"
+        if (not template.is_file() or file_hash(template) != profile.formal_template_sha256
+                or any(path.is_symlink() or path.is_junction() for path in (grant_path, *grant_path.parents))
+                or not grant_path.is_file() or grant_path.stat().st_size > 65536
+                or grant_path.stat().st_nlink != 1):
+            raise GateFailure("standing_release_grant_unavailable")
+        try:
+            pinned = strict_object(template.read_text(encoding="utf-8"))["contract"]["runtime_hashes"][str(grant_path)]
+            grant_hash = file_hash(grant_path)
+            if not isinstance(pinned, str) or not re.fullmatch(r"[0-9a-f]{64}", pinned) or pinned != grant_hash:
+                raise ValueError("pin")
+            grant = strict_object(grant_path.read_text(encoding="utf-8"))
+            source = grant["source"]
+            if (set(grant) != {"schema", "grant_id", "mode", "owner_user_id", "repositories", "branch", "actions", "source"}
+                    or grant["schema"] != "ephy.owner-standing-release-grant.v1"
+                    or grant["mode"] != "standing-owner-full-cycle" or type(grant["owner_user_id"]) is not int
+                    or grant["owner_user_id"] != OWNER_USER_ID or grant["branch"] != "main"
+                    or not isinstance(grant["grant_id"], str)
+                    or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,79}", grant["grant_id"])
+                    or not isinstance(grant["repositories"], list) or not grant["repositories"]
+                    or any(value not in {"kirimine170/ephy-worker", "kirimine170/ephy-runtime"}
+                        for value in grant["repositories"])
+                    or len(set(grant["repositories"])) != len(grant["repositories"])
+                    or profile.github_repository not in grant["repositories"]
+                    or grant["actions"] != ["commit", "push", "pull_request", "merge", "deploy", "restart"]
+                    or not isinstance(source, dict)
+                    or set(source) != {"kind", "recorded_by", "reference", "statements"}
+                    or source["kind"] != "operator-recorded-existing-human-instructions"
+                    or source["recorded_by"] != "integration-release-operator"
+                    or not isinstance(source["reference"], str) or not 1 <= len(source["reference"].strip()) <= 256
+                    or not isinstance(source["statements"], list) or not 1 <= len(source["statements"]) <= 16
+                    or any(not isinstance(value, str) or not 1 <= len(value.strip()) <= 2048
+                        for value in source["statements"])):
+                raise ValueError("schema")
+        except (KeyError, TypeError, ValueError):
+            raise GateFailure("standing_release_grant_invalid_or_unpinned") from None
+        event.update(repair_id=current["id"], text_sha256=digest(text.encode()),
+            previous_answer_sha256=None if previous is None else digest(previous.encode()))
+        context = {"schema": "ephy.owner-release-context.v1", "provenance":
+            "authenticated SDK fields checked by bridge and persisted in private queue; not a cryptographic local-writer attestation",
+            "standing_grant": {"id": grant["grant_id"], "sha256": grant_hash,
+                "template_sha256": profile.formal_template_sha256}, "event": event,
+            "registry": {"repository": profile.github_repository, "origin": profile.origin, "branch": profile.branch,
+                "source": str(profile.source.resolve()), "production": str(profile.production.resolve())},
+            "controller_scope": {"guild": str(self.config.guild_id),
+                "channels": sorted(str(value) for value in self.config.channel_ids)}}
+        path = self.config.state_dir / "execution" / current["id"] / "owner-release-context.json"
+        context_hash = self._bind(path, context, create=True)
+        if current["data"].get("owner_release_context_sha256", context_hash) != context_hash:
+            raise GateFailure("release_event_context_changed")
+        store.transition(current["id"], current["stage"], owner_release_context_sha256=context_hash)
+        return context
+
+    def _authorization(self, store, job: dict, frozen: dict, patch: Path, head: str,
+                       tree: str, number: int, *, create: bool = False) -> str:
+        context = self._owner_context(store, job)
+        current = store.get(job["id"])
+        directory = self.config.state_dir / "execution" / job["id"]
+        evidence = directory / "release-evidence.json"
+        formal = Path(current["data"]["formal_job"])
+        profile = self.config.repositories[current["data"]["repository"]]
+        if (not all(isinstance(value, str) and SHA.fullmatch(value) for value in (head, tree, frozen.get("baseRevision")))
+                or type(number) is not int or number <= 0 or current["data"].get("pr_number") != number
+                or current["data"].get("release_head") != head or not isinstance(frozen.get("id"), str)
+                or not frozen["id"] or not formal.is_file() or read_json(formal) != frozen
+                or Path(frozen["repoRoot"]).resolve() != profile.source.resolve()
+                or current["data"].get("patch_sha256") != file_hash(patch)
+                or current["data"].get("evidence_head") != head or not evidence.is_file()
+                or current["data"].get("release_evidence_sha256") != file_hash(evidence)):
+            raise GateFailure("final_release_authorization_inputs_invalid")
+        saved = read_json(evidence)
+        if saved.get("head") != head or not current_head_ready(head, saved["checks"], saved["comments"],
+                saved["threads"], profile.required_checks):
+            raise GateFailure("final_release_authorization_evidence_invalid")
+        record = {"schema": "ephy.owner-final-release-authorization.v1",
+            "basis": "operator-decision-under-existing-standing-human-grant",
+            "new_head_specific_human_approval": False, "standing_grant": context["standing_grant"],
+            "event": context["event"], "context_sha256": current["data"]["owner_release_context_sha256"],
+            "repository": profile.github_repository, "origin": profile.origin, "branch": profile.branch,
+            "formal_proposal": {"id": frozen["id"], "job_sha256": file_hash(formal)},
+            "base": frozen["baseRevision"], "patch_sha256": file_hash(patch), "head": head, "tree": tree,
+            "pr_number": number, "release_evidence_sha256": file_hash(evidence)}
+        authorization_hash = self._bind(directory / "release-authorization.json", record, create=create)
+        data = current["data"]
+        if (not create and (data.get("release_authorization_sha256") != authorization_hash
+                or data.get("release_authorization_head") != head)
+                or create and (data.get("release_authorization_sha256", authorization_hash) != authorization_hash
+                    or data.get("release_authorization_head", head) != head)):
+            raise GateFailure("durable_release_authorization_changed_or_missing")
+        if create:
+            store.transition(job["id"], current["stage"], release_authorization_sha256=authorization_hash,
+                release_authorization_head=head)
+        return authorization_hash
+
+    @staticmethod
+    def _pr_identity(pr: dict, repository: str, number: int, head: str) -> None:
+        if (pr.get("number") != number or type(pr.get("number")) is not int
+                or pr.get("head", {}).get("sha") != head or pr.get("base", {}).get("ref") != "main"
+                or any(pr.get(side, {}).get("repo", {}).get("full_name") != repository for side in ("head", "base"))):
+            raise GateFailure("reviewed_pull_request_identity_changed")
+
+    def _integration_identity(self, profile, integration: Path, candidate: Path, head: str, tree: str) -> None:
+        if (self.git(profile.source, "remote", "get-url", "origin").decode().strip() != profile.origin
+                or self.git(integration, "rev-parse", "HEAD").decode().strip() != head
+                or self.git(integration, "rev-parse", "HEAD^{tree}").decode().strip() != tree
+                or self.git(integration, "status", "--porcelain").strip()
+                or snapshot(integration) != snapshot(candidate)):
+            raise GateFailure("authorized_integration_source_changed")
+
     def _operator(self, argv: list[str], cwd: Path, *, input_bytes: bytes | None = None,
                   timeout: int = 300) -> bytes:
         temporary = self.config.state_dir / "operator-temp"
@@ -277,7 +437,7 @@ class GitHubRelease:
         return response.json()
 
     def _proposal(self, job: dict) -> tuple[dict, Path, Path]:
-        if int(job["author"]) != OWNER_USER_ID:
+        if type(job.get("author")) is not str or job["author"] != str(OWNER_USER_ID):
             raise GateFailure("release_owner_authorization_missing")
         formal = Path(job["data"]["formal_job"])
         from .owner_repair_pipeline import verify_in_interpreter
@@ -375,6 +535,7 @@ class GitHubRelease:
             public_evidence_comments=comment_ids)
 
     def advance(self, store, job: dict) -> None:
+        self._owner_context(store, job)
         frozen, patch, candidate = self._proposal(job)
         profile = self.config.repositories[job["data"]["repository"]]
         if Path(frozen["repoRoot"]).resolve() != profile.source.resolve():
@@ -448,8 +609,7 @@ class GitHubRelease:
         number = data["pr_number"]
         self.publish_evidence(prefix, number, job, report, store)
         pr = self.api("GET", prefix + "/pulls/" + str(number))
-        if pr.get("head", {}).get("sha") != head or pr.get("base", {}).get("ref") != profile.branch:
-            raise GateFailure("reviewed_pull_request_identity_changed")
+        self._pr_identity(pr, profile.github_repository, number, head)
         if not pr.get("merged"):
             if pr.get("state") != "open":
                 raise GateFailure("repair_pull_request_closed")
@@ -478,15 +638,27 @@ class GitHubRelease:
             if len(comments) >= 100 or not current_head_ready(head, checks, comments, threads, profile.required_checks):
                 raise ReviewPending("waiting_for_exact_head_ci_and_codex_review")
             self._proposal(store.get(job["id"]))
+            self._integration_identity(profile, integration, candidate, head, tree)
             evidence = directory / "release-evidence.json"
-            write_json(evidence, {"head": head, "checks": checks, "comments": comments, "threads": threads})
+            self._bind(evidence, {"head": head, "checks": checks, "comments": comments, "threads": threads}, create=True)
             store.transition(job["id"], "merge_pending", evidence_head=head,
                 release_evidence_sha256=file_hash(evidence))
+            self._authorization(store, store.get(job["id"]), frozen, patch, head, tree, number, create=True)
+            # Recheck the persisted derivation, proposal and live PR immediately
+            # before the separate operator uses the standing merge authority．
+            self._proposal(store.get(job["id"]))
+            self._pr_identity(self.api("GET", prefix + "/pulls/" + str(number)),
+                profile.github_repository, number, head)
+            self._authorization(store, store.get(job["id"]), frozen, patch, head, tree, number)
             merged = self.api("PUT", prefix + "/pulls/" + str(number) + "/merge",
                 {"sha": head, "merge_method": "squash"})
             if merged.get("merged") is not True or not SHA.fullmatch(merged.get("sha", "")):
                 raise GateFailure("github_merge_not_confirmed")
             pr = self.api("GET", prefix + "/pulls/" + str(number))
+            if pr.get("merge_commit_sha") != merged["sha"]:
+                raise GateFailure("merged_result_identity_changed")
+        self._pr_identity(pr, profile.github_repository, number, head)
+        self._authorization(store, store.get(job["id"]), frozen, patch, head, tree, number)
         current = store.get(job["id"])["data"]
         evidence = directory / "release-evidence.json"
         if (current.get("evidence_head") != head or not evidence.is_file()
@@ -499,15 +671,28 @@ class GitHubRelease:
         commit = pr.get("merge_commit_sha", "")
         if not pr.get("merged") or not SHA.fullmatch(commit):
             raise GateFailure("merged_commit_identity_missing")
+        self._bind(directory / "authorized-merge.json", {"schema": "ephy.owner-authorized-merge.v1",
+            "authorization_sha256": store.get(job["id"])["data"]["release_authorization_sha256"],
+            "repository": profile.github_repository, "pr_number": number, "head": head,
+            "merged_commit": commit}, create=True)
+        if current.get("merged_commit", commit) != commit:
+            raise GateFailure("merged_commit_binding_changed")
         store.transition(job["id"], "deployment_pending", merged_commit=commit)
         adapter = self.config.release_adapter
         if file_hash(adapter) != self.config.release_adapter_sha256:
             raise GateFailure("release_adapter_changed")
         request = self.config.state_dir / "releases" / job["id"] / "release-request.json"
         request.parent.mkdir(parents=True, exist_ok=True)
-        write_json(request, {"schema": "ephy.owner-repair-release.v1", "repair_id": job["id"],
+        self._bind(request, {"schema": "ephy.owner-repair-release.v1", "repair_id": job["id"],
             "owner_user_id": OWNER_USER_ID, "repository": profile.github_repository,
-            "deployed_commit": commit, "pr_number": number, "head_sha": head})
+            "deployed_commit": commit, "pr_number": number, "head_sha": head}, create=True)
+        self._proposal(store.get(job["id"]))
+        self._integration_identity(profile, integration, candidate, head, tree)
+        latest = self.api("GET", prefix + "/pulls/" + str(number))
+        self._pr_identity(latest, profile.github_repository, number, head)
+        if latest.get("merged") is not True or latest.get("merge_commit_sha") != commit:
+            raise GateFailure("deployment_pull_request_binding_changed")
+        self._authorization(store, store.get(job["id"]), frozen, patch, head, tree, number)
         try:
             output = self._operator([self.config.powershell, "-NoProfile", "-NonInteractive", "-File",
                 str(adapter), "-RepairRequest", str(request)], directory, timeout=7200)
@@ -517,10 +702,11 @@ class GitHubRelease:
             result = json.loads(output)
         except (ValueError, UnicodeError):
             raise GateFailure("release_adapter_result_invalid") from None
-        write_json(directory / "release-result.json", result)
+        self._bind(directory / "release-result.json", result, create=True)
         if (result.get("deployed_commit") != commit or result.get("healthy") is not True
                 or result.get("model_identity_unchanged") is not True):
             raise GateFailure("production_deployment_not_verified")
+        self._authorization(store, store.get(job["id"]), frozen, patch, head, tree, number)
         # Persist the result before the bot's independent outbox drain can send it．
         store.finish(job["id"], "completed", "修正とテスト，独立レビューを終え，本番へ反映して再起動しました．\n"
             + "変更内容と検証結果はこちらです：" + data["pr_url"], deployed_commit=commit,

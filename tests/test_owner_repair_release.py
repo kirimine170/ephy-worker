@@ -105,6 +105,7 @@ def test_deployment_failure_never_marks_completed(tmp_path, monkeypatch, result)
     store.transition(identifier, "deployment_pending", repository="ephy-worker", release_head=HEAD,
         pr_number=1, pr_url="https://github.com/kirimine170/ephy-worker/pull/1", evidence_head=HEAD,
         release_evidence_sha256=file_hash(directory / "release-evidence.json"))
+    _review_v11_release_fixture(release, store, identifier, monkeypatch, merged=True)
     with pytest.raises(GateFailure, match="deployment_not_verified"):
         release.advance(store, store.get(identifier))
     assert store.get(identifier)["stage"] == "deployment_pending"
@@ -142,6 +143,7 @@ def test_successful_deployment_atomically_persists_completion_and_message(tmp_pa
     store.transition(identifier, "deployment_pending", repository="ephy-worker", release_head=HEAD,
         pr_number=1, pr_url="https://github.com/kirimine170/ephy-worker/pull/1", evidence_head=HEAD,
         release_evidence_sha256=file_hash(directory / "release-evidence.json"))
+    _review_v11_release_fixture(release, store, identifier, monkeypatch, merged=True)
     release.advance(store, store.get(identifier))
     assert store.get(identifier)["stage"] == "completed" and len(store.pending(guild_id=11, channel_ids=(20,))) == 1
 
@@ -286,6 +288,7 @@ def test_review_relay_selection_preserves_exact_head_gate_and_has_no_cli_fallbac
     monkeypatch.setattr(release, "request_owner_review", relay)
     store.transition(identifier, "review_pending", repository="ephy-worker", release_head=HEAD,
         pr_number=9, pr_url="https://github.com/kirimine170/ephy-worker/pull/9")
+    _review_v11_release_fixture(release, store, identifier, monkeypatch, merged=False)
     with pytest.raises(ReviewPending):
         release.advance(store, store.get(identifier))
     assert bool(posted) == (mode == "default")
@@ -418,3 +421,315 @@ def test_public_report_chunking_preserves_utf8_content_and_recorded_binding(tmp_
     assert json.loads(combined) == report
     assert store.get(identifier)["data"]["public_evidence_sha256"] == digest(combined.encode())
     assert file_hash(store.root / "execution" / identifier / "public-evidence.json") == digest(combined.encode())
+
+
+def _review_v11_release_fixture(release, store, identifier, monkeypatch, merged=True):
+    """Actual pinned synthetic authority；never read operator-private artifacts．"""
+    job = store.get(identifier)
+    release.config.guild_id = int(job["guild"])
+    release.config.channel_ids = (int(job["channel"]),)
+    profile = release.config.repositories[job["data"]["repository"]]
+    profile.production = getattr(profile, "production", profile.source.parent / "production")
+    grant = {"schema": "ephy.owner-standing-release-grant.v1", "grant_id": "synthetic-test-standing-grant",
+        "mode": "standing-owner-full-cycle", "owner_user_id": OWNER_USER_ID,
+        "repositories": [profile.github_repository], "branch": "main",
+        "actions": ["commit", "push", "pull_request", "merge", "deploy", "restart"],
+        "source": {"kind": "operator-recorded-existing-human-instructions",
+            "recorded_by": "integration-release-operator", "reference": "synthetic-fixture-only-not-a-human-event",
+            "statements": ["Synthetic test records the standing full-cycle authority; no real approval is asserted."]}}
+    grant_path = store.root / "authorization" / "standing-human-grant.json"
+    grant_path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(grant_path, grant)
+    profile.formal_template = store.root / "synthetic-template.json"
+    write_json(profile.formal_template, {"contract": {"runtime_hashes": {str(grant_path): file_hash(grant_path)}}})
+    profile.formal_template_sha256 = file_hash(profile.formal_template)
+    original_proposal = release._proposal
+    frozen, patch, _candidate = original_proposal(job)
+    frozen.setdefault("id", "synthetic-proposal-only")
+    frozen.setdefault("baseRevision", "d" * 40)
+    frozen.setdefault("contract", {"allowed_files": ["src/example.py"]})
+    def proposal(actual):
+        observed, actual_patch, actual_candidate = original_proposal(actual)
+        return {**frozen, **observed}, actual_patch, actual_candidate
+    monkeypatch.setattr(release, "_proposal", proposal)
+    formal = store.root / "execution" / identifier / "synthetic-formal.json"
+    write_json(formal, frozen)
+    store.transition(identifier, job["stage"], formal_job=str(formal), patch_sha256=file_hash(patch))
+    original_api = release.api
+    def api(method, path, payload=None):
+        result = original_api(method, path, payload)
+        if method == "GET" and "/pulls/" in path and isinstance(result, dict):
+            result = copy.deepcopy(result)
+            result.setdefault("number", store.get(identifier)["data"]["pr_number"])
+            for side in ("head", "base"):
+                side_data = result.setdefault(side, {})
+                if isinstance(side_data, dict):
+                    repo = side_data.setdefault("repo", {})
+                    if isinstance(repo, dict):
+                        repo.setdefault("full_name", profile.github_repository)
+        return result
+    monkeypatch.setattr(release, "api", api)
+    release._owner_context(store, store.get(identifier))
+    if merged:
+        release._authorization(store, store.get(identifier), frozen, patch, HEAD, HEAD,
+            store.get(identifier)["data"]["pr_number"], create=True)
+
+
+def _review_v11_case(tmp_path, monkeypatch, *, merged=False):
+    store = RepairStore(tmp_path / "state")
+    identifier = store.enqueue(guild_id=11, channel_id=20, message_id=123, author_id=OWNER_USER_ID,
+        text="synthetic private directive", previous_answer="synthetic private context")
+    directory = store.root / "execution" / identifier
+    directory.mkdir(parents=True)
+    source = tmp_path / "source"
+    source.mkdir()
+    adapter = tmp_path / "adapter.ps1"
+    adapter.write_text("# synthetic inert adapter", encoding="utf-8")
+    profile = SimpleNamespace(source=source, production=tmp_path / "production", branch="main",
+        origin="https://github.com/kirimine170/ephy-worker.git", github_repository="kirimine170/ephy-worker",
+        required_checks=("tests",))
+    release = GitHubRelease(SimpleNamespace(state_dir=store.root, repositories={"ephy-worker": profile},
+        release_adapter=adapter, release_adapter_sha256=file_hash(adapter), powershell="synthetic-powershell"))
+    patch = directory / "candidate.patch"
+    patch.write_text("synthetic frozen patch", encoding="utf-8")
+    frozen = {"id": "synthetic-formal-job", "repoRoot": str(source), "baseRevision": "d" * 40,
+        "contract": {"allowed_files": ["src/example.py"]}}
+    monkeypatch.setattr(release, "_proposal", lambda _: (frozen, patch, tmp_path / "candidate"))
+    monkeypatch.setattr("ephy_worker.owner_repair_release.snapshot", lambda _: {})
+    monkeypatch.setattr("ephy_worker.owner_repair_release.public_evidence", lambda *_: {"head": HEAD})
+    monkeypatch.setattr(release, "publish_evidence", lambda *_: None)
+    calls = []
+    def git(_root, *args):
+        calls.append(("git", args))
+        return profile.origin.encode() if args[0] == "remote" else HEAD.encode() if args[0] == "rev-parse" else b""
+    monkeypatch.setattr(release, "git", git)
+    remote = {"merged": merged}
+    def api(method, path, payload=None):
+        calls.append((method, path))
+        if method == "PUT":
+            data = store.get(identifier)["data"]
+            authorization = directory / "release-authorization.json"
+            assert data["release_authorization_sha256"] == file_hash(authorization)
+            assert data["release_authorization_head"] == payload["sha"] == HEAD
+            remote["merged"] = True
+            return {"merged": True, "sha": "b" * 40}
+        if "/pulls/" in path:
+            return {"number": 1, "head": {"sha": HEAD, "repo": {"full_name": profile.github_repository}},
+                "base": {"ref": "main", "repo": {"full_name": profile.github_repository}}, "state": "open",
+                "merged": remote["merged"], "merge_commit_sha": "b" * 40}
+        if "check-runs" in path:
+            return evidence()[0]
+        if path == "/graphql":
+            return {"data": {"repository": {"pullRequest": {"reviewThreads": evidence()[2]}}}}
+        return evidence()[1]
+    monkeypatch.setattr(release, "api", api)
+    def operator(argv, *_args, **_kwargs):
+        calls.append(("deploy", argv))
+        request = json.loads(Path(argv[-1]).read_text(encoding="utf-8"))
+        assert set(request) == {"schema", "repair_id", "owner_user_id", "repository", "deployed_commit", "pr_number", "head_sha"}
+        return json.dumps({"deployed_commit": "b" * 40, "healthy": True, "model_identity_unchanged": True}).encode()
+    monkeypatch.setattr(release, "_operator", operator)
+    store.transition(identifier, "review_pending", repository="ephy-worker", release_head=HEAD,
+        pr_number=1, pr_url="https://github.com/kirimine170/ephy-worker/pull/1", review_requested=True)
+    if merged:
+        checks, comments, threads = evidence()
+        write_json(directory / "release-evidence.json", {"head": HEAD, "checks": checks, "comments": comments, "threads": threads})
+        store.transition(identifier, "deployment_pending", evidence_head=HEAD,
+            release_evidence_sha256=file_hash(directory / "release-evidence.json"))
+    _review_v11_release_fixture(release, store, identifier, monkeypatch, merged=merged)
+    calls.clear()
+    return store, identifier, release, calls
+
+
+def test_review_v11_standing_authority_is_durable_before_merge_and_resumes(tmp_path, monkeypatch):
+    store, identifier, release, calls = _review_v11_case(tmp_path, monkeypatch)
+    release.advance(store, store.get(identifier))
+    directory = store.root / "execution" / identifier
+    record = json.loads((directory / "release-authorization.json").read_text(encoding="utf-8"))
+    assert record["new_head_specific_human_approval"] is False
+    assert record["event"]["author"] == str(OWNER_USER_ID)
+    assert record["event"]["text_sha256"] == digest(store.get(identifier)["text"].encode())
+    assert record["head"] == record["tree"] == HEAD
+    assert record["standing_grant"]["sha256"] == file_hash(store.root / "authorization" / "standing-human-grant.json")
+    assert any(call[0] == "PUT" for call in calls) and any(call[0] == "deploy" for call in calls)
+    original = (directory / "release-authorization.json").read_bytes()
+    frozen, patch, _ = release._proposal(store.get(identifier))
+    release._authorization(RepairStore(store.root), store.get(identifier), frozen, patch, HEAD, HEAD, 1)
+    assert (directory / "release-authorization.json").read_bytes() == original
+    assert sum(call[0] == "PUT" for call in calls) == 1
+    assert store.get(identifier)["stage"] == "completed"
+
+
+@pytest.mark.parametrize("fault", ["missing_grant", "unpinned_grant", "owner_bool", "extra_head", "duplicate_key",
+    "wrong_guild", "wrong_channel", "noncanonical_owner", "message_changed", "text_changed", "context_changed",
+    "grant_revoked", "authorization_changed", "authorization_missing", "formal_changed", "evidence_changed"])
+def test_review_v11_changed_or_incomplete_authority_never_merges_or_deploys(tmp_path, monkeypatch, fault):
+    store, identifier, release, calls = _review_v11_case(tmp_path, monkeypatch, merged=True)
+    grant_path = store.root / "authorization" / "standing-human-grant.json"
+    profile = release.config.repositories["ephy-worker"]
+    if fault == "missing_grant":
+        grant_path.unlink()
+    elif fault in {"unpinned_grant", "owner_bool", "extra_head", "duplicate_key", "grant_revoked"}:
+        grant = json.loads(grant_path.read_text(encoding="utf-8"))
+        if fault == "owner_bool":
+            grant["owner_user_id"] = True
+        elif fault == "extra_head":
+            grant["head"] = HEAD
+        elif fault == "grant_revoked":
+            grant["actions"].remove("merge")
+        else:
+            grant["grant_id"] = "changed-grant"
+        grant_path.write_text(json.dumps(grant), encoding="utf-8")
+        if fault == "duplicate_key":
+            grant_path.write_text('{"schema":"duplicate",' + grant_path.read_text(encoding="utf-8")[1:], encoding="utf-8")
+        if fault != "unpinned_grant":
+            profile.formal_template.write_text(json.dumps({"contract": {"runtime_hashes": {str(grant_path): file_hash(grant_path)}}}), encoding="utf-8")
+            profile.formal_template_sha256 = file_hash(profile.formal_template)
+    elif fault in {"wrong_guild", "wrong_channel", "noncanonical_owner", "message_changed", "text_changed", "context_changed"}:
+        column, value = {"wrong_guild": ("guild", "12"), "wrong_channel": ("channel", "21"),
+            "noncanonical_owner": ("author", "0" + str(OWNER_USER_ID)), "message_changed": ("message", "124"),
+            "text_changed": ("text", "changed directive"), "context_changed": ("previous", "changed context")}[fault]
+        with store.db() as db:
+            db.execute("UPDATE jobs SET " + column + "=? WHERE id=?", (value, identifier))
+    else:
+        filename = {"authorization_changed": "release-authorization.json", "authorization_missing": "release-authorization.json",
+            "formal_changed": "synthetic-formal.json", "evidence_changed": "release-evidence.json"}[fault]
+        path = store.root / "execution" / identifier / filename
+        if fault == "authorization_missing":
+            path.unlink()
+        else:
+            path.write_text("{}", encoding="utf-8")
+    with pytest.raises((GateFailure, ValueError, KeyError)):
+        release.advance(store, store.get(identifier))
+    assert not any(call[0] in {"PUT", "deploy"} for call in calls)
+    assert store.get(identifier)["stage"] != "completed"
+
+
+def test_review_v11_premerged_evidence_without_authorization_cannot_deploy(tmp_path, monkeypatch):
+    store, identifier, release, calls = _review_v11_case(tmp_path, monkeypatch, merged=True)
+    with store.db() as db:
+        data = store.get(identifier)["data"]
+        data.pop("release_authorization_sha256")
+        db.execute("UPDATE jobs SET data=? WHERE id=?", (json.dumps(data), identifier))
+    with pytest.raises(GateFailure, match="authorization"):
+        release.advance(store, store.get(identifier))
+    assert not any(call[0] in {"PUT", "deploy"} for call in calls)
+
+
+def _review_v12_api_fixture(tmp_path, monkeypatch, callback):
+    store = RepairStore(tmp_path / "state")
+    identifier = store.enqueue(guild_id=11, channel_id=20, message_id=321, author_id=OWNER_USER_ID,
+        text="synthetic fixture integrity directive")
+    source = tmp_path / "source"
+    source.mkdir()
+    directory = store.root / "execution" / identifier
+    directory.mkdir(parents=True)
+    patch = directory / "fixture.patch"
+    patch.write_text("synthetic inert patch", encoding="utf-8")
+    profile = SimpleNamespace(source=source, origin="https://github.com/kirimine170/ephy-worker.git",
+        github_repository="kirimine170/ephy-worker", branch="main", required_checks=("tests",))
+    release = GitHubRelease(SimpleNamespace(state_dir=store.root, repositories={"ephy-worker": profile}))
+    monkeypatch.setattr(release, "_proposal", lambda _: ({"repoRoot": str(source)}, patch, tmp_path / "candidate"))
+    monkeypatch.setattr(release, "api", callback)
+    store.transition(identifier, "review_pending", repository="ephy-worker", pr_number=9)
+    _review_v11_release_fixture(release, store, identifier, monkeypatch, merged=False)
+    assert store.get(identifier)["stage"] == "review_pending"
+    assert not (directory / "release-evidence.json").exists()
+    assert not (directory / "release-authorization.json").exists()
+    return release
+
+
+@pytest.mark.parametrize("response", [
+    {"number": None}, {"number": "9"}, {"number": 77}, {"number": True},
+    {"head": None}, {"head": []}, {"base": "wrong-shape"},
+    {"head": {"sha": "f" * 40, "repo": None}},
+    {"head": {"repo": []}}, {"head": {"repo": {"full_name": None}}},
+    {"base": {"ref": "other-branch", "repo": {"full_name": "wrong/repository", "id": 17}}},
+    {"number": 99, "head": {"sha": "f" * 40, "repo": {"full_name": "wrong/repo", "id": None}},
+        "base": {"ref": "wrong", "repo": False}, "state": "closed", "merged": False, "fault": [None, "retained"]},
+])
+def test_review_v12_pr_fixture_preserves_existing_identity_and_fault_values(tmp_path, monkeypatch, response):
+    original = copy.deepcopy(response)
+    calls = []
+    payload = {"sentinel": "original-callback-payload"}
+    def callback(method, path, actual_payload=None):
+        calls.append((method, path, actual_payload))
+        return response
+    release = _review_v12_api_fixture(tmp_path, monkeypatch, callback)
+    path = "/repos/kirimine170/ephy-worker/pulls/9"
+    returned = release.api("GET", path, payload)
+    assert calls == [("GET", path, payload)] and calls[0][2] is payload
+    assert response == original and returned is not response
+    def preserve(before, after):
+        if isinstance(before, dict):
+            assert isinstance(after, dict)
+            for key, value in before.items():
+                assert key in after
+                preserve(value, after[key])
+        else:
+            assert type(before) is type(after) and before == after
+    preserve(original, returned)
+    def paths(value, prefix=""):
+        result = set()
+        if isinstance(value, dict):
+            for key, item in value.items():
+                current = prefix + "." + key
+                result.add(current)
+                result.update(paths(item, current))
+        return result
+    assert paths(returned) - paths(original) <= {".number", ".head", ".base", ".head.repo", ".base.repo",
+        ".head.repo.full_name", ".base.repo.full_name"}
+    with pytest.raises((GateFailure, AttributeError, TypeError)):
+        release._pr_identity(returned, "kirimine170/ephy-worker", 9, HEAD)
+
+
+def test_review_v12_pr_fixture_fills_only_missing_identity_without_mutating_original(tmp_path, monkeypatch):
+    response = {"head": {"sha": HEAD, "other": [1, None]}, "base": {"ref": "main"},
+        "state": "open", "merged": False, "sentinel": "unchanged"}
+    original = copy.deepcopy(response)
+    calls = []
+    def callback(*args):
+        calls.append(args)
+        return response
+    release = _review_v12_api_fixture(tmp_path, monkeypatch, callback)
+    path = "/repos/kirimine170/ephy-worker/pulls/9"
+    result = release.api("GET", path)
+    assert calls == [("GET", path, None)]
+    assert response == original
+    assert result == {**original, "number": 9,
+        "head": {**original["head"], "repo": {"full_name": "kirimine170/ephy-worker"}},
+        "base": {**original["base"], "repo": {"full_name": "kirimine170/ephy-worker"}}}
+    release._pr_identity(result, "kirimine170/ephy-worker", 9, HEAD)
+
+
+@pytest.mark.parametrize("method,path,response", [
+    ("POST", "/repos/kirimine170/ephy-worker/pulls/9", {"number": None}),
+    ("PUT", "/repos/kirimine170/ephy-worker/pulls/9/merge", {"merged": False}),
+    ("GET", "/repos/kirimine170/ephy-worker/issues/9", {"number": None}),
+    ("GET", "/repos/kirimine170/ephy-worker/pulls/9", [None, {"number": 77}]),
+    ("GET", "/repos/kirimine170/ephy-worker/pulls/9", None),
+    ("GET", "/repos/kirimine170/ephy-worker/pulls/9", "wrong-result"),
+])
+def test_review_v12_nonmatching_api_fixture_returns_original_object_and_calls_once(tmp_path, monkeypatch, method, path, response):
+    calls = []
+    payload = {"original": True}
+    def callback(*args):
+        calls.append(args)
+        return response
+    release = _review_v12_api_fixture(tmp_path, monkeypatch, callback)
+    assert release.api(method, path, payload) is response
+    assert calls == [(method, path, payload)] and calls[0][2] is payload
+
+
+def test_review_v12_original_api_exception_and_call_arguments_are_unchanged(tmp_path, monkeypatch):
+    calls = []
+    original_error = GateFailure("synthetic original callback failure")
+    def callback(*args):
+        calls.append(args)
+        raise original_error
+    release = _review_v12_api_fixture(tmp_path, monkeypatch, callback)
+    path = "/repos/kirimine170/ephy-worker/pulls/9"
+    with pytest.raises(GateFailure) as caught:
+        release.api("GET", path)
+    assert caught.value is original_error
+    assert calls == [("GET", path, None)]

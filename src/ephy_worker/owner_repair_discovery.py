@@ -194,8 +194,8 @@ def authority_fingerprint(source: str) -> dict:
     return {"protected": protected, "signatures": signatures}
 
 
-def preserve_original_tests(original: str, candidate: str) -> None:
-    """Keep original AST exact；new functions have inert collection signatures．"""
+def preserve_original_tests(original: str, candidate: str, subjects: tuple[str, ...] = ()) -> None:
+    """Exact prefix plus a closed appended-test DSL, not a Python sandbox．"""
     before, after = ast.parse(original), ast.parse(candidate)
     old_nodes = [ast.dump(node, include_attributes=False) for node in before.body]
     prefix = [ast.dump(node, include_attributes=False) for node in after.body[:len(before.body)]]
@@ -218,6 +218,7 @@ def preserve_original_tests(original: str, candidate: str) -> None:
         collect(node)
     old_test_names = {node.name for node in ast.walk(before)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_")}
+    original_bindings = set(bindings)
     for node in after.body[len(before.body):]:
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             raise ValueError("only_new_test_or_helper_functions_may_append")  # noqa: TRY004 — invalid source AST value．
@@ -240,6 +241,262 @@ def preserve_original_tests(original: str, candidate: str) -> None:
         if any(isinstance(child, ast.Attribute) and child.attr in {"skip", "skipif", "xfail"}
                 for child in ast.walk(node)):
             raise ValueError("new_test_skip_or_xfail")
+    added = after.body[len(before.body):]
+    if len(added) > 64 or sum(1 for node in added for _ in ast.walk(node)) > 4096:
+        raise ValueError("new_test_body_budget")
+    functions = {node.name: node for node in added}
+    pure = {"abs", "all", "any", "bool", "bytes", "dict", "enumerate", "float", "frozenset", "int",
+        "isinstance", "len", "list", "max", "min", "range", "reversed", "set", "sorted", "str", "sum", "tuple", "zip"}
+    pure -= original_bindings
+    methods = {"capitalize", "casefold", "count", "endswith", "find", "get", "index", "isalnum", "isalpha",
+        "isascii", "isdecimal", "isdigit", "islower", "isspace", "istitle", "isupper", "items", "join", "keys",
+        "lower", "lstrip", "partition", "removeprefix", "removesuffix", "replace", "rfind", "rindex", "rpartition",
+        "rsplit", "rstrip", "split", "splitlines", "startswith", "strip", "swapcase", "title", "upper", "values"}
+    graph = {name: [] for name in functions}
+    subject_names = set(subjects)
+    if any(not isinstance(name, str) or not all(part.isidentifier() and not part.startswith("_")
+            for part in name.split(".")) for name in subjects):
+        raise ValueError("new_test_subject_binding_invalid")
+    def dotted(node):
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return dotted(node.value) + "." + node.attr
+        return ""
+    def literal(node):
+        if isinstance(node, ast.Constant):
+            value = node.value
+            return (type(value) in {str, bytes} and len(value) <= 4096 or value is None
+                or type(value) is bool or type(value) is int and value.bit_length() <= 64
+                or type(value) is float and -1e100 <= value <= 1e100)
+        if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+            return len(node.elts) <= 128 and all(literal(value) for value in node.elts)
+        if isinstance(node, ast.Dict):
+            return len(node.keys) <= 128 and all(key is not None and literal(key) and literal(value)
+                for key, value in zip(node.keys, node.values))
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            return isinstance(node.operand, ast.Constant) and type(node.operand.value) in {int, float} and literal(node.operand)
+        return False
+    fixture_decorators = set()
+    for node in before.body:
+        if isinstance(node, ast.Import):
+            fixture_decorators.update((alias.asname or "pytest") + ".fixture" for alias in node.names if alias.name == "pytest")
+        elif isinstance(node, ast.ImportFrom) and node.module == "pytest" and not node.level:
+            fixture_decorators.update(alias.asname or alias.name for alias in node.names if alias.name == "fixture")
+    fixtures = set()
+    for node in before.body:
+        if not isinstance(node, ast.FunctionDef) or len(node.decorator_list) != 1:
+            continue
+        body = node.body[1:] if (node.body and isinstance(node.body[0], ast.Expr)
+            and isinstance(node.body[0].value, ast.Constant) and isinstance(node.body[0].value.value, str)) else node.body
+        if (dotted(node.decorator_list[0]) in fixture_decorators and not node.args.posonlyargs and not node.args.args
+                and not node.args.kwonlyargs and not node.args.vararg and not node.args.kwarg and not node.type_params
+                and node.returns is None and len(body) == 1 and isinstance(body[0], ast.Return)
+                and literal(body[0].value)):
+            fixtures.add(node.name)
+    def bound(node, local_bounds):
+        if isinstance(node, ast.Constant) and type(node.value) in {str, bytes} and literal(node):
+            return len(node.value)
+        if isinstance(node, (ast.Tuple, ast.List, ast.Set)) and literal(node):
+            return len(node.elts)
+        if isinstance(node, ast.Dict) and literal(node):
+            return len(node.keys)
+        if isinstance(node, ast.Name):
+            return local_bounds.get(node.id)
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "range"
+                and not node.keywords and 1 <= len(node.args) <= 3 and all(isinstance(arg, ast.Constant)
+                    and type(arg.value) is int and abs(arg.value) <= 4096 for arg in node.args)):
+            try:
+                length = len(range(*(arg.value for arg in node.args)))
+            except ValueError:
+                return None
+            return length if length <= 128 else None
+        return None
+    def validate(node):
+        if (not node.name.startswith(("test_", "helper_")) or node.name.startswith("test_pytest_")
+                or node.name in pure or node.name in subject_names):
+            raise ValueError("new_test_body_function_name")
+        args = [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
+        args += [arg for arg in (node.args.vararg, node.args.kwarg) if arg is not None]
+        local = {arg.arg for arg in args}
+        reserved = pure | set(functions) | {name.split(".")[0] for name in subject_names}
+        if any(name.startswith("_") or name in reserved for name in local):
+            raise ValueError("new_test_body_parameter")
+        if node.name.startswith("test_") and (isinstance(node, ast.AsyncFunctionDef)
+                or node.args.vararg or node.args.kwarg or not local <= fixtures):
+            raise ValueError("new_test_body_fixture_capability")
+        bounds = {}
+        def expression(item, names, limits):
+            if isinstance(item, ast.Constant):
+                if not literal(item):
+                    raise ValueError("new_test_body_literal_budget")
+            elif isinstance(item, ast.Name):
+                if item.id not in names and item.id not in {"bool", "bytes", "float", "int", "str"} & pure:
+                    raise ValueError("new_test_body_unresolved_name")
+            elif isinstance(item, (ast.List, ast.Tuple, ast.Set)):
+                if len(item.elts) > 128:
+                    raise ValueError("new_test_body_container_budget")
+                for value in item.elts:
+                    expression(value, names, limits)
+            elif isinstance(item, ast.Dict):
+                if len(item.keys) > 128 or any(key is None for key in item.keys):
+                    raise ValueError("new_test_body_dictionary")
+                for key, value in zip(item.keys, item.values):
+                    expression(key, names, limits)
+                    expression(value, names, limits)
+            elif isinstance(item, ast.UnaryOp) and isinstance(item.op, (ast.Not, ast.USub, ast.UAdd)):
+                expression(item.operand, names, limits)
+            elif isinstance(item, ast.BinOp) and isinstance(item.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv)):
+                if not literal(item.left) and not literal(item.right):
+                    raise ValueError("new_test_body_arithmetic_budget")
+                if isinstance(item.op, ast.Mult) and not (literal(item.left) and literal(item.right)
+                        and isinstance(item.left, ast.Constant) and isinstance(item.right, ast.Constant)
+                        and type(item.left.value) in {int, float} and type(item.right.value) in {int, float}):
+                    raise ValueError("new_test_body_allocation")
+                expression(item.left, names, limits)
+                expression(item.right, names, limits)
+            elif isinstance(item, ast.BoolOp) and isinstance(item.op, (ast.And, ast.Or)):
+                for value in item.values:
+                    expression(value, names, limits)
+            elif isinstance(item, ast.Compare) and all(isinstance(op, (ast.Eq, ast.NotEq, ast.Lt, ast.LtE,
+                    ast.Gt, ast.GtE, ast.Is, ast.IsNot, ast.In, ast.NotIn)) for op in item.ops):
+                for value in (item.left, *item.comparators):
+                    expression(value, names, limits)
+            elif isinstance(item, ast.IfExp):
+                for value in (item.test, item.body, item.orelse):
+                    expression(value, names, limits)
+            elif isinstance(item, ast.Subscript) and isinstance(item.ctx, ast.Load):
+                expression(item.value, names, limits)
+                if isinstance(item.slice, ast.Slice):
+                    for value in (item.slice.lower, item.slice.upper, item.slice.step):
+                        if value is not None:
+                            expression(value, names, limits)
+                else:
+                    expression(item.slice, names, limits)
+            elif isinstance(item, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                if (len(item.generators) != 1 or sum(isinstance(value, (ast.ListComp, ast.SetComp,
+                        ast.DictComp, ast.GeneratorExp)) for value in ast.walk(item)) != 1
+                        or any(isinstance(value, ast.Call) and (not isinstance(value.func, ast.Name)
+                            or value.func.id not in pure) for value in ast.walk(item))):
+                    raise ValueError("new_test_body_comprehension_budget")
+                gen = item.generators[0]
+                size = bound(gen.iter, limits)
+                if (gen.is_async or not isinstance(gen.target, ast.Name) or gen.target.id.startswith("_")
+                        or gen.target.id in reserved or size is None):
+                    raise ValueError("new_test_body_unbounded_comprehension")
+                expression(gen.iter, names, limits)
+                nested = names | {gen.target.id}
+                for condition in gen.ifs:
+                    expression(condition, nested, limits)
+                for value in ((item.key, item.value) if isinstance(item, ast.DictComp) else (item.elt,)):
+                    expression(value, nested, limits)
+            elif isinstance(item, ast.Call):
+                call = dotted(item.func)
+                if call in subject_names:
+                    if call.split(".")[0] in names:
+                        raise ValueError("new_test_body_subject_shadowed")
+                elif isinstance(item.func, ast.Name) and item.func.id not in names:
+                    target = item.func.id
+                    if target in functions and target.startswith("helper_") and not isinstance(functions[target], ast.AsyncFunctionDef):
+                        graph[node.name].append(target)
+                    elif target not in pure:
+                        raise ValueError("new_test_body_call_capability")
+                    if target == "range" and bound(item, limits) is None:
+                        raise ValueError("new_test_body_range_budget")
+                elif isinstance(item.func, ast.Attribute) and item.func.attr in methods:
+                    if bound(item.func.value, limits) is None:
+                        raise ValueError("new_test_body_unbounded_method_receiver")
+                    expression(item.func.value, names, limits)
+                else:
+                    raise ValueError("new_test_body_dynamic_call")
+                if any(keyword.arg is None for keyword in item.keywords):
+                    raise ValueError("new_test_body_dynamic_keyword")
+                for value in (*item.args, *(keyword.value for keyword in item.keywords)):
+                    expression(value, names, limits)
+            else:
+                raise ValueError("new_test_body_unsupported_expression")
+        def statements(items, names, limits):
+            for index, item in enumerate(items):
+                if isinstance(item, ast.Expr) and index == 0 and isinstance(item.value, ast.Constant) and isinstance(item.value.value, str):
+                    expression(item.value, names, limits)
+                elif isinstance(item, ast.Assign):
+                    if (len(item.targets) != 1 or not isinstance(item.targets[0], ast.Name)
+                            or item.targets[0].id in reserved or item.targets[0].id.startswith("_")):
+                        raise ValueError("new_test_body_external_mutation")
+                    expression(item.value, names, limits)
+                    name = item.targets[0].id
+                    names.add(name)
+                    limits[name] = bound(item.value, limits)
+                elif isinstance(item, ast.Assert):
+                    expression(item.test, names, limits)
+                    if item.msg is not None:
+                        expression(item.msg, names, limits)
+                elif isinstance(item, ast.Return):
+                    if item.value is not None:
+                        expression(item.value, names, limits)
+                elif isinstance(item, ast.If):
+                    expression(item.test, names, limits)
+                    statements(item.body, set(names), dict(limits))
+                    statements(item.orelse, set(names), dict(limits))
+                else:
+                    raise ValueError("new_test_body_unsupported_statement")
+        statements(node.body, local, bounds)
+    for node in added:
+        validate(node)
+    def visit(name, active, done):
+        if name in active:
+            raise ValueError("new_test_body_helper_cycle")
+        if name not in done:
+            cost = sum(1 for _ in ast.walk(functions[name]))
+            for dependency in graph[name]:
+                cost += visit(dependency, active | {name}, done)
+                if cost > 4096:
+                    raise ValueError("new_test_body_helper_expansion_budget")
+            done[name] = cost
+        return done[name]
+    done = {}
+    for name in functions:
+        visit(name, set(), done)
+
+
+def registered_test_subjects(original: str, sources: dict[str, str | None]) -> tuple[str, ...]:
+    """Freeze explicit feature-function imports from selected registered source．"""
+    modules = {}
+    for path, text in sources.items():
+        if text is None or not path.endswith(".py") or path.startswith("tests/"):
+            continue
+        relative = path.removeprefix("src/").removesuffix(".py").replace("/", ".")
+        if not relative.startswith(("ephy_worker.", "packages.", "apps.")):
+            continue
+        modules[relative] = {node.name for node in ast.parse(text).body
+            if isinstance(node, ast.FunctionDef) and not node.name.startswith("_")}
+    approved = set()
+    tree = ast.parse(original)
+    counts = {}
+    def bindings(node):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            counts[node.name] = counts.get(node.name, 0) + 1
+            return
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                name = alias.asname or alias.name.split(".")[0]
+                counts[name] = counts.get(name, 0) + 1
+            return
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            counts[node.id] = counts.get(node.id, 0) + 1
+        for child in ast.iter_child_nodes(node):
+            bindings(child)
+    for node in tree.body:
+        bindings(node)
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and not node.level and node.module in modules:
+            approved.update(alias.asname or alias.name for alias in node.names if alias.name in modules[node.module])
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in modules:
+                    binding = alias.asname or alias.name
+                    approved.update(binding + "." + name for name in modules[alias.name])
+    return tuple(sorted(name for name in approved if counts.get(name.split(".")[0]) == 1))
 
 
 class LocalDiscovery:
@@ -324,7 +581,10 @@ class LocalDiscovery:
             sources[name] = path.read_text(encoding="utf-8") if path.exists() else None
         if sum(len(text.encode("utf-8")) for text in sources.values() if text is not None) > 131072:
             raise GateFailure("contract_incomplete:discovery_context_too_large")
+        subjects = {name: registered_test_subjects(text, sources) for name, text in sources.items()
+            if name.startswith("tests/") and text is not None}
         prepared = self.completion(json.dumps({"request": job["text"], "scope": initial, "source": sources,
+            "approved_subject_calls_by_test_file": subjects,
             "response_schema": {"checker_python": "standalone Python checker; argv[1] candidate root; nonzero on wrong behavior",
                 "known_good": {"scoped/path": [{"old": "exact unique original substring", "new": "replacement"},
                     {"append": "small additional test including its leading newline"}]},
@@ -334,7 +594,13 @@ class LocalDiscovery:
                 "Controls are temporary verifier specimens, not the formal implementation. Preserve every existing test "
                 "module's original AST prefix exactly, including imports, decorators, fixtures and assertions. Only "
                 "append new uniquely named test/helper functions without decorators, defaults, parameter/return "
-                "annotations or type parameters; put additional imports inside these new functions. "
+                "annotations or type parameters. No imports anywhere in appended functions. Their closed body DSL "
+                "allows literal/local-name assignments, assert, return, if, bounded arithmetic/containers, one bounded "
+                "literal/range comprehension, pure builtins and bounded nonmutating data methods. Use test_ or helper_ "
+                "names; helpers may call only acyclic pure helpers and the exact approved subject calls listed above. "
+                "No dynamic/callback/parameter calls, exceptions, loops, nested definitions, async calls/await, hooks, "
+                "global mutation or filesystem/network/process/pytest capabilities. Test fixture parameters are allowed "
+                "only for original zero-argument @pytest.fixture functions returning an inert literal. "
                 "known_good MUST change an existing selected tests file by appending a non-weakening "
                 "regression test in addition to the repair control. No checker success markers, environment detection or simulated PASS. "
                 "Return only these three keys. Use compact edit operations, never repeat complete existing files or tests. "
@@ -364,7 +630,8 @@ class LocalDiscovery:
         guard = {"allowed": names, "snapshot": original_snapshot,
             "authority": {name: authority_fingerprint(text) for name, text in sources.items()
                 if name == "src/ephy_worker/discord_runtime.py" and text is not None},
-            "tests": {name: text for name, text in sources.items() if name.startswith("tests/") and text is not None}}
+            "tests": {name: text for name, text in sources.items() if name.startswith("tests/") and text is not None},
+            "subjects": subjects}
         (directory / "checker-guard.json").write_text(json.dumps(guard, ensure_ascii=False), encoding="utf-8")
         checker.write_text("import ast\n" + inspect.getsource(authority_fingerprint) + "\n"
             + inspect.getsource(preserve_original_tests) + "\n" + _CHECKER, encoding="utf-8", newline="")
@@ -473,7 +740,7 @@ assert changed <= set(guard['allowed']), 'scope_escape'
 for name, original in guard['authority'].items():
     assert authority_fingerprint((root/name).read_text(encoding='utf-8')) == original, 'protected_discord_authority_changed'
 for name, original in guard['tests'].items():
-    preserve_original_tests(original,(root/name).read_text(encoding='utf-8'))
+    preserve_original_tests(original,(root/name).read_text(encoding='utf-8'),tuple(guard.get('subjects',{}).get(name,())))
 sys.path.insert(0,str(root))
 sys.path.insert(0,str(root/'src'))
 runpy.run_path(str(base/'acceptance.py'),run_name='__main__')
