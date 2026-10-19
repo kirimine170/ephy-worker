@@ -207,6 +207,21 @@ class Review(ProseModel):
     gaps: list[str] = Field(default_factory=list, max_length=8)
 
 
+class Coverage(StrictModel):
+    subquestion: int = Field(ge=0, le=7)
+    claim_ids: list[str] = Field(min_length=1, max_length=10)
+
+
+class GapResolution(StrictModel):
+    gap: str = Field(min_length=1, max_length=2000)
+    claim_ids: list[str] = Field(min_length=1, max_length=10)
+
+
+class AdaptiveReview(Review):
+    coverage: list[Coverage] = Field(default_factory=list, max_length=8)
+    resolutions: list[GapResolution] = Field(default_factory=list, max_length=8)
+
+
 class Selection(StrictModel):
     urls: list[str] = Field(min_length=1, max_length=6)
     reason: str = Field(max_length=1500)
