@@ -80,7 +80,7 @@ ResearchJob v1 はこの0.4とは別系統の将来プロトコルであり，`p
 - Workerがleaseをclaimすると，Managerは **atomicな単一のclaim操作** で `attempt_id` と `lease_generation` を発行する．有効なleaseがない `submitted` 作業に対しては，複数のclaim試行のうち高々1つだけが勝つ．2人目のclaimantを「単純に先行者を置換する」とは扱わず，`lease_conflict` で拒否する．
 - 絶対deadline：信頼済みManagerがSubmit時に不変の `deadline_at` を確定し，初期lease発行およびすべてのheartbeat更新では `lease_expires_at <= deadline_at`（すなわち `min(now + 許可TTL, deadline_at)`）を満たす．heartbeat更新はJobの `deadline_at` を決してリセット・延長しない．すべての新規active mutation（heartbeat，artifact受け付け，Finalize，停止確認）は，Manager権威の `now < deadline_at` と有効で期限切れでないleaseを必須とし，`now >= deadline_at` ではsweeper実行前でもfail closedで拒否する．等号（`now == deadline_at`）は期限切れであり，遅延sweeperの下でもdeadline経過後の成功は許されない．
 - heartbeat（lease renew）は有効期限内のみ延長可能で，期限切れ後の延長は不可（`lease_expired`）．期限切れはsweeperがJobを `lost` へ遷移させることがある．
-- artifactは許可されたmedia typeとSHA-256・サイズ検証を受け，`job_id` と `attempt_id` に紐づく．
+- artifactの公開・Jobへの関連付けは，現在の `running`，exactな `job_id`／`attempt_id`／`lease_generation`，有効lease，Manager権威の `now < deadline_at`，各revisionの一致，許可されたmedia typeとSHA-256・サイズ検証を，Managerの同じatomicな判断で必須とする．この公開判断はcancel受理，Finalize受理，lease／deadline失効と同じ直列化領域で競合を解決する．fenceが先なら，upload開始時のleaseが有効でも公開を拒否し，Job・artifact集合・受領記録を変更しない．先に公開済みのartifactは既存の不変記録として保持する．streaming等の未公開staging bytesは受理済みartifactではなく，upload完了だけでは公開権限を得ない．
 - lease claimは常に `submitted` から `running` へのatomicな単一遷移であり，中間のJob状態は存在しない．leased envelopeは追加のJob状態ではなく **view** であり，`leased` を状態として扱う選択肢は本提案には存在しない．状態グラフ上の状態はJobの実状態のみとする（§6）．
 - **active実行の権威あるbudget強制（将来要件・現状未実装）**：activeな実行（`running` のattempt）とFinalizeにおけるbudgetの権威ある強制は，Worker信頼境界の **外側** にある信頼済みManager制御のmeteringとresource gatingでなければならない．Workerはself-attestしたusageでmeteringを代替できず，無制限のcredential／tool／network／processリソースを消費してallowanceを超過できない．信頼済みbroker／executorは消費 **前** に有界なpermit／quotaをcapまたはdenyし，permitの超過・回避はdeny／fenceされる．未使用allowanceはretryでリセットされない．これは必要な将来infrastructureであり，現在の実装済みcapabilityではない．
 
@@ -119,6 +119,7 @@ ResearchJob v1 はこの0.4とは別系統の将来プロトコルであり，`p
 - すべての状態遷移，lease発行，結果受領，cancel受理，retry child作成を監査ログへ記録する．ログへ資格情報を含めない．
 - Runtime Adoption は，terminalなWorker Jobを `adopted` へ遷移させる操作ではなく，**別系統の信頼済みライフサイクル記録／判断** である．Adoptionは次のすべてを必須とする：（1）`succeeded` のJobであること，（2）認証済みManagerが受理したfinal result receiptの存在，（3）証拠・provenanceの独立検証完了，（4）T-033／T-122のRuntimeポリシーによる明示的な採用許可，（5）現在の `target_revision` と `policy_revision` をそれぞれ期待値と照合する検証と，そのexactなrevision対に束縛した採用記録作成を，一つの信頼済みcompare-and-write／CASで成功させること．単なる「直前のread」では条件を満たさない．
 - **Adoptionのrevision guard（将来要件・現状未実装）**：対象revisionとpolicy revisionの更新も，採用記録の作成と同じRuntimeのauthoritativeなversion guard／直列化領域へ参加しなければならない．採用判断は，受理済みreceipt／result digestと，そのrevision対に束縛して独立検証された証拠・明示policy許可を入力とする．どちらかのrevision更新が先にcommitすればCASは失敗し，採用記録を作らない．Adoptionが先なら，記録は検証した `target_revision`／`policy_revision` とreceipt／result digestを保持する不変記録とし，後続のrevisionへ読み替えない．guard不在，参加しない外部更新，freshnessや束縛の未証明時はfail closedで採用を拒否する．これは異なるsystemへのread／writeが自動的にatomicになるという保証ではなく，未実装の接続に要求する条件である．
+- **Adoptionの冪等作成（将来要件・現状未実装）**：信頼済みRuntimeは，exactなJob／attempt／generation，受理receipt／result digest，権威あるstableなpolicy decision identity，target／policy revisionsからcanonicalな `adoption_key` を導出する．callerが再送ごとに新しいkeyやpolicy decision identityを発行して重複を作ることは許さない．keyの永続的一意制約，immutableな採用入力全体のdigest比較，新規記録作成とrevision guardのCASを同じatomicな判断へ束縛し，並行要求でも高々1記録だけを作る．同一key・同一immutable入力の認証済み再送は既存記録を読み取り専用で返し，新規採用・再書込み・新revisionへの読み替えを一切行わない．後続revision更新後も，これは検証時のrevisionに束縛された履歴の照会に限る．同一keyで異なるimmutable入力は `adoption_conflict` で拒否する．知識台帳等への後続効果もこの一意な記録identityで重複排除し，同一transactionまたは信頼済みのidempotentな書込み先で高々1効果を保証できなければ実行しない．
 - ポリシーがpendingまたはundefinedの場合は採用を拒否する．`failed`／`cancelled`／`lost` のJob，およびManagerが受理していないfinal resultのアップロード済みartifactは，本v1提案では採用可能ではない．
 - WorkerはKarteへ一切書き込まない．Karteおよび知識台帳への書き込みはRuntime側の責任とする．
 
@@ -156,6 +157,7 @@ stateDiagram-v2
 | Submit（信頼済みRuntime） | submit_key未使用，full-input hash確定 | submitted（新規） | 同一key・同一immutable入力：既存Jobを **現在の状態のまま** viewで返す（全状態，無変更）／同一key・異なる入力：submit_key_conflict拒否 |
 | lease claim（Worker依頼，Manager発行） | submitted，有効active leaseなし，deadline前，revisions各々凍結期待値と一致 | running（attempt_idとlease_generationをManagerがclaim時に1度だけ発行，leasedはviewで状態ではない） | 並行claimは高々1勝者，敗者はlease_conflict／revisions不一致はrevision_mismatch／terminalなら拒否 |
 | heartbeat（Worker） | 現在のattempt，有効lease期限内，Manager権威now < deadline_at | 状態不変（lease_expires_at <= deadline_atで延長，deadlineは不変） | 期限切れ後：lease_expired（延長不可，lost化されうる）／now >= deadline_at：deadline経過後はsweeper実行前でも拒否，lease延長はdeadlineを伸ばさない |
+| artifact公開（Worker依頼，Manager受理） | 現在のrunning，exact job／attempt／generation，有効lease，now < deadline_at，各revision一致，media type／hash／size検証をlifecycle fenceと同じ直列化判断で検証（§5.3） | Job状態不変，検証済みartifactのみ関連付け | cancel_requested／terminal，古いtuple，lease／deadline失効，revision不一致は公開拒否／upload開始時の認可や未公開staging bytesは例外にならない |
 | 結果finalize（Worker） | 現在のrunning，exact job／attempt／generation tuple，有効lease，Manager権威now < deadline_at，revisions一致，job／attempt／generationに束縛された信頼済みmeter／ledger証拠とper-attempt／root-lineage使用量の上限内検証，全permit失効・in-flight精算の確認を同じ受理判断へ束縛（将来要件・未実装） | succeeded／failed | cancel受理後またはterminal後：stale_lease／job_terminal拒否（旧ID一致・同一本文でも常に不可，terminal Finalizeの再送も不可）／同一receipt identityで異なる内容：result_conflict／meter証拠の欠落・偽造・不一致・over-budget・permit失効や精算の未確認：receipt／Adoptionなしで拒否し予約保持 |
 | ReceiptLookup（認証済みcaller，読み取り専用） | succeededかつ受理済みfinal result receiptあり，exact job／attempt／generation／result digest一致，identity／caller認可と受理済みreceiptの完全性検証PASS，またはfailedかつすでにManagerが受理したfailed結果receiptで同一検証PASS | 状態不変（保存済みreceiptを返すだけ，lease期限切れ後およびdeadline_at経過後も可，active lease不要） | `cancelled`／`lost`，および受理済みreceiptのない`failed` は拒否／digest不一致は拒否／取り込み・Adoption・状態変化・retry／budget付与は一切起こさない／受理済みfailed receiptの復旧はAdoptionを許可しない |
 | cancel受理（Runtime→Manager） | submitted | cancelled（即terminal） | 同一入力Submitのread-only view返却のみ許容，他の新規変更操作は全て拒否 |
@@ -165,7 +167,7 @@ stateDiagram-v2
 | Worker停止確認（Worker） | cancel_requested，現在のattempt，Manager権威now < deadline_at | cancelled | 有効leaseとtuple検証はfinalizeと同じ／fence後の新規結果は不可／停止確認なきlease期限切れはsweeperがlostへ |
 | deadline／lease loss（Manager sweeper） | deadline_at経過（等号含む）時のsubmitted／running／cancel_requested（active leaseが名目上残っていても），runningかつlease期限切れ，cancel_requestedかつactive lease期限切れ（停止確認なし） | lost | 以後の結果送信・新規permit使用は旧ID一致でも拒否／sweeper遅延でもdeadline経過後の新規書込み・finalizeは不可／失効・in-flight精算が未確認の予約は保持（§5.3） |
 | retry child作成（信頼済みRuntime承認，Manager実行） | 親がfailed／lostのterminal，認証済みusageと権威あるroot lineage台帳から残budget・original deadlineが証明可能，stable retry identity，信頼済みresource gatingとmeter証拠が有効，未確認permit／in-flight予約を解放額に含めない（将来要件・未実装） | 新child Jobがsubmitted（parent_job_id設定，保守的に予約済みの残額budget，未使用allowanceはリセットされない） | 親のstate／入力・結果は不変／unknown usageはゼロでも解放額でもなくfull予約として保守的に消費／台帳予約はatomicで二重消費なし／同一retry identityの再送は同一childを返す／cancelled親は対象外／permit超過・回避はdeny／fence |
-| Adoption（Runtime） | Jobがsucceeded，認証済みManager受理final result receipt，独立検証済み証拠・provenance，T-033／T-122ポリシーの明示許可，exactなtarget／policy revisionsの検証と記録作成を同じauthoritative guardへのCASで成功（§5.7） | Job状態は不変，検証したrevision対とreceipt／result digestを束縛した別系統の不変採用記録のみ作成 | revision競合・guard不在・非協調更新は記録なしで拒否／ポリシーpending／undefinedは拒否／failed／cancelled／lostは拒否／未受理artifactのアップロードのみでは採用不可／Jobをadoptedへ遷移させる操作は存在しない／WorkerのKarte書き込みは禁止 |
+| Adoption（Runtime） | Jobがsucceeded，認証済みManager受理final result receipt，独立検証済み証拠・provenance，T-033／T-122ポリシーの明示許可，exactなtarget／policy revisionsの検証とadoption_keyの一意な記録作成を同じauthoritative guardへのCASで成功（§5.7） | Job状態は不変，検証したrevision対とreceipt／result digestを束縛した別系統の不変採用記録を高々1件作成 | 同一key・同一入力は認証済みread-only既存記録返却のみ，異なる入力はadoption_conflict／後続効果も記録identityで重複排除／revision競合・guard不在・非協調更新は新規記録なしで拒否／ポリシーpending／undefinedは拒否／failed／cancelled／lostは拒否／未受理artifactのアップロードのみでは採用不可／Jobをadoptedへ遷移させる操作は存在しない／WorkerのKarte書き込みは禁止 |
 
 ## 7. 計画する合成（synthetic）受入ケースと将来の実行可能作業
 
@@ -182,6 +184,7 @@ stateDiagram-v2
 8. Finalize応答喪失後，`deadline_at` 経過後でも，Manager受理済みfailed結果receiptのReceiptLookupがexact job／attempt／generation／digest一致の認証済みcallerへ読み取り専用で復旧できること（active lease不要，取り込み・状態変化・retry／Adoption／budget付与なし）．
 9. root＋childの集計使用量がoriginal cap内の通常の有界使用と，`verified spent ＋ unknown予約 ＋ active予約残 == original cap` ちょうど境界での受理（将来要件・未実装の信頼済みmeter／gating前提の計画ケース）．
 10. AdoptionのCASが両revisionの一致，証拠・policy許可の束縛を同じ直列化判断で確認し，exactなrevision対と受理receipt／result digestを保持する記録を作ること．後のrevision更新でその記録が新revision向けへ読み替えられないこと．
+11. Adoption作成の応答喪失・同一要求の並行再送でも一意な記録と後続効果が高々1つで，認証済み再送は既存記録だけを返すこと．後のrevision更新後の再送も履歴照会に留まること．artifact公開とcancel／Finalizeの競合で，公開が先の場合だけ既存の不変artifactが残ること．
 
 ### 7.2 拒否系（negative）
 1. terminal Jobへの同一キー・異なるimmutable入力Submitと，terminal Jobへの新規変更操作（結果送信，terminal Finalizeの再送，lease claim，renew）のすべてが拒否され，terminalは不変．本文が完全一致・古いIDが一致してもterminal Finalizeは常に拒否されること．
@@ -201,6 +204,8 @@ stateDiagram-v2
 15. Finalize・cancel・lease／deadline失効の前に発行されたpermitの遅延使用と二重使用が拒否されること．permit使用と遷移・child予約の競合でも，旧in-flightの失効確認・usage精算前に予約を解放せず，旧Workerとchildが同じ残額を消費できないこと．失効確認が得られなければworst-case予約を保持すること．
 16. target revision更新，policy revision更新がAdoptionの先行readと記録作成の間にcommitした場合，CASが記録なしで拒否すること．Adoptionが先にcommitした場合は，記録がその検証済みrevision対を保持すること．
 17. authoritativeなrevision guardがない，外部更新がguardへ参加しない，または証拠・policy許可のrevision束縛が未証明の場合はAdoptionが拒否されること．
+18. 同一adoption_keyで異なるimmutable入力の要求，callerによるkey／policy decision identityの付け替え，後続効果の重複排除が保証できない書込みを拒否すること．
+19. cancel／Finalize／lease失効／deadline失効が先行したartifact公開を，開始時の有効leaseや完了済みuploadがあっても拒否し，Job・artifact集合・受領記録を変更しないこと．古いgeneration，revision不一致とnow == deadline_atもそれぞれ拒否すること．
 
 ### 7.2-β budget強制の拒否系（計画ケース・実行済みテストではない）
 1. rootまたはchildのoverrun：permit消費前の信頼済みgatingがdenyし，検出済みoverrunは最終検証で取り消せないためFinalizeは拒否されること．
