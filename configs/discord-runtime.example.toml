@@ -4,6 +4,8 @@ guild_id = 1
 allowed_channel_ids = [1]
 allowed_user_ids = [1]
 runtime_url = "http://127.0.0.1:8000"
+# 信頼したlocal設定だけでconfirm検索の自動承認を有効にする．blockは常に拒否する．
+auto_approve_search = false
 token_env = "EPHY_DISCORD_BOT_TOKEN"
 # mentionなしの直接返信にはDeveloper Portal側のMessage Content Intentも必要．
 read_message_content = false

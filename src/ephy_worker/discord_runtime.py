@@ -55,6 +55,7 @@ class DiscordRuntimeSettings(BaseModel):
     runtime_url: str = "http://127.0.0.1:8000"
     token_env: str = "EPHY_DISCORD_BOT_TOKEN"
     read_message_content: StrictBool = False
+    auto_approve_search: StrictBool = False
     state_dir: Path
     request_timeout_seconds: float = Field(120, ge=0.1, le=120)
     read_idle_timeout_seconds: float = Field(600, ge=1, le=1800)
@@ -259,11 +260,18 @@ class RuntimeGateway:
             status, plan = await self._post("/v1/web-search/plan", plan_input)
             if status != 200 or plan.get("decision") not in {"allow", "confirm", "block"}:
                 raise BridgeError("runtime_plan_invalid")
-            if plan["decision"] != "allow":
-                raise BridgeError("search_confirmation_required" if plan["decision"] == "confirm" else "search_blocked")
+            if plan["decision"] == "block":
+                raise BridgeError("search_blocked")
+            if plan["decision"] == "confirm" and not self.settings.auto_approve_search:
+                raise BridgeError("search_confirmation_required")
             proposed_plan_id = plan.get("plan_id")
             if not isinstance(proposed_plan_id, str) or not _ID.fullmatch(proposed_plan_id):
                 raise BridgeError("runtime_plan_invalid")
+            if plan["decision"] == "confirm":
+                status, approval = await self._post("/v1/web-search/approve", {"plan_id": proposed_plan_id})
+                if (status != 200 or approval.get("status") != "approved"
+                        or approval.get("plan_id") != proposed_plan_id):
+                    raise BridgeError("runtime_approval_invalid")
             plan_id = proposed_plan_id
             messages = [{"role": "system", "content": PERSONA}]
             if previous:

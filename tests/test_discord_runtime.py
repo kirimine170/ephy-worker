@@ -136,6 +136,147 @@ async def test_unapproved_plan_never_chats_or_approves(tmp_path, decision):
         await gateway.aclose()
 
 
+@pytest.mark.parametrize("value", ["true", "false", 1, 0, None])
+def test_auto_approval_setting_requires_strict_boolean(tmp_path, value):
+    with pytest.raises(ValidationError):
+        settings(tmp_path, auto_approve_search=value)
+
+
+def test_auto_approval_setting_is_disabled_by_default_and_frozen(tmp_path):
+    assert settings(tmp_path).auto_approve_search is False
+    config = settings(tmp_path, auto_approve_search=True)
+    assert config.auto_approve_search is True
+    with pytest.raises(ValidationError):
+        config.auto_approve_search = False
+
+
+@pytest.mark.parametrize("pending", [0, 1])
+@pytest.mark.asyncio
+async def test_opted_in_confirmation_approves_once_then_resumes_same_plan(tmp_path, pending):
+    fixture, calls = RuntimeFixture(decision="confirm", pending=pending), []
+    async def handler(request):
+        path, payload = request.url.path, json.loads(request.content)
+        calls.append((path, payload, request.headers.get("Prefer")))
+        if path == "/v1/web-search/approve":
+            return httpx.Response(200, json={"status": "approved", "plan_id": "plan1"})
+        return await fixture(request)
+    gateway = RuntimeGateway(settings(tmp_path, auto_approve_search=True), transport=httpx.MockTransport(handler))
+    try:
+        assert await gateway.answer("公開の質問", "公開済みの回答") == "わたしは公開資料を確認しました．"
+        assert [path for path, _, _ in calls] == ["/v1/web-search/plan", "/v1/web-search/approve"] + [
+            "/v1/chat/completions"] * (pending + 1)
+        assert calls[0][1] == {"query": "公開の質問", "context": "公開済みの回答"}
+        assert calls[1] == ("/v1/web-search/approve", {"plan_id": "plan1"}, None)
+        chats = calls[2:]
+        assert all(payload == chats[0][1] and prefer == "respond-async" for _, payload, prefer in chats)
+        assert chats[0][1]["metadata"] == {"web_search": True, "web_search_plan_id": "plan1"}
+        assert chats[0][1]["messages"] == [{"role": "system", "content": PERSONA},
+            {"role": "assistant", "content": "公開済みの回答"}, {"role": "user", "content": "公開の質問"}]
+    finally:
+        await gateway.aclose()
+
+
+@pytest.mark.parametrize("decision", ["allow", "block"])
+@pytest.mark.asyncio
+async def test_opt_in_does_not_approve_allow_or_block(tmp_path, decision):
+    fixture = RuntimeFixture(decision=decision)
+    gateway = RuntimeGateway(settings(tmp_path, auto_approve_search=True), transport=httpx.MockTransport(fixture))
+    try:
+        if decision == "block":
+            with pytest.raises(BridgeError) as error:
+                await gateway.answer("公開の質問")
+            assert error.value.code == "search_blocked"
+            assert [path for path, _, _ in fixture.calls] == ["/v1/web-search/plan"]
+        else:
+            assert await gateway.answer("公開の質問") == "わたしは公開資料を確認しました．"
+            assert [path for path, _, _ in fixture.calls] == ["/v1/web-search/plan", "/v1/chat/completions"]
+    finally:
+        await gateway.aclose()
+
+
+@pytest.mark.parametrize("plan_id", [None, 42, "", "unvalidated plan", "plan/other", "plan\n", "p" * 161])
+@pytest.mark.asyncio
+async def test_opted_in_confirmation_rejects_invalid_id_before_approval(tmp_path, plan_id):
+    calls = []
+    async def handler(request):
+        calls.append(request.url.path)
+        return httpx.Response(200, json={"decision": "confirm", "plan_id": plan_id})
+    gateway = RuntimeGateway(settings(tmp_path, auto_approve_search=True), transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(BridgeError) as error:
+            await gateway.answer("公開の質問")
+        assert error.value.code == "runtime_plan_invalid" and calls == ["/v1/web-search/plan"]
+    finally:
+        await gateway.aclose()
+
+
+@pytest.mark.parametrize(("fault", "code"), [("http", "runtime_request_failed"),
+    ("transport", "runtime_unavailable_or_invalid_response"), ("json", "runtime_unavailable_or_invalid_response"),
+    ("accepted", "runtime_approval_invalid"), ("status", "runtime_approval_invalid"),
+    ("missing_status", "runtime_approval_invalid"), ("plan", "runtime_approval_invalid"),
+    ("missing_plan", "runtime_approval_invalid")])
+@pytest.mark.asyncio
+async def test_invalid_or_failed_approval_never_chats_or_cancels(tmp_path, fault, code):
+    calls = []
+    async def handler(request):
+        path, payload = request.url.path, json.loads(request.content)
+        calls.append((path, payload))
+        if path == "/v1/web-search/plan":
+            return httpx.Response(200, json={"decision": "confirm", "plan_id": "plan1"})
+        assert path == "/v1/web-search/approve" and payload == {"plan_id": "plan1"}
+        if fault == "http":
+            return httpx.Response(503)
+        if fault == "transport":
+            raise httpx.ReadTimeout("private backend error", request=request)
+        if fault == "json":
+            return httpx.Response(200, content=b"invalid")
+        approval = {"status": "approved", "plan_id": "plan1"}
+        if fault == "status":
+            approval["status"] = "pending"
+        elif fault == "missing_status":
+            del approval["status"]
+        elif fault == "plan":
+            approval["plan_id"] = "different"
+        elif fault == "missing_plan":
+            del approval["plan_id"]
+        return httpx.Response(202 if fault == "accepted" else 200, json=approval)
+    gateway = RuntimeGateway(settings(tmp_path, auto_approve_search=True), transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(BridgeError) as error:
+            await gateway.answer("公開の質問")
+        assert error.value.code == code
+        assert calls == [("/v1/web-search/plan", {"query": "公開の質問"}),
+            ("/v1/web-search/approve", {"plan_id": "plan1"})]
+    finally:
+        await gateway.aclose()
+
+
+@pytest.mark.asyncio
+async def test_approved_plan_chat_failure_keeps_existing_cancellation(tmp_path):
+    calls = []
+    async def handler(request):
+        path, payload = request.url.path, json.loads(request.content)
+        calls.append((path, payload))
+        if path.endswith("/plan"):
+            return httpx.Response(200, json={"decision": "confirm", "plan_id": "plan1"})
+        if path.endswith("/approve"):
+            return httpx.Response(200, json={"status": "approved", "plan_id": "plan1"})
+        if path.endswith("/cancel"):
+            assert payload == {"plan_id": "plan1"}
+            return httpx.Response(503)
+        assert path == "/v1/chat/completions"
+        return final_stream(done=False)
+    gateway = RuntimeGateway(settings(tmp_path, auto_approve_search=True), transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(BridgeError) as error:
+            await gateway.answer("公開の質問")
+        assert error.value.code == "runtime_stream_incomplete"
+        assert [path for path, _ in calls] == ["/v1/web-search/plan", "/v1/web-search/approve",
+            "/v1/chat/completions", "/v1/web-search/cancel"]
+    finally:
+        await gateway.aclose()
+
+
 @pytest.mark.parametrize("fault", ["finish-missing", "done-missing", "length", "negative-status", "wrong-plan",
     "pending-plan", "pending-job", "redirect", "large", "error-event", "invalid-json", "reasoning-only"])
 @pytest.mark.asyncio
