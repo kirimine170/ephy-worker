@@ -1,0 +1,292 @@
+{
+  "schema_version": "ephy.synthetic-gap-fixtures.v1",
+  "cases": [
+    {
+      "name": "validation_failure",
+      "payloads": [
+        {
+          "schema_version": "ephy.capability-observations.v1",
+          "source_family": "synthetic_observations",
+          "evidence_kind": "synthetic",
+          "artifact_id": "artifact-1",
+          "job_id": "synthetic-job",
+          "run_id": "synthetic-run",
+          "observations": [
+            {
+              "sequence": 0,
+              "check_id": "check-1",
+              "category": "task_performance",
+              "code": "validation",
+              "stage": "validation",
+              "status": "failed",
+              "validation_passed": false
+            }
+          ]
+        }
+      ],
+      "categories": [
+        "task_performance"
+      ],
+      "unknowns": [],
+      "assessment": "synthetic_candidates_only"
+    },
+    {
+      "name": "success",
+      "payloads": [
+        {
+          "schema_version": "ephy.capability-observations.v1",
+          "source_family": "synthetic_observations",
+          "evidence_kind": "synthetic",
+          "artifact_id": "artifact-1",
+          "job_id": "synthetic-job",
+          "run_id": "synthetic-run",
+          "observations": [
+            {
+              "sequence": 0,
+              "check_id": "check-1",
+              "category": "task_performance",
+              "code": "validation",
+              "stage": "validation",
+              "status": "passed",
+              "validation_passed": true
+            }
+          ]
+        }
+      ],
+      "categories": [],
+      "unknowns": [],
+      "assessment": "no_rule_match_in_supplied_synthetic_input"
+    },
+    {
+      "name": "unknown_validation",
+      "payloads": [
+        {
+          "schema_version": "ephy.capability-observations.v1",
+          "source_family": "synthetic_observations",
+          "evidence_kind": "synthetic",
+          "artifact_id": "artifact-1",
+          "job_id": "synthetic-job",
+          "run_id": "synthetic-run",
+          "observations": [
+            {
+              "sequence": 0,
+              "check_id": "check-1",
+              "category": "task_performance",
+              "code": "validation",
+              "stage": "validation",
+              "status": "unknown",
+              "validation_passed": null
+            }
+          ]
+        }
+      ],
+      "categories": [],
+      "unknowns": [
+        "status_unknown"
+      ],
+      "assessment": "insufficient_evidence"
+    },
+    {
+      "name": "timeout",
+      "payloads": [
+        {
+          "schema_version": "ephy.capability-observations.v1",
+          "source_family": "synthetic_observations",
+          "evidence_kind": "synthetic",
+          "artifact_id": "artifact-1",
+          "job_id": "synthetic-job",
+          "run_id": "synthetic-run",
+          "observations": [
+            {
+              "sequence": 0,
+              "check_id": "check-1",
+              "category": "workflow",
+              "code": "execution_timeout",
+              "stage": "execution",
+              "status": "failed",
+              "validation_passed": null
+            }
+          ]
+        }
+      ],
+      "categories": [
+        "workflow"
+      ],
+      "unknowns": [],
+      "assessment": "synthetic_candidates_only"
+    },
+    {
+      "name": "environment_failure",
+      "payloads": [
+        {
+          "schema_version": "ephy.capability-observations.v1",
+          "source_family": "synthetic_observations",
+          "evidence_kind": "synthetic",
+          "artifact_id": "artifact-1",
+          "job_id": "synthetic-job",
+          "run_id": "synthetic-run",
+          "observations": [
+            {
+              "sequence": 0,
+              "check_id": "check-1",
+              "category": "environment",
+              "code": "environment_unavailable",
+              "stage": "setup",
+              "status": "failed",
+              "validation_passed": null
+            }
+          ]
+        }
+      ],
+      "categories": [
+        "environment"
+      ],
+      "unknowns": [],
+      "assessment": "synthetic_candidates_only"
+    },
+    {
+      "name": "missing_evidence",
+      "payloads": [
+        {
+          "schema_version": "ephy.capability-observations.v1",
+          "source_family": "synthetic_observations",
+          "evidence_kind": "synthetic",
+          "artifact_id": "artifact-1",
+          "job_id": "synthetic-job",
+          "run_id": "synthetic-run",
+          "observations": [
+            {
+              "sequence": 0,
+              "check_id": "check-1",
+              "category": "evidence",
+              "code": "evidence_missing",
+              "stage": "verification",
+              "status": "failed",
+              "validation_passed": null
+            }
+          ]
+        }
+      ],
+      "categories": [
+        "evidence"
+      ],
+      "unknowns": [],
+      "assessment": "synthetic_candidates_only"
+    },
+    {
+      "name": "incomplete_plan",
+      "payloads": [
+        {
+          "schema_version": "ephy.capability-observations.v1",
+          "source_family": "synthetic_observations",
+          "evidence_kind": "synthetic",
+          "artifact_id": "artifact-1",
+          "job_id": "synthetic-job",
+          "run_id": "synthetic-run",
+          "observations": [
+            {
+              "sequence": 0,
+              "check_id": "check-1",
+              "category": "workflow",
+              "code": "plan_incomplete",
+              "stage": "planning",
+              "status": "failed",
+              "validation_passed": null
+            }
+          ]
+        }
+      ],
+      "categories": [
+        "workflow"
+      ],
+      "unknowns": [],
+      "assessment": "synthetic_candidates_only"
+    },
+    {
+      "name": "information_gap",
+      "payloads": [
+        {
+          "schema_version": "ephy.capability-observations.v1",
+          "source_family": "synthetic_observations",
+          "evidence_kind": "synthetic",
+          "artifact_id": "artifact-1",
+          "job_id": "synthetic-job",
+          "run_id": "synthetic-run",
+          "observations": [
+            {
+              "sequence": 0,
+              "check_id": "check-1",
+              "category": "information",
+              "code": "information_missing",
+              "stage": "research",
+              "status": "failed",
+              "validation_passed": null
+            }
+          ]
+        }
+      ],
+      "categories": [
+        "information"
+      ],
+      "unknowns": [],
+      "assessment": "synthetic_candidates_only"
+    },
+    {
+      "name": "empty",
+      "payloads": [
+        {
+          "schema_version": "ephy.capability-observations.v1",
+          "source_family": "synthetic_observations",
+          "evidence_kind": "synthetic",
+          "artifact_id": "artifact-1",
+          "job_id": "synthetic-job",
+          "run_id": "synthetic-run",
+          "observations": []
+        }
+      ],
+      "categories": [],
+      "unknowns": [
+        "empty_observations"
+      ],
+      "assessment": "insufficient_evidence"
+    },
+    {
+      "name": "conflict",
+      "payloads": [
+        {
+          "schema_version": "ephy.capability-observations.v1",
+          "source_family": "synthetic_observations",
+          "evidence_kind": "synthetic",
+          "artifact_id": "artifact-1",
+          "job_id": "synthetic-job",
+          "run_id": "synthetic-run",
+          "observations": [
+            {
+              "sequence": 0,
+              "check_id": "check-1",
+              "category": "task_performance",
+              "code": "validation",
+              "stage": "validation",
+              "status": "failed",
+              "validation_passed": false
+            },
+            {
+              "sequence": 1,
+              "check_id": "check-1",
+              "category": "task_performance",
+              "code": "validation",
+              "stage": "validation",
+              "status": "passed",
+              "validation_passed": true
+            }
+          ]
+        }
+      ],
+      "categories": [],
+      "unknowns": [
+        "conflicting_observations"
+      ],
+      "assessment": "insufficient_evidence"
+    }
+  ]
+}
