@@ -207,9 +207,39 @@ class Review(ProseModel):
     gaps: list[str] = Field(default_factory=list, max_length=8)
 
 
+class Coverage(StrictModel):
+    subquestion: int = Field(ge=0, le=7)
+    claim_ids: list[str] = Field(min_length=1, max_length=10)
+
+
+class GapResolution(StrictModel):
+    gap: str = Field(min_length=1, max_length=2000)
+    claim_ids: list[str] = Field(min_length=1, max_length=10)
+
+
+class AdaptiveReview(Review):
+    coverage: list[Coverage] = Field(default_factory=list, max_length=8)
+    resolutions: list[GapResolution] = Field(default_factory=list, max_length=8)
+
+
 class Selection(StrictModel):
     urls: list[str] = Field(min_length=1, max_length=6)
     reason: str = Field(max_length=1500)
+
+
+class AcquisitionResolution(StrictModel):
+    """Worker-issued dependency decision；never an extract/review model output．"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    version: Literal["unused-html-v1"] = "unused-html-v1"
+    failure_index: int = Field(ge=0)
+    stage: Literal["fetch"] = "fetch"
+    code: str
+    source_id: str
+    source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    supporting_claim_ids: list[str] = Field(min_length=1, max_length=10)
+    round_number: int = Field(ge=0, le=5)
+    resolved_at: str
 
 
 class Report(StrictModel):
@@ -232,6 +262,7 @@ class Report(StrictModel):
     claims: list[Claim] = Field(default_factory=list)
     gaps: list[str] = Field(default_factory=list)
     failures: list[dict] = Field(default_factory=list)
+    acquisition_resolutions: list[AcquisitionResolution] = Field(default_factory=list, max_length=30)
     rounds: list[dict] = Field(default_factory=list)
     metrics: dict = Field(default_factory=dict)
     activity_summary: str = ""

@@ -69,6 +69,7 @@ class _BudgetTransport(httpx.AsyncBaseTransport):
         self.usage_unknown_requests = 0
         self.last_budget_error: BudgetExceeded | None = None
         self.last_error: str | None = None
+        self.call_timeout_seconds: float | None = None
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         self.last_error = None
@@ -97,6 +98,7 @@ class _BudgetTransport(httpx.AsyncBaseTransport):
             raise
         timeout = min(
             self.profile.profile.timeout_seconds,
+            self.call_timeout_seconds if self.call_timeout_seconds is not None else self.profile.profile.timeout_seconds,
             self.budget.limits.request_seconds,
             self.budget.remaining_seconds,
         )
@@ -219,8 +221,23 @@ class ModelRunner:
                 self.transport.last_error or f"model_discovery_failed:{type(exc).__name__}"
             ) from None
 
-    async def run(self, output_type: type[T], prompt: str, *, stage: str) -> T:
+    async def run(
+        self, output_type: type[T], prompt: str, *, stage: str,
+        max_output_tokens: int | None = None, timeout_seconds: float | None = None,
+        schema_retries: int | None = None,
+    ) -> T:
         settings = self.profile.profile
+        updates = {}
+        for name, value in (("max_output_tokens", max_output_tokens), ("timeout_seconds", timeout_seconds),
+                            ("schema_retries", schema_retries)):
+            if value is not None:
+                if (not math.isfinite(value) or value < 0 or value == 0 and name != "schema_retries"
+                        or value > getattr(settings, name)
+                        or name != "timeout_seconds" and type(value) is not int):
+                    raise ValueError("model_call_bounds_must_tighten")
+                updates[name] = value
+        if updates:
+            settings = settings.model_copy(update=updates)
         schema_text = json.dumps(output_type.model_json_schema(), ensure_ascii=False)
         estimated = estimate_tokens(prompt) + estimate_tokens(schema_text) + 1024 + settings.max_output_tokens
         if estimated > settings.context_tokens:
@@ -262,6 +279,7 @@ class ModelRunner:
         await asyncio.sleep(0)
         task = asyncio.current_task()
         cancellations_before = task.cancelling() if task is not None else 0
+        self.transport.call_timeout_seconds = timeout_seconds
         try:
             result = await agent.run(
                 prompt, usage_limits=UsageLimits(request_limit=settings.schema_retries + 1)
@@ -297,6 +315,8 @@ class ModelRunner:
             else:
                 code = f"model_stage_failed:{type(exc).__name__}"
             raise ModelError(code) from None
+        finally:
+            self.transport.call_timeout_seconds = None
 
     async def aclose(self) -> None:
         await self.client.close()
