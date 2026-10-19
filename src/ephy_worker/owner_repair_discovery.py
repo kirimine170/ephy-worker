@@ -195,7 +195,7 @@ def authority_fingerprint(source: str) -> dict:
 
 
 def preserve_original_tests(original: str, candidate: str) -> None:
-    """Keep original module AST exact；append new named functions only．"""
+    """Keep original AST exact；new functions have inert collection signatures．"""
     before, after = ast.parse(original), ast.parse(candidate)
     old_nodes = [ast.dump(node, include_attributes=False) for node in before.body]
     prefix = [ast.dump(node, include_attributes=False) for node in after.body[:len(before.body)]]
@@ -224,6 +224,16 @@ def preserve_original_tests(original: str, candidate: str) -> None:
         if node.name in bindings:
             raise ValueError("existing_test_binding_overridden")
         bindings.add(node.name)
+        if node.decorator_list:
+            raise ValueError("new_test_collection_decorator")
+        if node.args.defaults or any(value is not None for value in node.args.kw_defaults):
+            raise ValueError("new_test_collection_default")
+        arguments = [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
+        arguments += [argument for argument in (node.args.vararg, node.args.kwarg) if argument is not None]
+        if node.returns is not None or any(argument.annotation is not None for argument in arguments):
+            raise ValueError("new_test_collection_annotation")
+        if node.type_params:
+            raise ValueError("new_test_collection_type_parameter")
         if any(isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name in old_test_names
                 for child in ast.walk(node)):
             raise ValueError("existing_test_name_duplicated")
@@ -323,7 +333,8 @@ class LocalDiscovery:
                 "unchanged baseline and wrong behavior, and pass a genuinely repaired known-good control. "
                 "Controls are temporary verifier specimens, not the formal implementation. Preserve every existing test "
                 "module's original AST prefix exactly, including imports, decorators, fixtures and assertions. Only "
-                "append new uniquely named test/helper functions; put additional imports inside these new functions. "
+                "append new uniquely named test/helper functions without decorators, defaults, parameter/return "
+                "annotations or type parameters; put additional imports inside these new functions. "
                 "known_good MUST change an existing selected tests file by appending a non-weakening "
                 "regression test in addition to the repair control. No checker success markers, environment detection or simulated PASS. "
                 "Return only these three keys. Use compact edit operations, never repeat complete existing files or tests. "

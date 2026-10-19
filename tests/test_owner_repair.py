@@ -636,3 +636,221 @@ def test_isolated_explicit_utf8_child_reports_actual_mode_and_japanese_bytes():
         capture_output=True, check=False, timeout=30)
     assert result.returncode == 0 and not result.stderr
     assert result.stdout.decode("utf-8").strip() == "独立した日本語出力"
+
+
+@pytest.mark.parametrize("point", ["receipt", "classification", "before_enqueue", "after_enqueue",
+    "before_claim", "after_claim", "acceptance"])
+@pytest.mark.asyncio
+async def test_review_revision_owner_intake_crash_replays_without_losing_or_duplicating_repair(tmp_path, monkeypatch, point):
+    bridge, gateway, event = bridge_fixture(tmp_path)
+    enqueue, claim, classify = bridge.repairs.enqueue, bridge.ledger.claim, gateway.classify_repair
+    queued_points = {"after_enqueue", "before_claim", "after_claim", "acceptance"}
+    claimed_points = {"after_claim", "acceptance"}
+
+    def interrupted_enqueue(**kwargs):
+        if point == "before_enqueue":
+            raise asyncio.CancelledError
+        identifier = enqueue(**kwargs)
+        if point == "after_enqueue":
+            raise asyncio.CancelledError
+        return identifier
+
+    def interrupted_claim(message):
+        assert bridge.repairs.next() is not None, "claim preceded durable repair enqueue"
+        if point == "before_claim":
+            raise asyncio.CancelledError
+        result = claim(message)
+        if point == "after_claim":
+            raise asyncio.CancelledError
+        return result
+
+    async def interrupted_classify(text, previous):
+        if point == "classification":
+            raise asyncio.CancelledError
+        return await classify(text, previous)
+
+    async def interrupted_send(text):
+        if (point == "receipt" and text == RECEIPT) or (point == "acceptance" and "修正依頼として" in text):
+            raise asyncio.CancelledError
+        return 1000
+
+    with monkeypatch.context() as patch:
+        patch.setattr(bridge.repairs, "enqueue", interrupted_enqueue)
+        patch.setattr(bridge.ledger, "claim", interrupted_claim)
+        patch.setattr(gateway, "classify_repair", interrupted_classify)
+        with pytest.raises(asyncio.CancelledError):
+            await bridge.handle(event, interrupted_send)
+    before = bridge.repairs.next()
+    assert (before is not None) == (point in queued_points)
+    assert bridge.ledger.seen(event.message_id) == (point in claimed_points)
+    assert bridge.inflight == 0
+
+    restarted, restarted_gateway, replay = bridge_fixture(tmp_path)
+    sent = []
+    async def send(text):
+        sent.append(text)
+        return 1001
+    await restarted.handle(replay, send)
+    queued = restarted.repairs.next()
+    assert queued is not None and queued["stage"] == "queued"
+    if before is not None:
+        assert queued["id"] == before["id"]
+    with restarted.repairs.db() as db:
+        assert db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 1
+    assert restarted.ledger.seen(event.message_id)
+    assert len(restarted_gateway.classifications) == (0 if point in claimed_points else 1)
+    assert restarted_gateway.answers == []
+    sent_before = list(sent)
+    await restarted.handle(replay, send)
+    assert sent == sent_before
+
+
+@pytest.mark.asyncio
+async def test_review_revision_concurrent_owner_delivery_enqueues_one_durable_job_before_claim(tmp_path):
+    first, _, event = bridge_fixture(tmp_path)
+    second, _, _ = bridge_fixture(tmp_path)
+    ready = asyncio.Event()
+    classifiers = []
+    claims = []
+    sent = []
+
+    async def classify(text, previous):
+        classifiers.append((text, previous))
+        if len(classifiers) == 2:
+            ready.set()
+        await ready.wait()
+        return True
+
+    def guarded_claim(bridge):
+        original = bridge.ledger.claim
+        def claim(message):
+            assert bridge.repairs.next() is not None
+            result = original(message)
+            claims.append(result)
+            return result
+        return claim
+
+    for bridge in (first, second):
+        bridge.gateway.classify_repair = classify
+        bridge.ledger.claim = guarded_claim(bridge)
+    async def send(text):
+        sent.append(text)
+        return len(sent) + 1000
+    await asyncio.wait_for(asyncio.gather(first.handle(event, send), second.handle(event, send)), 10)
+    with first.repairs.db() as db:
+        assert db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 1
+    assert len(classifiers) == 2 and sorted(claims) == [False, True]
+    assert sum("修正依頼として" in text for text in sent) == 1
+    assert first.ledger.seen(event.message_id) and first.inflight == second.inflight == 0
+
+
+@pytest.mark.asyncio
+async def test_review_revision_owner_conversation_and_classifier_failure_remain_replayable_before_claim(tmp_path):
+    bridge, gateway, event = bridge_fixture(tmp_path, repair=False)
+    sent = []
+    async def send(text):
+        sent.append(text)
+        return 1000
+    await bridge.handle(event, send)
+    assert not bridge.ledger.seen(event.message_id) and bridge.repairs.next() is None
+    assert gateway.answers == [] and "公開の質問" in sent[-1]
+    public = replace(event, content="<@10> 先ほどの回答の数字はどうですか")
+    await bridge.handle(public, send)
+    assert bridge.ledger.seen(event.message_id) and bridge.repairs.next() is None
+    assert len(gateway.answers) == 1
+    await bridge.handle(public, send)
+    assert len(gateway.answers) == 1 and len(gateway.classifications) == 2
+
+    broken, broken_gateway, private = bridge_fixture(tmp_path / "classification-failure", failure=True)
+    await broken.handle(private, send)
+    assert not broken.ledger.seen(private.message_id) and broken.repairs.next() is None
+    assert broken_gateway.answers == [] and "判定できません" in sent[-1]
+    broken_gateway.failure = False
+    await broken.handle(private, send)
+    assert broken.ledger.seen(private.message_id) and broken.repairs.next() is not None
+    assert len(broken_gateway.classifications) == 2 and broken_gateway.answers == []
+
+
+@pytest.mark.parametrize("author", [533693210879459338, 330903316575944704])
+@pytest.mark.asyncio
+async def test_review_revision_nonowner_private_directive_cannot_enter_repair_intake(tmp_path, author):
+    bridge, gateway, event = bridge_fixture(tmp_path)
+    sent = []
+    async def send(text):
+        sent.append(text)
+    await bridge.handle(replace(event, user_id=author), send)
+    assert gateway.classifications == [] and gateway.answers == []
+    assert bridge.repairs.next() is None and not bridge.ledger.seen(event.message_id)
+    assert "公開の質問" in sent[-1]
+
+
+def _review_revision_collection_cases():
+    return [
+        ("@pytest.fixture(autouse=True)\ndef helper_added():\n    pass\n", "decorator"),
+        ("@fixture_alias\ndef helper_added():\n    pass\n", "decorator"),
+        ("@trip()\ndef helper_added():\n    pass\n", "decorator"),
+        ("def helper_added(value=trip()):\n    pass\n", "default"),
+        ("def helper_added(*, value=trip()):\n    pass\n", "default"),
+        ("def helper_added(value=1):\n    pass\n", "default"),
+        ("def helper_added(value: trip(), /):\n    pass\n", "annotation"),
+        ("def helper_added(value: trip()):\n    pass\n", "annotation"),
+        ("def helper_added(*, value: trip()):\n    pass\n", "annotation"),
+        ("def helper_added(*values: trip()):\n    pass\n", "annotation"),
+        ("def helper_added(**values: trip()):\n    pass\n", "annotation"),
+        ("def helper_added() -> trip():\n    pass\n", "annotation"),
+        ("def helper_added(value: 'trip()'):\n    pass\n", "annotation"),
+        ("def helper_added[T: trip()]():\n    pass\n", "type_parameter"),
+        ("def helper_added[*Ts]():\n    pass\n", "type_parameter"),
+        ("def helper_added[**P]():\n    pass\n", "type_parameter"),
+        ("@trip()\nasync def helper_added():\n    pass\n", "decorator"),
+        ("async def helper_added(value=trip()):\n    pass\n", "default"),
+        ("async def helper_added() -> trip():\n    pass\n", "annotation"),
+        ("async def helper_added[T: trip()]():\n    pass\n", "type_parameter"),
+    ]
+
+
+def _review_revision_run_generated_checker(tmp_path, original, candidate_text):
+    import hashlib
+    import inspect
+
+    from ephy_worker.owner_repair_discovery import _CHECKER
+
+    candidate, directory = tmp_path / "candidate", tmp_path / "checker"
+    test = candidate / "tests/test_original.py"
+    test.parent.mkdir(parents=True)
+    directory.mkdir()
+    test.write_text(candidate_text, encoding="utf-8")
+    (directory / "checker-guard.json").write_text(json.dumps({"allowed": ["tests/test_original.py"],
+        "snapshot": {"tests/test_original.py": {"sha256": hashlib.sha256(original.encode()).hexdigest()}},
+        "authority": {}, "tests": {"tests/test_original.py": original}}), encoding="utf-8")
+    checker = directory / "checker.py"
+    checker.write_text("import ast\n" + inspect.getsource(authority_fingerprint) + "\n"
+        + inspect.getsource(preserve_original_tests) + "\n" + _CHECKER, encoding="utf-8")
+    marker = tmp_path / "acceptance-was-reached"
+    (directory / "acceptance.py").write_text("from pathlib import Path\nPath(" + repr(str(marker))
+        + ").write_text('reached', encoding='utf-8')\n", encoding="utf-8")
+    result = subprocess.run([sys.executable, "-I", "-X", "utf8", "-B", str(checker), str(candidate)],
+        capture_output=True, text=True, encoding="utf-8", check=False, timeout=30)
+    return result, marker
+
+
+@pytest.mark.parametrize("appended, error", _review_revision_collection_cases())
+def test_review_revision_direct_and_generated_checker_reject_collection_execution(tmp_path, appended, error):
+    original = "import pytest\n\n@pytest.fixture\ndef stable():\n    return 1\n\ndef test_original(stable):\n    assert stable == 1\n"
+    candidate = original + "\n" + appended
+    with pytest.raises(ValueError, match="new_test_collection_" + error):
+        preserve_original_tests(original, candidate)
+    result, marker = _review_revision_run_generated_checker(tmp_path, original, candidate)
+    assert result.returncode != 0 and "new_test_collection_" + error in result.stderr
+    assert not marker.exists()
+
+
+def test_review_revision_direct_and_generated_checker_allow_inert_new_function_signatures(tmp_path):
+    original = "from __future__ import annotations\n\nimport pytest\n\n@pytest.fixture\ndef stable():\n    return 1\n\ndef test_original(stable):\n    assert stable == 1\n"
+    appended = ("\ndef helper_added(value, /, *items, flag, **kw):\n    return value + 1\n"
+        "\nasync def helper_async(value):\n    return value\n"
+        "\ndef test_new_regression(stable):\n    assert helper_added(stable, flag=True) == 2\n")
+    preserve_original_tests(original, original + appended)
+    result, marker = _review_revision_run_generated_checker(tmp_path, original, original + appended)
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text(encoding="utf-8") == "reached"

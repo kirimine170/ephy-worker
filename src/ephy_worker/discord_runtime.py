@@ -504,6 +504,10 @@ class BridgeLedger:
             db.execute("INSERT INTO requests VALUES (?)", (str(message_id),))
             return True
 
+    def seen(self, message_id: int) -> bool:
+        with self._db() as db:
+            return db.execute("SELECT 1 FROM requests WHERE id=?", (str(message_id),)).fetchone() is not None
+
     def previous(self, event: DiscordEvent) -> str | None:
         if event.reply_to is None:
             return None
@@ -618,7 +622,7 @@ class RuntimeDiscordBridge:
             from .owner_repair import OWNER_USER_ID
             owner_route = self.repairs is not None and event.user_id == OWNER_USER_ID
             if owner_route:
-                if not await asyncio.to_thread(self.ledger.claim, event.message_id):
+                if await asyncio.to_thread(self.ledger.seen, event.message_id):
                     return
                 await send(RECEIPT)
                 task = asyncio.create_task(self.gateway.classify_repair(question, previous))
@@ -631,6 +635,10 @@ class RuntimeDiscordBridge:
                     identifier = await asyncio.to_thread(self.repairs.enqueue, guild_id=event.guild_id,
                         channel_id=event.channel_id, message_id=event.message_id, author_id=event.user_id,
                         text=question, previous_answer=previous)
+                    # A durable claim may suppress replay only after the repair
+                    # exists；enqueue itself deduplicates concurrent deliveries．
+                    if not await asyncio.to_thread(self.ledger.claim, event.message_id):
+                        return
                     await send("修正依頼として受け付けました．修正，テストと独立レビューを進め，"
                         "条件を満たしたら本番への反映と再起動まで行います．受付番号：" + identifier)
                     return
@@ -638,7 +646,7 @@ class RuntimeDiscordBridge:
                 validate_public_text(question, max_chars=4000)
             except QueryPrivacyError:
                 raise BridgeError("question_not_public") from None
-            if not owner_route and not await asyncio.to_thread(self.ledger.claim, event.message_id):
+            if not await asyncio.to_thread(self.ledger.claim, event.message_id):
                 return
             if not owner_route:
                 await send(RECEIPT)
