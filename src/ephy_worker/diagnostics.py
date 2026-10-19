@@ -46,7 +46,10 @@ async def doctor(
         else:
             candidates = await search.search("Python documentation", "doctor-public-probe")
             result["search"].update(
-                ok=True, json_api=True, probe_result_count=len(candidates), diagnostic=search.last_diagnostic
+                ok=True,
+                json_api=config.search.provider not in {"duckduckgo_html", "ddgs"},
+                probe_result_count=len(candidates),
+                diagnostic=search.last_diagnostic,
             )
     except (SearchError, ConfigurationError, BudgetExceeded, ValueError) as exc:
         result["ok"] = False
