@@ -1,0 +1,278 @@
+{
+  "schema": "ephy.synthetic-improvement-integration-fixture.v1",
+  "case_id": "planner-gap-single-case",
+  "evidence_kind": "synthetic",
+  "evidence_scope": "Invented saved planner output, Research Report and CodingResult metadata only; no model, search, task command or trusted execution receipt is produced.",
+  "candidate_id": "explicit-plan-requirement-map",
+  "repeat_index": 1,
+  "budget": {
+    "timeout_seconds": 30,
+    "model_calls": 0,
+    "search_calls": 0,
+    "automatic_repairs": 0
+  },
+  "environment": {
+    "platform": "synthetic-platform",
+    "python": "synthetic-python",
+    "dependencies": "synthetic-frozen-dependencies",
+    "executor": "invented-records-only"
+  },
+  "profile": {
+    "profile_id": "synthetic-fixed-model",
+    "provider": "mock",
+    "model_id": "synthetic-no-model-execution",
+    "server_type": "mock",
+    "context_window": 2048,
+    "reasoning_level": null,
+    "quantization": null,
+    "endpoint": null,
+    "pi_executable": "not-invoked",
+    "pi_args": [],
+    "notes": "A descriptor only; no executor is invoked."
+  },
+  "task": {
+    "task_id": "planner-gap-single-case",
+    "category": "repository_navigation",
+    "description": "Synthetic metadata for the one-case contract connection; no coding command is run.",
+    "fixture_repository": "generated",
+    "base_revision": "HEAD",
+    "validation_command": [
+      "not-invoked-synthetic-validation"
+    ],
+    "timeout_seconds": 30,
+    "files": {
+      "docs/plan.md": "Synthetic fixture input.\n"
+    },
+    "mock_changes": [
+      {
+        "path": "docs/plan.md",
+        "content": "Synthetic fixture candidate.\n"
+      }
+    ]
+  },
+  "variants": [
+    {
+      "label": "baseline",
+      "run_id": "single-case-baseline",
+      "configuration": {
+        "plan_format": "incomplete-check-map"
+      },
+      "invented_result": {
+        "status": "failed",
+        "validation_passed": false,
+        "exit_code": 1,
+        "failure": {
+          "code": "validation_failure",
+          "stage": "validation",
+          "detail": null
+        }
+      }
+    },
+    {
+      "label": "candidate",
+      "run_id": "single-case-candidate",
+      "configuration": {
+        "plan_format": "explicit-requirement-map"
+      },
+      "invented_result": {
+        "status": "succeeded",
+        "validation_passed": true,
+        "exit_code": 0,
+        "failure": null
+      }
+    }
+  ],
+  "trial_result_note": "The invented validation booleans are independent synthetic task metadata; planner completed/checks_executed must never be converted into task validation results.",
+  "planner": {
+    "completion_contract": {
+      "schema": "ephy.plan-completion-contract.v1",
+      "requirements": [
+        {
+          "id": "R1",
+          "text": "計画の受入条件を要求へ結び付ける"
+        }
+      ],
+      "allowed_files": [
+        "docs/plan.md"
+      ],
+      "semantic_scope": "合成計画の要求と検証の対応のみ",
+      "prohibitions": [
+        {
+          "id": "P1",
+          "text": "モデル実行・採用を行わない"
+        }
+      ],
+      "checks": [
+        {
+          "id": "target",
+          "argv": [
+            "not-invoked-synthetic-target"
+          ]
+        },
+        {
+          "id": "regression",
+          "argv": [
+            "not-invoked-synthetic-regression"
+          ]
+        },
+        {
+          "id": "lint",
+          "argv": [
+            "not-invoked-synthetic-lint"
+          ]
+        },
+        {
+          "id": "repository",
+          "argv": [
+            "not-invoked-synthetic-repository"
+          ]
+        },
+        {
+          "id": "fixed",
+          "argv": [
+            "not-invoked-synthetic-fixed"
+          ]
+        }
+      ]
+    },
+    "baseline_text": "ACK\n",
+    "candidate_plan": {
+      "schema": "ephy.plan.v1",
+      "hypothesis": "受入条件と固定検証の対応を明示する",
+      "scope": {
+        "files": [
+          "docs/plan.md"
+        ],
+        "semantic_scope": "合成計画の要求と検証の対応のみ"
+      },
+      "prohibitions": [
+        "P1"
+      ],
+      "acceptance": [
+        {
+          "id": "A1",
+          "requirement_ids": [
+            "R1"
+          ],
+          "criterion": "要求と検証の対応が欠落しない"
+        }
+      ],
+      "verification": [
+        {
+          "check_id": "target",
+          "acceptance_ids": [
+            "A1"
+          ]
+        },
+        {
+          "check_id": "regression",
+          "acceptance_ids": [
+            "A1"
+          ]
+        },
+        {
+          "check_id": "lint",
+          "acceptance_ids": [
+            "A1"
+          ]
+        },
+        {
+          "check_id": "repository",
+          "acceptance_ids": [
+            "A1"
+          ]
+        },
+        {
+          "check_id": "fixed",
+          "acceptance_ids": [
+            "A1"
+          ]
+        }
+      ]
+    },
+    "baseline_missing_check": "fixed"
+  },
+  "research": {
+    "job_id": "synthetic-discovery-single-case",
+    "timestamp": "2026-10-13T00:00:00+00:00",
+    "source_id": "source-explicit-map",
+    "passage_id": "passage-explicit-map",
+    "evidence_id": "evidence-explicit-map",
+    "claim_id": "claim-explicit-map",
+    "source_url": "https://example.invalid/synthetic-explicit-plan",
+    "text": "Explicit requirement mapping links each acceptance criterion to declared requirements and checks.",
+    "conditions": "Synthetic saved-plan structural contract only.",
+    "information_gaps": [
+      "License, version and resource requirements were not investigated."
+    ],
+    "selection": {
+      "candidate_id": "explicit-plan-requirement-map",
+      "claims_by_field": {
+        "evaluation_method": [
+          "claim-explicit-map"
+        ]
+      }
+    }
+  },
+  "pending_connection": {
+    "gap_native_contract": "ephy.capability-native-adapter-development.v1",
+    "gap_native_contract_sha256": "72e078ce87556b59c2fda4f4c9641236023674737d47aa91c0f543579034553e",
+    "gap_native_contract_acceptance": "accepted_local_p2_synthetic_only",
+    "gap_native_acceptance_contract_sha256": "2483b4db4e48ef0f0af326f4399d0485d13aa9cf77df97b62e66170e5a0b3204",
+    "gap_native_source_pin": "cadf8d0aa1a1ff23e03e65394e8b35a37965731bc244c0a5e193c7dd54f6c4ac",
+    "gap_native_patch_pin": "ad7a2a87df2e69348fe39d1d538dc207e5067045d41ff35d6ac3143224b3e789",
+    "native_transport_result_sha256": "7f55d52648ae1beb49fafbbf490516f8ac8b2406003c8f03175879fd195529e7",
+    "lineage_schema": "ephy.synthetic-improvement-lineage.v1",
+    "unresolved_output_fields": [],
+    "reason": "The native dependency is accepted for local P2 synthetic integration and transported byte-exactly under accepted-dependencies-v3.json. The preliminary output shape remains historical example metadata. Actual execution results are recorded separately at evidence/verification-runs/sol-integration-v1/summary.json; this fixture makes no execution or pass claim.",
+    "native_output_shape_sha256": "fd5472bb9c66d1dfef3fa789e3674f37119d09df9d7a76ffb7d65491ab1d726c",
+    "native_output_shape_status": "unverified_candidate_example",
+    "native_output_shape_source_sha256": "cadf8d0aa1a1ff23e03e65394e8b35a37965731bc244c0a5e193c7dd54f6c4ac"
+  },
+  "native_inputs": {
+    "source_origin": "test_fixture",
+    "contexts_meaning": "Caller envelope identities only; they are not producer job or run identities.",
+    "baseline": {
+      "artifact_id": "saved-plan-baseline",
+      "context_id": "baseline-structure",
+      "source_family": "planner_completion"
+    },
+    "candidate": {
+      "artifact_id": "saved-plan-candidate",
+      "context_id": "candidate-structure",
+      "source_family": "planner_completion"
+    },
+    "trials": {
+      "artifact_id": "single-case-trial-accounting",
+      "context_id": "single-case-trials",
+      "source_family": "trial_reconciliation"
+    },
+    "conflict_control": {
+      "context_id": "same-logical-planning-check",
+      "job_id": "synthetic-shared-planner-job",
+      "meaning": "Two independently supplied reports for the same caller context and intended pins conflict. Preserve both observations instead of selecting the favorable report."
+    }
+  },
+  "candidate_count": 1,
+  "accepted_dependencies": {
+    "plan_completion": {
+      "acceptance_contract_sha256": "656478c94fb9b08f0c75efb9a983ee14a92952f79d4a57d247a86875d92edb7d",
+      "accepted_for": "local P2 synthetic contract integration only",
+      "core_source_sha256": "d8d4c2c47a97cdaac946c5ff5f4ae5cee1ea1bebcec96c0e8b2d616350b45180",
+      "adapter_source_sha256": "52a8be641b32db11596f708c657d83ec7ce3c6de4eafdae3a732422a8b0c1ddf",
+      "patch_sha256": "b61db92784fedff39625e1c09dc1ae91191e695c23d0008872b542eaff08c97b",
+      "p2_execution": "external_verification_result_reference",
+      "p2_execution_result_reference": "evidence/verification-runs/sol-integration-v1/summary.json"
+    },
+    "capability_gap_native": {
+      "acceptance_contract_sha256": "2483b4db4e48ef0f0af326f4399d0485d13aa9cf77df97b62e66170e5a0b3204",
+      "accepted_for": "local P2 synthetic contract integration only",
+      "source_sha256": "cadf8d0aa1a1ff23e03e65394e8b35a37965731bc244c0a5e193c7dd54f6c4ac",
+      "patch_sha256": "ad7a2a87df2e69348fe39d1d538dc207e5067045d41ff35d6ac3143224b3e789",
+      "development_contract_sha256": "72e078ce87556b59c2fda4f4c9641236023674737d47aa91c0f543579034553e",
+      "transport_result_sha256": "7f55d52648ae1beb49fafbbf490516f8ac8b2406003c8f03175879fd195529e7",
+      "p2_execution": "external_verification_result_reference",
+      "p2_execution_result_reference": "evidence/verification-runs/sol-integration-v1/summary.json"
+    }
+  }
+}
