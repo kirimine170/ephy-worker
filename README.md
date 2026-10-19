@@ -6,7 +6,7 @@
 
 ## Role in the Ephy ecosystem
 
-Workerは調査Job内の実行・予算・出典を所有します．目的・許可・結果の利用はRuntime，永続記憶はKarteの責務です．Runtimeの通常会話・音声設定や本番Karteには接続・変更しません．将来のUIはGo／Wailsを想定しています．
+Workerは調査Job内の実行・予算・出典を所有します．目的・許可・結果の利用はRuntime，永続記憶はKarteの責務です．Runtimeの通常会話・音声設定を変更しません．Windows 向けの [Ephy Worker Console](docs/desktop.md) は，既存 coding executor を操作する限定的な Tk GUI と，明示設定による Karte observer 連携を提供します．常用 Karte への接続・登録済みを前提にしません．
 
 ## Goals
 
@@ -18,9 +18,11 @@ Workerは調査Job内の実行・予算・出典を所有します．目的・�
 
 ## Non-goals
 
-UI，stdio daemon，Runtime／Karte実接続，自動再割当，中間resume，複数調査の並列化，OCR，JSブラウザ，認証回避は対象外です．coding機能の自動model weight取得，自動ranking，merge／push／deploy，自己更新も対象外です．
+汎用 Runtime UI，stdio daemon，Runtime 実接続，自動再割当，中間resume，複数調査の並列化，OCR，JSブラウザ，認証回避は対象外です．coding機能の自動model weight取得，自動ranking，merge／push／deploy，自己更新も対象外です．Console の実タスクは `governance_ack` を確認した読み取り専用 `planner` に限定し，公開 tool は `read` と `governance_ack` だけです．
 
 ## Current status
+
+Windows Console は，入力・統計・生成／イベントの 3 ペインと，合成デモ，Pi RPC による実 worker 経路を提供します．実接続は固定の正本 bundle を使う `strata-local` の限定 planner で，利用者の設定が必要です．Karte には GUI ホストの観測を記録し，モデル自身の報告とは区別します．起動，設定，予算・governance の実行契約，Windows ビルド，実試験と合成試験の区別は [Console の手順](docs/desktop.md) を参照してください．
 
 Phase 1の調査処理に加え，Phase 2の分散収集経路を実装しています．実行したfixture・実モデル試験，未検証のOS／profile，検索基盤の制約は[Phase 1検証](docs/phase1-validation.md)と[Phase 2検証](docs/phase2-validation.md)に記載します．`completed`は処理完了を表し，すべての主張が真実だという保証ではありません．`answerability`で回答範囲を別記します．
 
@@ -40,7 +42,7 @@ Coding経路は`coding_schema`／`coding_profiles`／`coding_executor`／`evalua
 
 ## Repository relationships
 
-親projectは`ephy`です．直接依存repoはありません．将来のRuntime／Karte接続は未実装であり，現時点の`.ephy/project.yaml`へ実接続として宣言しません．
+親projectは`ephy`です．直接依存repoはありません．Runtime 接続は未実装です．Console の Karte observer は任意の外部 CLI 接続であり，常用環境への適用を`.ephy/project.yaml`へ実接続として宣言しません．
 
 ## Getting started
 
