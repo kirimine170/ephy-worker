@@ -24,7 +24,9 @@ Runtime URLはliteralのloopback IPだけを許可します．環境proxyとredi
 
 最終生成はSSEです．`delta.content`だけを集め，`reasoning_content`やroute／source eventを会話本文へ混ぜません．完了reasonと`[DONE]`を確認してから最終回答を送ります．thinking tagを除去し，不完全な内部出力を拒否します．streamには600秒のread idle timeoutがあり，活動が続く生成に経過時間の締切は設けません．検索のpending回数，stream byte数，回答長は別に制限します．意味上の反復を判定するモデルやloop watchdogは追加していません．
 
-直接返信の参照先は，このtransportが同じguild／channel／userへ送った最終回答だけです．過去回答は最大1200 UTF-16単位，24時間以内，最大128件を保持します．質問の参照用データとして同じplan queryとchatへ渡すため，Runtime plannerも主題を解決できます．Managerへ送るのはRuntimeが許可した書換え後の検索語だけです．Discordの履歴取得や参照先のfetch，返信先の再帰探索はしません．
+直接返信の参照先は，このtransportが同じguild／channel／userへ送った最終回答だけです．過去回答は最大1200 UTF-16単位，24時間以内，最大128件を保持し，既知のcredentialをredactします．新しい質問だけを従来の厳格な公開text検査（最大4000文字）へ通してから，planの`query`へそのまま指定します．過去回答は別のoptional `context`として渡し，chatでもassistantの参照用データとして保持します．chatの最新user本文は新しい質問そのものです．過去回答がない場合は従来どおり`query`だけを送ります．
+
+既に公開した回答のcode fenceや公開連絡先・pathの例を，新しい質問の個人情報として再判定しません．Runtimeは過去回答を命令や権限として扱わず，必要なredaction後にlocalな検索語書換えの参考だけに使います．書換え後の検索語はRuntimeの同じprivacy／許可検査を必須とし，Managerへ送るのは許可された検索語だけです．生の過去回答をManagerへ渡さず，`confirm`／`block`を自動承認しません．Discordの履歴取得や参照先のfetch，返信先の再帰探索はしません．
 
 ## 状態と失敗
 
