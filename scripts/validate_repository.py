@@ -12,10 +12,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from pathlib import Path
 import re
 import sys
-from typing import Any, Iterable, Sequence
+from collections.abc import Iterable, Sequence
+from pathlib import Path
+from typing import Any
 
 from init_repository import (
     DATA_CLASSIFICATIONS,
@@ -28,7 +29,6 @@ from init_repository import (
     VISIBILITIES,
     repository_root,
 )
-
 
 REQUIRED_FILES = (
     ".ephy/project.yaml",

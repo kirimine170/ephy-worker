@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import json
 import os
 import platform
 import signal
 import subprocess
 import sys
+import time
 from contextlib import suppress
+from ctypes import wintypes
 from pathlib import Path
 
 import psutil
@@ -88,6 +91,154 @@ class ScriptPiRpcRunner(PiRpcRunner):
 
     def invocation(self, profile: CodingModelProfile) -> list[str]:
         return [sys.executable, str(self.script), *super().invocation(profile)[1:]]
+
+
+@pytest.mark.asyncio
+async def test_pi_observers_child_environment_and_required_guard(tmp_path):
+    repository, revision = _repository(tmp_path)
+    script = tmp_path / "observed-pi.py"
+    script.write_text(
+        "import json,os,sys\n"
+        "assert os.environ['EPHY_DESKTOP_TEST_ENV']=='child-only'\n"
+        "print(json.dumps({'type':'ephy_navigation_guard_ready','version':1}),flush=True)\n"
+        "assert json.loads(sys.stdin.readline())['type']=='prompt'\n"
+        "print(json.dumps({'type':'message_update','assistantMessageEvent':"
+        "{'type':'thinking_delta','delta':'must redact'}}),flush=True)\n"
+        "print(json.dumps({'type':'agent_settled'}),flush=True)\n",
+        encoding="utf-8",
+    )
+    events, pids = [], []
+    runner = ScriptPiRpcRunner(script)
+    PiRpcRunner.__init__(
+        runner, observer=events.append, process_observer=pids.append,
+        child_environment={"EPHY_DESKTOP_TEST_ENV": "child-only"},
+        required_ready_event="ephy_navigation_guard_ready",
+    )
+    profile = _profile(profile_id="real", provider="local", model_id="fixture", server_type="pi",
+                       pi_executable=sys.executable)
+    result, _ = await CodingExecutor(runner=runner).execute(
+        _job(repository, revision, model_profile="real", mock_changes=[],
+             validation_command=["git", "diff", "--check"]), profile, tmp_path / "runs",
+    )
+    assert result.result.status == "succeeded"
+    assert events[0]["type"] == "ephy_navigation_guard_ready"
+    assert "must redact" not in json.dumps(events)
+    assert type(pids[0]) is int and pids[-1] is None
+    assert "EPHY_DESKTOP_TEST_ENV" not in os.environ
+
+
+@pytest.mark.asyncio
+async def test_pi_missing_guard_fails_without_submitting_prompt(tmp_path):
+    repository, revision = _repository(tmp_path)
+    script = tmp_path / "no-guard-pi.py"
+    script.write_text(
+        "import json\nprint(json.dumps({'type':'extension_error','error':'guard unavailable'}),flush=True)\n",
+        encoding="utf-8",
+    )
+    runner = ScriptPiRpcRunner(script)
+    PiRpcRunner.__init__(runner, required_ready_event="ephy_navigation_guard_ready")
+    profile = _profile(profile_id="real", provider="local", model_id="fixture", server_type="pi",
+                       pi_executable=sys.executable)
+    result, _ = await CodingExecutor(runner=runner).execute(
+        _job(repository, revision, model_profile="real", mock_changes=[]), profile, tmp_path / "runs",
+    )
+    assert result.result.status == "failed"
+    assert result.result.failure.code == "pi_rpc_failure"
+    assert "guard" in result.result.failure.detail
+
+
+@pytest.mark.asyncio
+async def test_pi_mid_stream_eof_does_not_count_as_settled(tmp_path):
+    repository, revision = _repository(tmp_path)
+    script = tmp_path / "interrupted-pi.py"
+    script.write_text(
+        "import json,sys\nsys.stdin.readline()\n"
+        "print(json.dumps({'type':'message_update','assistantMessageEvent':"
+        "{'type':'text_delta','delta':'partial'}}),flush=True)\n",
+        encoding="utf-8",
+    )
+    observed = []
+    runner = ScriptPiRpcRunner(script)
+    PiRpcRunner.__init__(runner, observer=observed.append)
+    profile = _profile(profile_id="real", provider="local", model_id="fixture", server_type="pi",
+                       pi_executable=sys.executable)
+    result, _ = await CodingExecutor(runner=runner).execute(
+        _job(repository, revision, model_profile="real", mock_changes=[]), profile, tmp_path / "runs",
+    )
+    assert observed[0]["assistantMessageEvent"]["delta"] == "partial"
+    assert result.result.status == "failed"
+    assert result.result.failure.code == "pi_rpc_failure"
+    assert "before the agent settled" in result.result.failure.detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry_recovers", [False, True])
+async def test_pi_aborted_stream_fails_unless_retry_recovers(tmp_path, retry_recovers):
+    repository, revision = _repository(tmp_path)
+    aborted = {"role": "assistant", "stopReason": "aborted"}
+    events = [
+        {"type": "message_end", "message": aborted},
+        {"type": "agent_end", "willRetry": retry_recovers, "messages": [aborted]},
+    ]
+    if retry_recovers:
+        completed = {"role": "assistant", "stopReason": "stop"}
+        events.extend([
+            {"type": "auto_retry_start"}, {"type": "auto_retry_end"},
+            {"type": "message_end", "message": completed},
+            {"type": "agent_end", "willRetry": False, "messages": [completed]},
+        ])
+    events.append({"type": "agent_settled"})
+    script = tmp_path / "aborted-pi.py"
+    script.write_text(
+        "import json,sys\nsys.stdin.readline()\n"
+        f"events={events!r}\n"
+        "for event in events: print(json.dumps(event),flush=True)\n",
+        encoding="utf-8",
+    )
+    profile = _profile(profile_id="real", provider="local", model_id="fixture", server_type="pi",
+                       pi_executable=sys.executable)
+    result, _ = await CodingExecutor(runner=ScriptPiRpcRunner(script)).execute(
+        _job(repository, revision, model_profile="real", mock_changes=[],
+             validation_command=["git", "diff", "--check"]), profile, tmp_path / "runs",
+    )
+    if retry_recovers:
+        assert result.result.status == "succeeded"
+        assert result.metrics.retries == 1
+    else:
+        assert result.result.status == "failed"
+        assert result.result.failure.code == "pi_rpc_failure"
+        assert "aborted" in result.result.failure.detail
+
+
+@pytest.mark.skipif(os.name != "nt", reason="MSYS path normalization is Windows-only")
+def test_windows_msys_repository_root_is_resolved(tmp_path, monkeypatch):
+    from ephy_worker.coding_executor import resolve_repository
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    native = str(repository.resolve()).replace("\\", "/")
+    msys = "/" + native[0].lower() + native[2:]
+
+    def git(root, *args, **kwargs):
+        stdout = msys if "--show-toplevel" in args else "a" * 40
+        return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr("ephy_worker.coding_executor._git", git)
+    root, revision = resolve_repository(repository, "HEAD")
+    assert root == repository
+    assert revision == "a" * 40
+
+
+def test_revision_commit_peel_accepts_annotated_tags_but_not_blobs(tmp_path):
+    from ephy_worker.coding_executor import resolve_repository
+
+    repository, revision = _repository(tmp_path)
+    _run_git(repository, "-c", "user.name=Fixture", "-c", "user.email=fixture@invalid.example",
+             "tag", "-a", "navigation-base", "-m", "fixture tag")
+    assert resolve_repository(repository, "navigation-base")[1] == revision
+    blob = _run_git(repository, "hash-object", "value.py")
+    with pytest.raises(CodingExecutionError, match="invalid_revision"):
+        resolve_repository(repository, blob)
 
 
 def test_snapshot_cleanup_removes_only_allocated_repository(tmp_path):
@@ -677,3 +828,165 @@ async def test_pi_runner_cleans_child_after_agent_settles(tmp_path, monkeypatch)
     finally:
         with suppress(ProcessLookupError):
             os.kill(child_pid, signal.SIGKILL)
+
+
+def _owned_process_alive(identity):
+    try:
+        process = psutil.Process(identity["pid"])
+        if process.create_time() != identity["created"]:
+            return False
+        # Windows may still enumerate a terminated PID while references unwind.
+        # psutil.wait(0) additionally polls PID disappearance even after the OS
+        # reports a signalled handle, so use the native exit proof directly.
+        api = ctypes.WinDLL("kernel32", use_last_error=True)
+        api.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        api.OpenProcess.restype = wintypes.HANDLE
+        api.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        api.WaitForSingleObject.restype = wintypes.DWORD
+        api.CloseHandle.argtypes = [wintypes.HANDLE]
+        api.CloseHandle.restype = wintypes.BOOL
+        handle = api.OpenProcess(0x00100000, False, identity["pid"])  # SYNCHRONIZE
+        if not handle:
+            if ctypes.get_last_error() == 87:  # ERROR_INVALID_PARAMETER: PID is gone.
+                return False
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            status = api.WaitForSingleObject(handle, 0)
+            assert status in (0, 258), "owned process wait failed"
+            return status == 258  # WAIT_TIMEOUT: still executing.
+        finally:
+            api.CloseHandle(handle)
+    except psutil.NoSuchProcess:
+        return False
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows Job Objects")
+@pytest.mark.parametrize("disposition", ["cancel", "timeout", "settled", "invalid-json", "leader-exit"])
+async def test_windows_pi_owned_tree_and_inherited_pipes_are_reaped(tmp_path, disposition):
+    from ephy_worker.coding_executor import _run_agent_with_limits
+
+    identities_file = tmp_path / "owned-identities.json"
+    child_script = tmp_path / "owned-child.py"
+    child_script.write_text(
+        "import json,os,pathlib,subprocess,sys,time,psutil\n"
+        "grandchild=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'])\n"
+        "identities=[{'pid':pid,'created':psutil.Process(pid).create_time()} "
+        "for pid in (os.getpid(),grandchild.pid)]\n"
+        f"metadata=pathlib.Path({str(identities_file)!r})\n"
+        "staged=metadata.with_suffix('.tmp')\nstaged.write_text(json.dumps(identities))\n"
+        "staged.replace(metadata)\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    leader_script = tmp_path / "owned-leader.py"
+    leader_script.write_text(
+        "import json,os,pathlib,subprocess,sys,time\n"
+        "sys.stdin.readline()\n"
+        f"subprocess.Popen([sys.executable,{str(child_script)!r}],stdin=subprocess.DEVNULL)\n"
+        f"while not pathlib.Path({str(identities_file)!r}).exists(): time.sleep(0.01)\n"
+        + (
+            "print(json.dumps({'type':'agent_settled'}),flush=True)\n"
+            if disposition == "settled" else "print('invalid JSON',flush=True)\n"
+            if disposition == "invalid-json" else ""
+        )
+        + ("os._exit(0)\n" if disposition == "leader-exit" else "time.sleep(60)\n"),
+        encoding="utf-8",
+    )
+    runner = ScriptPiRpcRunner(leader_script)
+    pids = []
+    PiRpcRunner.__init__(runner, process_observer=pids.append)
+    profile = _profile(profile_id="real", provider="local", model_id="fixture", server_type="pi",
+                       pi_executable=sys.executable)
+    job = _job(tmp_path, "HEAD", model_profile="real", mock_changes=[])
+    cancel = asyncio.Event()
+    started = time.monotonic()
+    run = asyncio.create_task(_run_agent_with_limits(
+        runner, job, profile, tmp_path, cancel, 3 if disposition == "timeout" else 15,
+    ))
+    identities = []
+    # This independent, self-created control process must never enter Pi's job.
+    control = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", "import time; time.sleep(60)",
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    try:
+        deadline = time.monotonic() + 8
+        while not identities_file.exists():
+            if run.done():
+                await run  # Surface containment/setup errors without hiding them.
+            assert time.monotonic() < deadline, "fixture did not start its owned child tree"
+            await asyncio.sleep(0.01)
+        identities = json.loads(identities_file.read_text(encoding="utf-8"))
+        if disposition == "cancel":
+            cancel.set()
+        if disposition == "settled":
+            outcome = await asyncio.wait_for(run, timeout=8)
+            assert outcome.exit_code == 0
+        else:
+            code = {"cancel": "cancelled", "timeout": "execution_timeout"}.get(disposition, "pi_rpc_failure")
+            with pytest.raises(CodingExecutionError, match=code):
+                await asyncio.wait_for(run, timeout=8)
+        assert time.monotonic() - started < 10
+        assert identities and not any(_owned_process_alive(item) for item in identities)
+        assert pids[-1] is None
+        assert not psutil.pid_exists(pids[0])
+        assert control.returncode is None, "unrelated process was affected by owned-tree cleanup"
+    finally:
+        if not run.done():
+            run.cancel()
+            with suppress(asyncio.CancelledError, CodingExecutionError):
+                await asyncio.wait_for(run, timeout=8)
+        for identity in identities:
+            if _owned_process_alive(identity):
+                psutil.Process(identity["pid"]).kill()
+        control.kill()
+        await asyncio.wait_for(control.wait(), timeout=5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows Job Objects")
+@pytest.mark.parametrize("also_fail_terminate", [False, True])
+async def test_windows_assignment_failure_stops_suspended_child_before_any_code(tmp_path, monkeypatch,
+                                                                            also_fail_terminate):
+    from ephy_worker.coding_executor import _WindowsJob
+
+    marker = tmp_path / "must-not-execute.txt"
+    script = tmp_path / "suspended-pi.py"
+    script.write_text(
+        f"import pathlib,time\npathlib.Path({str(marker)!r}).write_text('executed')\ntime.sleep(60)\n",
+        encoding="utf-8",
+    )
+
+    def denied(*args):
+        raise OSError("synthetic AssignProcessToJobObject refusal")
+
+    monkeypatch.setattr(_WindowsJob, "assign_and_resume", denied)
+    if also_fail_terminate:
+        monkeypatch.setattr(_WindowsJob, "terminate", denied)
+    runner = ScriptPiRpcRunner(script)
+    pids = []
+    PiRpcRunner.__init__(runner, process_observer=pids.append)
+    profile = _profile(profile_id="real", provider="local", model_id="fixture", server_type="pi",
+                       pi_executable=sys.executable)
+    expected = "internal_worker_failure" if also_fail_terminate else "sandbox_unavailable"
+    with pytest.raises(CodingExecutionError, match=expected):
+        await asyncio.wait_for(
+            runner.run(_job(tmp_path, "HEAD"), profile, tmp_path, asyncio.Event()), timeout=8,
+        )
+    assert not marker.exists(), "uncontained child executed code before assignment"
+    assert pids[-1] is None
+    assert not psutil.pid_exists(pids[0])
+
+
+@pytest.mark.asyncio
+async def test_stderr_drain_has_a_deadline():
+    from ephy_worker.coding_executor import _finish_stderr
+
+    task = asyncio.create_task(asyncio.Event().wait())
+    started = time.monotonic()
+    with pytest.raises(CodingExecutionError, match="pi_rpc_failure"):
+        await _finish_stderr(task)
+    assert task.cancelled()
+    assert time.monotonic() - started < 3

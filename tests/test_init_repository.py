@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
-
+from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 INIT_SCRIPT = REPOSITORY_ROOT / "scripts" / "init_repository.py"
