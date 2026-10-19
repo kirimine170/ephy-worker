@@ -40,7 +40,7 @@ Coding経路は`coding_schema`／`coding_profiles`／`coding_executor`／`evalua
 
 ## Repository relationships
 
-親projectは`ephy`です．直接依存repoはありません．将来のRuntime／Karte接続は未実装であり，現時点の`.ephy/project.yaml`へ実接続として宣言しません．
+親projectは`ephy`です．standalone収集の直接依存repoはありません．opt-in Discord入口はRuntimeのHTTP APIへ接続し，`.ephy/project.yaml`のintegrationへ記録します．Karteへの実接続は未実装です．
 
 ## Getting started
 
@@ -88,6 +88,8 @@ uv run python -m ephy_worker research --config /absolute/private/worker.yaml --p
 ```
 
 ### Coding evaluation
+
+DiscordからRuntimeの検索・会話経路を利用するopt-in入口は[Discord Runtime transport](docs/discord-runtime-bridge.md)を参照してください．`discord-runtime check`は接続を行わず，`run --connect`だけがDiscordへ接続します．optional依存は`uv sync --locked --extra discord`で導入します．
 
 実modelもPiも不要なmock smoke suiteです．artifact既定先はGit外の`~/.local/state/ephy-worker/eval/runs`です．
 
@@ -187,6 +189,7 @@ Windowsのrepository validationは`python scripts/validate_repository.py --check
 - [Phase 1 validation](docs/phase1-validation.md)
 - [Phase 2 distributed collection ADR](docs/adr/0003-phase2-distributed-collection.md)
 - [Phase 2 validation](docs/phase2-validation.md)
+- [Discord Runtime transport](docs/discord-runtime-bridge.md)
 - [Tavily free-plan validation](docs/tavily-validation.md)
 - [Coding executor and evaluation](docs/coding-evaluation.md)
 - [Local coding model validation](docs/coding-model-validation.md)

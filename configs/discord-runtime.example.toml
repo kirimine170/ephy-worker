@@ -1,0 +1,14 @@
+# Git外へコピーする．IDと絶対state_dirを実際の許可範囲へ置き換える．
+application_id = 1
+guild_id = 1
+allowed_channel_ids = [1]
+allowed_user_ids = [1]
+runtime_url = "http://127.0.0.1:8000"
+token_env = "EPHY_DISCORD_BOT_TOKEN"
+# mentionなしの直接返信にはDeveloper Portal側のMessage Content Intentも必要．
+read_message_content = false
+state_dir = "/absolute/private/ephy-discord-runtime"
+request_timeout_seconds = 120
+read_idle_timeout_seconds = 600
+poll_interval_seconds = 1
+max_polls = 600
