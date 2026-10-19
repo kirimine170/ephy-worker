@@ -1,0 +1,19 @@
+# アカウント・APIキー不要．公開queryをTavily公式APIへ送信する．
+search:
+  provider: tavily_keyless
+  request_policy:
+    min_interval_seconds: 3
+    cache_ttl_seconds: 300
+    cache_max_entries: 128
+    cache_max_bytes: 2097152
+    cooldown_seconds: 300
+
+model_profiles:
+  qwen-local:
+    family: qwen
+    base_url_env: EPHY_QWEN_BASE_URL
+    model_id_env: EPHY_QWEN_MODEL_ID
+    output_mode: prompted_json
+    context_tokens: 32768
+    max_output_tokens: 4096
+    max_tokens_parameter: max_tokens
