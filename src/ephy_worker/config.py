@@ -70,7 +70,7 @@ def _resolve(value: str | None, env: str | None, label: str) -> str:
 
 
 class SearchConfig(StrictModel):
-    provider: Literal["searxng", "tavily"] = "searxng"
+    provider: Literal["searxng", "tavily", "duckduckgo_html"] = "searxng"
     base_url: str | None = None
     base_url_env: str | None = None
     api_key_env: str | None = None
@@ -98,11 +98,20 @@ class SearchConfig(StrictModel):
             if self.retries:
                 raise ValueError("Tavily validation does not retry potentially charged searches")
             self.api_key_env = self.api_key_env or "TAVILY_API_KEY"
+        elif self.provider == "duckduckgo_html":
+            if self.base_url or self.base_url_env or self.api_key_env:
+                raise ValueError("DuckDuckGo HTML uses a fixed endpoint without API keys")
+            if self.engine != "duckduckgo":
+                raise ValueError("DuckDuckGo HTML requires engine: duckduckgo")
+            if self.language != "auto":
+                raise ValueError("DuckDuckGo HTML currently supports language: auto only")
         elif self.api_key_env:
             raise ValueError("search API keys are supported only by the Tavily provider")
         return self
 
     def endpoint(self) -> str:
+        if self.provider == "duckduckgo_html":
+            return "https://html.duckduckgo.com/html/"
         if self.provider == "tavily":
             value = (
                 _resolve(self.base_url, self.base_url_env, "Tavily base URL")

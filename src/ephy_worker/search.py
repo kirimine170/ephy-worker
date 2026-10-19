@@ -114,6 +114,10 @@ def normalize_url(value: str) -> str | None:
 
 
 def create_search_provider(config: SearchConfig, budget: Budget, *, transport=None):
+    if config.provider == "duckduckgo_html":
+        from .duckduckgo import DuckDuckGoHTMLProvider
+
+        return DuckDuckGoHTMLProvider(config, budget, transport=transport)
     if config.provider == "tavily":
         from .tavily import TavilySearchProvider
 
