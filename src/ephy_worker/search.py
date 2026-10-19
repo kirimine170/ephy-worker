@@ -6,8 +6,11 @@ import asyncio
 import html
 import ipaddress
 import json
+import math
 import re
+import time
 import unicodedata
+from email.utils import parsedate_to_datetime
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 import httpx
@@ -22,9 +25,24 @@ class QueryPrivacyError(ValueError):
 
 
 class SearchError(RuntimeError):
-    def __init__(self, code: str, *, status: int | None = None):
+    def __init__(self, code: str, *, status: int | None = None, retry_after: float | None = None):
         self.code, self.status = code, status
+        self.retry_after = retry_after
         super().__init__(code)
+
+
+def retry_after_seconds(value: str | None) -> float | None:
+    """Keep only a finite delay from an upstream Retry-After header．"""
+    if not value:
+        return None
+    try:
+        delay = float(value)
+    except ValueError:
+        try:
+            delay = parsedate_to_datetime(value).timestamp() - time.time()
+        except (ValueError, TypeError, OverflowError):
+            return None
+    return max(0, delay) if math.isfinite(delay) else None
 
 
 _PRIVATE_PATTERNS = {
@@ -114,11 +132,31 @@ def normalize_url(value: str) -> str | None:
 
 
 def create_search_provider(config: SearchConfig, budget: Budget, *, transport=None):
-    if config.provider == "tavily":
+    if config.provider == "ddgs":
+        from .ddgs_search import DDGSSearchProvider
+
+        if transport is not None:
+            raise ValueError("DDGS uses its isolated native transport")
+        provider = DDGSSearchProvider(config, budget)
+    elif config.provider == "duckduckgo_html":
+        from .duckduckgo import DuckDuckGoHTMLProvider
+
+        provider = DuckDuckGoHTMLProvider(config, budget, transport=transport)
+    elif config.provider == "tavily":
         from .tavily import TavilySearchProvider
 
-        return TavilySearchProvider(config, budget, transport=transport)
-    return SearchProvider(config, budget, transport=transport)
+        provider = TavilySearchProvider(config, budget, transport=transport)
+    elif config.provider == "tavily_keyless":
+        from .tavily_keyless import TavilyKeylessSearchProvider
+
+        provider = TavilyKeylessSearchProvider(config, budget, transport=transport)
+    else:
+        provider = SearchProvider(config, budget, transport=transport)
+    if config.request_policy is not None:
+        from .search_policy import PolicySearchProvider
+
+        return PolicySearchProvider(provider)
+    return provider
 
 
 class SearchProvider:
@@ -135,6 +173,7 @@ class SearchProvider:
             headers={"Accept": "application/json"},
         )
         self.last_diagnostic: dict = {}
+        self._retry_after: float | None = None
 
     @property
     def metadata(self) -> dict:
@@ -154,10 +193,14 @@ class SearchProvider:
                     async with self.client.stream(
                         "POST" if data else "GET", self.base_url + path, data=data
                     ) as response:
+                        self._retry_after = retry_after_seconds(response.headers.get("retry-after"))
                         if response.status_code == 403:
                             raise SearchError("searxng_forbidden_json_or_access_disabled", status=403)
                         if response.status_code != 200:
-                            raise SearchError("searxng_http_error", status=response.status_code)
+                            raise SearchError(
+                                "searxng_http_error", status=response.status_code,
+                                retry_after=retry_after_seconds(response.headers.get("retry-after")),
+                            )
                         content = bytearray()
                         async for chunk in response.aiter_bytes():
                             content.extend(chunk)
@@ -178,6 +221,8 @@ class SearchProvider:
                 if attempt == self.config.retries:
                     raise SearchError("searxng_network_error") from exc
             except SearchError as exc:
+                if self.config.request_policy is not None and exc.status == 429:
+                    raise
                 if attempt == self.config.retries or exc.status not in {429, 502, 503, 504}:
                     raise
             await asyncio.sleep(min(0.25 * (attempt + 1), self.budget.remaining_seconds))
@@ -214,7 +259,7 @@ class SearchProvider:
                 if any(reason in upstream for upstream in reasons)
             ]
             self.last_diagnostic["reasons"] = known or ["engine_error"]
-            raise SearchError("searxng_engine_unresponsive")
+            raise SearchError("searxng_engine_unresponsive", retry_after=self._retry_after)
         if not isinstance(payload.get("results"), list):
             raise SearchError("searxng_missing_results")
         results = []
