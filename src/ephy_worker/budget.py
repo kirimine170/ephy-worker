@@ -13,8 +13,9 @@ class BudgetExceeded(RuntimeError):
 
 
 class Budget:
-    def __init__(self, limits: Limits):
+    def __init__(self, limits: Limits, *, enforce_time_limit: bool = True):
         self.limits = limits
+        self.enforce_time_limit = enforce_time_limit
         self.started = time.monotonic()
         self.counts: Counter = Counter()
         self.query_keys: set[str] = set()
@@ -25,6 +26,8 @@ class Budget:
 
     @property
     def remaining_seconds(self) -> float:
+        if not self.enforce_time_limit:
+            return float("inf")
         return max(0, self.limits.job_seconds - (time.monotonic() - self.started))
 
     def check(self) -> None:
@@ -54,7 +57,7 @@ class Budget:
         return True
 
     def snapshot(self) -> dict:
-        return {
+        result = {
             "requests": {k: self.counts[k] for k in ("search_requests", "fetch_requests", "model_requests")},
             "counts": dict(self.counts),
             "elapsed_seconds": round(time.monotonic() - self.started, 3),
@@ -63,3 +66,6 @@ class Budget:
             "output_tokens": self.output_tokens,
             "limits": self.limits.model_dump(),
         }
+        if not self.enforce_time_limit:
+            result["time_limit_enforced"] = False
+        return result
