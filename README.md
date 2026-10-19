@@ -22,6 +22,8 @@ UI，stdio daemon，Runtime／Karte実接続，自動再割当，中間resume，
 
 ## Current status
 
+許可されたGoogle Sheetsを専用Service Accountで明示的に読み取るCLIを追加しました．セットアップ，予算，外部JSON保存と`live_validation_pending`の扱いは[Google Sheets Read-only MVP](docs/google-sheets.md)を参照してください．
+
 Phase 1の調査処理に加え，Phase 2の分散収集経路を実装しています．実行したfixture・実モデル試験，未検証のOS／profile，検索基盤の制約は[Phase 1検証](docs/phase1-validation.md)と[Phase 2検証](docs/phase2-validation.md)に記載します．`completed`は処理完了を表し，すべての主張が真実だという保証ではありません．`answerability`で回答範囲を別記します．
 
 Coding Evaluation MVPは，Pi RPC adapter，detached worktree，deterministic mock，独立validation，6カテゴリのoffline smoke suiteを実装しています．mac向けcodingの既定Pi backendはRuntimeのcode経路と同じllama.cppです．共有llama.cpp routerで複数GGUFを切り替えるprofileも用意しています．現在の未コミット内容も明示したfileだけ一時snapshotに含め，ephy-worker自身からcandidate patchを作れます．実行境界は[Coding executorとevaluation harness](docs/coding-evaluation.md)を参照してください．

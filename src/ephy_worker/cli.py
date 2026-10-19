@@ -19,6 +19,9 @@ class CLIError(ValueError):
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="ephy-worker", description="調査・収集・coding Jobを実行するWorker")
     sub = root.add_subparsers(dest="command", required=True)
+    from .google_sheets_cli import add_parser
+
+    add_parser(sub)
     doctor = sub.add_parser("doctor", help="設定・接続・型付き出力を確認")
     doctor.add_argument("--config", required=True, type=Path)
     doctor.add_argument("--profile", help="未指定なら全profileを診断")
@@ -333,6 +336,11 @@ def main(argv: list[str] | None = None) -> int:
             stream.reconfigure(encoding="utf-8", errors="replace")
     args = parser().parse_args(argv)
     try:
+        if args.command == "google-sheets":
+            from .config import load_config
+            from .google_sheets_cli import run
+
+            return run(load_config(args.config), args)
         return asyncio.run(dispatch(args))
     except KeyboardInterrupt:
         print("cancelled", file=sys.stderr)

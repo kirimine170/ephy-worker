@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 import yaml
 from pydantic import Field, SecretStr, ValidationError, model_validator
 
+from .google_sheets_schema import SheetsConfig
 from .schema import Limits, StrictModel
 
 
@@ -295,6 +296,7 @@ class ManagerSettings(StrictModel):
 
 
 class WorkerConfig(StrictModel):
+    google_sheets: SheetsConfig | None = None
     model_profiles: dict[str, ModelProfile] = Field(default_factory=dict)
     search: SearchConfig | None = None
     limits: Limits = Field(default_factory=Limits)

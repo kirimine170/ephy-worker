@@ -1,0 +1,17 @@
+# 実IDを含む設定とService Account ADCはGit checkout外に配置する．
+google_sheets:
+  sources:
+    ephy-backlog: EPHY_SPREADSHEET_ID_REPLACE_ME
+    karte-backlog: KARTE_SPREADSHEET_ID_REPLACE_ME
+  allowed_spreadsheet_ids:
+    - EPHY_SPREADSHEET_ID_REPLACE_ME
+    - KARTE_SPREADSHEET_ID_REPLACE_ME
+  limits:
+    requests: 8              # token exchange，metadata，values，retryの合計
+    cells: 10000
+    response_bytes: 2097152
+    total_bytes: 4194304
+    request_seconds: 15
+    operation_seconds: 60
+    retries: 2
+    backoff_seconds: 0.5
