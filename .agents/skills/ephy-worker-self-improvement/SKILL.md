@@ -29,7 +29,7 @@ Before acting，read [`AGENTS.md`](../../../AGENTS.md) and the complete [system 
 8. The runner attests the actual auditor model，tool trace，schema validation，and unchanged candidate before accepting the audit result．`ACCEPT_PROPOSAL` means reviewable only，not applied．
 9. If any required gate or attestation fails，reject or mark the proposal inconclusive and retain its patch and logs．Never treat an agent narrative as a gate result．
 
-Keep `SKILL.md` focused on the reusable workflow．Read [the evaluation contract](references/eval-contract.md) when defining measurements，read [the independent audit contract](references/audit-contract.md) before assembling or auditing a bundle，and use [the MVP description](../../../docs/self-improvement-mvp.md) for the implemented boundary．The external Windows runtime still needs workspace-root confinement and the formal audit connection before this loop can be called complete．
+Keep `SKILL.md` focused on the reusable workflow．Read [the evaluation contract](references/eval-contract.md) when defining measurements，read [the independent audit contract](references/audit-contract.md) before assembling or auditing a bundle，and use [the MVP description](../../../docs/self-improvement-mvp.md) for the implemented boundary．The external Windows runtime now enforces implementer workspace-root confinement at the exposed file-tool boundary．Its optional exploratory campaign controller also rejects plain-text completion as a stage transition，bounds automatic continuation，and owns fixed checks from a hash-pinned contract．It still needs the formal audit connection and does not provide an OS-level sandbox; do not call this loop complete．
 
 ## PR review transport
 

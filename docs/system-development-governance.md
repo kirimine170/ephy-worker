@@ -1,7 +1,7 @@
 # ephy-worker システム開発ガバナンス
 
 - Policy ID：`ephy.system-development-governance.v1`
-- Version：`1.2.0`
+- Version：`1.2.1`
 - Status：active
 
 この文書は，ephy-worker自身の変更，評価基盤，実行runner，prompt，skill，checkerを含むシステム開発の正本です．個別の作業指示より優先し，上位のsystem／developer指示とユーザーが明示した権限境界には従います．
@@ -67,7 +67,8 @@ agentの「完了した」「問題ない」「tests passed」という説明は
 ### Implementer
 
 - 指定されたcleanな隔離worktreeだけを変更します．
-- 自己checkはできますが，独立検証や自分の成果の承認を代行しません．
+- 汎用shellは持たず，workspace-rootへ限定されたfile toolだけを使用します．canonicalなPi設定の変更もcandidate worktree内でproposalとして行い，稼働中runtimeへ直接反映しません．
+- 許可されたtoolで自己checkできる場合だけ実行します．未実行のcheckは明記し，独立検証や自分の成果の承認を代行しません．
 
 ### Independent verifier
 
@@ -108,6 +109,8 @@ preflight
 ```
 
 各attemptの中でQwenより前に独立検証を実行したり，独立検証後にQwen以外がrepairしたり，最終attempt後に検証せず監査へ進んだりすることは`workflow_failed`です．基盤不具合，環境不一致，wrong model，invalid command，証拠欠落はattemptを増やさず停止します．auditorが見るpatch SHA-256と，最終独立検証が測定したpatch SHA-256は一致しなければなりません．監査後にcandidateが1 byteでも変われば，検証と監査は無効です．
+
+LLMの通常の最終回答はstage完了を意味しません．対話型Piを複数stageの探索実験に使う場合も，controllerは機械可読な契約を読み，現在stage，期待model，file allowlist，固定check，patch identity，継続上限を外側で保持します．未完了のままagent runがsettleした場合は有限回だけfollow-upを投入し，上限到達時は失敗として停止します．stage外・wrong-model・scope外の変更可能toolは実行前に遮断し，sessionを恒久停止します．fixed checkと証拠生成をモデルの自己申告へ委ねません．この探索用controllerは同一session内のreasoning reviewを独立監査へ昇格させず，formal workflowの代替にもなりません．
 
 ## 4．隔離とscopeを守る
 
@@ -157,7 +160,7 @@ candidate由来と機械的に判定できる失敗だけを，固定回数のre
 3. 初期toolを`governance_ack`だけに制限し，ack前にはfile readを含む他のtoolを公開しません．policy本文はtoolで取得させるのではなく，system payloadへ完全な形で注入します．初回provider callでは元のユーザー依頼と過去会話を非破壊的に退避し，system messageとack専用の最小messageだけを渡します．元の依頼はack結果の検証後に復元します．
 4. agentがPolicy ID，SHA-256，末尾marker，nonce，roleを構造化して`governance_ack`へ返した場合だけ受領候補とします．ack messageに含まれた文章，thinking，兄弟tool callは保存前に除去し，exactなack tool call一つだけを実行します．文章によるack，値違い，追加field，ackなしの回答は，安定したfailure markerへ置換し，そのsessionを恒久停止します．
 5. lead／plannerでは，ack実行時にrunner指定のskill，evaluation contract，audit contract，audit prompt，実装境界文書をraw bytesから再読込し，開始時のbyte数とSHA-256に一致することを確認します．これらは切り詰めず，一つのmodel-visible tool resultとして配送します．50 KiBまたは2000行を超える場合，truncationせず停止します．最終`tool_result` hookがそのcontentの完全一致を確認するまで，他のtoolを公開しません．
-6. ackと必須contextの検証後だけ，そのroleに許可されたtoolを公開し，`governance_ack`自体は非公開に戻します．auditor roleではack後に`read`，`grep`，`find`，`ls`だけを公開します．managed runtimeがrepository外にある場合は，runnerとsmoke testの実在path，byte数，SHA-256をsystem-controlled metadataとして渡し，架空のrepository内pathで代替させません．
+6. ackと必須contextの検証後だけ，そのroleに許可されたtoolを公開し，`governance_ack`自体は非公開に戻します．implementer roleでは汎用`bash`／`powershell`を公開せず，file toolの対象pathをcanonicalなcandidate workspace-root内へ限定します．auditor roleではack後に`read`，`grep`，`find`，`ls`だけを公開します．managed runtimeがrepository外にある場合は，runnerとsmoke testの実在path，byte数，SHA-256をsystem-controlled metadataとして渡し，架空のrepository内pathで代替させません．
 7. ack前，必須context検証中，role ceiling外のtool callを`tool_call` gateでも遮断します．gateは他のfeature extensionより後に読み込み，最終provider payloadと最終tool resultを検査します．
 8. system delivery，ack，必須context配送，解禁tool，最初の変更可能toolの順序をrunnerの証跡へ残します．
 

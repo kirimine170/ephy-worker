@@ -136,6 +136,7 @@ class GovernanceContractTests(unittest.TestCase):
         agents = read("AGENTS.md")
         bootstrap = read(".pi/APPEND_SYSTEM.md")
         orchestrator = read(".pi/orchestrator.md")
+        implementer = read(".pi/agents/qwen-worker.md")
 
         self.assertIn(POLICY_ID, agents)
         self.assertIn("docs/system-development-governance.md", agents)
@@ -146,6 +147,9 @@ class GovernanceContractTests(unittest.TestCase):
         self.assertIn("governanceContext.complete=true", orchestrator)
         self.assertIn("Governance-Context-Root", orchestrator)
         self.assertIn("Do not require duplicate copies inside the candidate", orchestrator)
+        self.assertIn("only writable root", implementer)
+        self.assertIn("Never edit `.pi-dual`", implementer)
+        self.assertIn("do not attempt `bash`", implementer)
         self.assertEqual(
             bootstrap.rstrip().splitlines()[-1],
             "END-OF-EPHY-PI-GOVERNANCE-BOOTSTRAP-V1",
@@ -172,6 +176,8 @@ class GovernanceContractTests(unittest.TestCase):
         self.assertIn("開始時刻から24時間後", pilot)
         self.assertIn("PRは一つ", pilot)
         self.assertIn("新しいbackground Job", pilot)
+        self.assertIn("integration_capability_missing", pilot)
+        self.assertIn("run-background-job.ps1", pilot)
         self.assertIn("external_pr_review_ready", pilot)
         self.assertIn("mergeはしない", pilot)
 
@@ -193,6 +199,8 @@ class GovernanceContractTests(unittest.TestCase):
             "DUAL_AUDIT_BUNDLE_ROOT",
             "realpathSync",
             "auditorPathViolation",
+            "implementerPathViolation",
+            "IMPLEMENTER_PATH_TOOLS",
             "tools: [acknowledgementTool]",
             "Managed-Runtime-Artifacts",
             "MANDATORY GOVERNANCE BOOTSTRAP ONLY",
@@ -201,6 +209,9 @@ class GovernanceContractTests(unittest.TestCase):
                 self.assertIn(required, gate)
 
         self.assertIn('const AUDITOR_TOOLS = new Set([...READ_ONLY_TOOLS]);', gate)
+        implementer_tools = gate.split("const IMPLEMENTER_TOOLS", 1)[1].split(");", 1)[0]
+        self.assertNotIn('"bash"', implementer_tools)
+        self.assertNotIn('"powershell"', implementer_tools)
         self.assertNotIn("governance_context_load", gate)
 
     def test_self_improvement_skill_routes_to_audit_contract(self) -> None:

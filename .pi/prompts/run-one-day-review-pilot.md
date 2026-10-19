@@ -7,7 +7,10 @@ description: Run one bounded 24-hour external PR review pilot for the frozen eph
 
 ## 実行前提
 
-- `ephy.system-development-governance.v1` Version `1.2.0`，rootの`AGENTS.md`にある`Code Review Rules`，`.pi/prompts/review-self-improvement-pr.md`が対象repositoryへ反映済みであること．
+- これはproposal Job後のIntegration／release作業であり，lead／implementer用background Jobではない．開始前に，現在のsessionがgit commit／push，GitHub PR，固定verificationを直接実行できるIntegration能力を持つことを確認する．`background_job_submit`などJob操作しか使えない場合は，旧Jobやrunnerを子Jobから再実行せず，直ちに`integration_capability_missing`で停止する．
+- `audit_pending`のSource Jobをtaskとして包む新しいbackground Job，`run-background-job.ps1`の再帰呼出し，Source Job用worktreeの再作成は禁止する．この文書の手順を実行できる別のIntegration／release operatorへ渡すこと．
+
+- `ephy.system-development-governance.v1` Version `1.2.1`，rootの`AGENTS.md`にある`Code Review Rules`，`.pi/prompts/review-self-improvement-pr.md`が対象repositoryへ反映済みであること．
 - 反映後にPiを完全に終了して再起動し，新しいmanaged sessionで実行すること．古いsessionのcontext，extension，policy hashを流用しないこと．
 - ephy-workerのdefault branchとremoteが明確で，対象branchに未保存のユーザー変更がないこと．不明またはdirtyなら停止すること．
 - GitHub側のCodex automatic reviewが有効であること．確認できない場合でも，同じPRに対する手動の`@codex review`を一度だけ試せるが，review自体を確認できなければ合格にしないこと．

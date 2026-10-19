@@ -37,11 +37,11 @@ const LEAD_TOOLS = new Set([
 ]);
 const IMPLEMENTER_TOOLS = new Set([
 	...READ_ONLY_TOOLS,
-	"bash",
-	"powershell",
 	"edit",
 	"write",
 ]);
+const IMPLEMENTER_PATH_TOOLS = new Set([...READ_ONLY_TOOLS, "edit", "write"]);
+const IMPLEMENTER_OPTIONAL_PATH_TOOLS = new Set(["grep", "find", "ls"]);
 const INTEGRATION_TOOLS = new Set([
 	...READ_ONLY_TOOLS,
 	"background_job_status",
@@ -171,7 +171,7 @@ export default function governanceGate(pi: ExtensionAPI) {
 	let contextComplete = true;
 	let nonce = randomUUID();
 	const role = process.env.DUAL_GOVERNANCE_ROLE?.trim() ?? "";
-	const workspaceRoot = resolve(process.cwd());
+	let workspaceRoot = resolve(process.cwd());
 	const managedRuntimeRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 	const configuredGovernanceContextRoot = process.env.DUAL_GOVERNANCE_CONTEXT_ROOT?.trim();
 	const policyPath =
@@ -187,6 +187,10 @@ export default function governanceGate(pi: ExtensionAPI) {
 	let loadError: string | undefined;
 
 	try {
+		workspaceRoot = realpathSync(workspaceRoot);
+		if (!statSync(workspaceRoot).isDirectory()) {
+			throw new Error("The governed workspace root must identify an existing directory");
+		}
 		if (!toolCeiling(role)) {
 			throw new Error(
 				`Missing or unsupported DUAL_GOVERNANCE_ROLE: ${role || "<empty>"}`,
@@ -398,6 +402,49 @@ export default function governanceGate(pi: ExtensionAPI) {
 		}
 		if (!isPathWithinRoot(auditBundleRoot, canonicalPath)) {
 			return `Auditor tool ${toolName} path escapes DUAL_AUDIT_BUNDLE_ROOT`;
+		}
+		return undefined;
+	}
+
+	function implementerPathViolation(toolName: string, input: unknown): string | undefined {
+		if (role !== "implementer" || !IMPLEMENTER_PATH_TOOLS.has(toolName)) return undefined;
+		if (!isRecord(input)) {
+			return `Implementer tool ${toolName} requires structured input`;
+		}
+
+		let requestedValue = input.path;
+		if (
+			(requestedValue === undefined || requestedValue === null || requestedValue === "") &&
+			IMPLEMENTER_OPTIONAL_PATH_TOOLS.has(toolName)
+		) {
+			requestedValue = ".";
+		}
+		if (typeof requestedValue !== "string" || requestedValue.trim().length === 0) {
+			return `Implementer tool ${toolName} requires a path inside the governed workspace root`;
+		}
+
+		const requestedPath = resolve(workspaceRoot, requestedValue);
+		if (!isPathWithinRoot(workspaceRoot, requestedPath)) {
+			return `Implementer tool ${toolName} path escapes the governed workspace root`;
+		}
+
+		let existingAncestor = requestedPath;
+		let canonicalAncestor: string | undefined;
+		for (;;) {
+			try {
+				canonicalAncestor = realpathSync(existingAncestor);
+				break;
+			} catch {
+				const parent = dirname(existingAncestor);
+				if (parent === existingAncestor) break;
+				existingAncestor = parent;
+			}
+		}
+		if (!canonicalAncestor) {
+			return `Implementer tool ${toolName} path has no resolvable existing ancestor`;
+		}
+		if (!isPathWithinRoot(workspaceRoot, canonicalAncestor)) {
+			return `Implementer tool ${toolName} path escapes the governed workspace root through a symlink or junction`;
 		}
 		return undefined;
 	}
@@ -712,7 +759,9 @@ export default function governanceGate(pi: ExtensionAPI) {
 		}
 
 		if (acknowledged) {
-			const pathViolation = auditorPathViolation(event.toolName, event.input);
+			const pathViolation =
+				auditorPathViolation(event.toolName, event.input) ??
+				implementerPathViolation(event.toolName, event.input);
 			if (pathViolation) {
 				latchViolation();
 				return {
