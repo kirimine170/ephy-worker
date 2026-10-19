@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import hashlib
 import json
 import os
@@ -14,7 +15,9 @@ import stat
 import subprocess
 import tempfile
 import time
+from collections.abc import Callable, Mapping
 from contextlib import suppress
+from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -106,6 +109,7 @@ def _git(repository: Path, *args: str, check: bool = True) -> subprocess.Complet
             encoding="utf-8",
             errors="replace",
             timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise CodingExecutionError(
@@ -124,12 +128,22 @@ def resolve_repository(repository_path: Path, revision: str) -> tuple[Path, str]
     root_result = _git(requested, "rev-parse", "--show-toplevel", check=False)
     if root_result.returncode:
         raise CodingExecutionError("repository_unavailable", "repository", "path is not a Git worktree")
-    root = Path(root_result.stdout.strip()).resolve()
+    root_text = root_result.stdout.strip()
+    # MSYS Git reports /c/... even when invoked by native Python. Preserve the
+    # user's Git selection and shared gitdir format while comparing native paths.
+    if (
+        os.name == "nt" and len(root_text) >= 3 and root_text[0] == "/" and root_text[2] == "/"
+        and root_text[1].isascii() and root_text[1].isalpha()
+    ):
+        root_text = f"{root_text[1]}:{root_text[2:]}"
+    root = Path(root_text).resolve()
     if root != requested:
         raise CodingExecutionError(
             "repository_unavailable", "repository", "repository_path must name the Git worktree root"
         )
-    revision_result = _git(root, "rev-parse", "--verify", f"{revision}^{{commit}}", check=False)
+    # ^0 is the commit peel spelling without braces, which MSYS argv globbing
+    # can expand before Git sees a native Windows subprocess argument.
+    revision_result = _git(root, "rev-parse", "--verify", f"{revision}^0", check=False)
     if revision_result.returncode:
         raise CodingExecutionError("invalid_revision", "repository", "base revision does not resolve")
     return root, revision_result.stdout.strip()
@@ -450,6 +464,8 @@ def _agent_error(event: dict) -> str | None:
         ][-1:]
     for message in messages:
         stop_reason = message.get("stopReason", message.get("stop_reason"))
+        if stop_reason == "aborted":
+            return "Pi model stream aborted before completion"
         if stop_reason == "error":
             return str(
                 message.get("errorMessage")
@@ -460,7 +476,260 @@ def _agent_error(event: dict) -> str | None:
     return None
 
 
-async def _stop_process(process: asyncio.subprocess.Process) -> None:
+class _WindowsJob:
+    """One non-inheritable job handle for a suspended, worker-owned Pi process tree."""
+
+    CREATE_SUSPENDED = 0x00000004
+
+    def __init__(self):
+        if os.name != "nt":
+            raise OSError("Windows jobs are only available on Windows")
+        self.handle = None
+        self.api = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class BasicLimits(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong), ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class IoCounters(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_ulonglong) for name in (
+                "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                "ReadTransferCount", "WriteTransferCount", "OtherTransferCount",
+            )]
+
+        class ExtendedLimits(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", BasicLimits), ("IoInfo", IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        class Accounting(ctypes.Structure):
+            _fields_ = [
+                ("TotalUserTime", ctypes.c_longlong), ("TotalKernelTime", ctypes.c_longlong),
+                ("ThisPeriodTotalUserTime", ctypes.c_longlong), ("ThisPeriodTotalKernelTime", ctypes.c_longlong),
+                ("TotalPageFaultCount", wintypes.DWORD), ("TotalProcesses", wintypes.DWORD),
+                ("ActiveProcesses", wintypes.DWORD), ("TotalTerminatedProcesses", wintypes.DWORD),
+            ]
+
+        class ThreadEntry(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ThreadID", wintypes.DWORD),
+                ("th32OwnerProcessID", wintypes.DWORD), ("tpBasePri", wintypes.LONG),
+                ("tpDeltaPri", wintypes.LONG), ("dwFlags", wintypes.DWORD),
+            ]
+
+        self.Accounting = Accounting
+        self.ThreadEntry = ThreadEntry
+        signatures = {
+            "CreateJobObjectW": ([ctypes.c_void_p, wintypes.LPCWSTR], wintypes.HANDLE),
+            "SetInformationJobObject": (
+                [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD], wintypes.BOOL,
+            ),
+            "AssignProcessToJobObject": ([wintypes.HANDLE, wintypes.HANDLE], wintypes.BOOL),
+            "TerminateJobObject": ([wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
+            "QueryInformationJobObject": (
+                [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p], wintypes.BOOL,
+            ),
+            "OpenProcess": ([wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE),
+            "IsProcessInJob": ([wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)], wintypes.BOOL),
+            "WaitForSingleObject": ([wintypes.HANDLE, wintypes.DWORD], wintypes.DWORD),
+            "OpenThread": ([wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE),
+            "GetProcessIdOfThread": ([wintypes.HANDLE], wintypes.DWORD),
+            "ResumeThread": ([wintypes.HANDLE], wintypes.DWORD),
+            "CreateToolhelp32Snapshot": ([wintypes.DWORD, wintypes.DWORD], wintypes.HANDLE),
+            "Thread32First": ([wintypes.HANDLE, ctypes.POINTER(ThreadEntry)], wintypes.BOOL),
+            "Thread32Next": ([wintypes.HANDLE, ctypes.POINTER(ThreadEntry)], wintypes.BOOL),
+            "CloseHandle": ([wintypes.HANDLE], wintypes.BOOL),
+        }
+        for name, (arguments, result) in signatures.items():
+            function = getattr(self.api, name)
+            function.argtypes = arguments
+            function.restype = result
+        # NULL security attributes make this handle non-inheritable. Children
+        # cannot retain it and defeat KILL_ON_JOB_CLOSE when the GUI exits.
+        self.handle = self.api.CreateJobObjectW(None, None)
+        if not self.handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        limits = ExtendedLimits()
+        limits.BasicLimitInformation.LimitFlags = 0x00002000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not self.api.SetInformationJobObject(self.handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+            error = ctypes.get_last_error()
+            self.close()
+            raise ctypes.WinError(error)
+
+    def assign_and_resume(self, pid: int) -> None:
+        # PROCESS_TERMINATE | PROCESS_SET_QUOTA, required by assignment.
+        process_handle = self.api.OpenProcess(0x0001 | 0x0100, False, pid)
+        if not process_handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            if not self.api.AssignProcessToJobObject(self.handle, process_handle):
+                raise ctypes.WinError(ctypes.get_last_error())
+            self._resume_primary_thread(pid)
+        finally:
+            self.api.CloseHandle(process_handle)
+
+    def _resume_primary_thread(self, pid: int) -> None:
+        # Popen closes CreateProcess's primary-thread handle. Recover only the
+        # one thread in our still-suspended process via documented ToolHelp APIs.
+        snapshot = self.api.CreateToolhelp32Snapshot(0x00000004, 0)  # TH32CS_SNAPTHREAD
+        if snapshot == ctypes.c_void_p(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            entry = self.ThreadEntry()
+            entry.dwSize = ctypes.sizeof(entry)
+            available = self.api.Thread32First(snapshot, ctypes.byref(entry))
+            thread_ids = []
+            while available:
+                if entry.th32OwnerProcessID == pid:
+                    thread_ids.append(entry.th32ThreadID)
+                entry.dwSize = ctypes.sizeof(entry)
+                available = self.api.Thread32Next(snapshot, ctypes.byref(entry))
+            if ctypes.get_last_error() != 18:  # ERROR_NO_MORE_FILES
+                raise ctypes.WinError(ctypes.get_last_error())
+            if len(thread_ids) != 1:
+                raise OSError("suspended Pi process must have exactly one primary thread")
+            # THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION.
+            thread = self.api.OpenThread(0x0002 | 0x0800, False, thread_ids[0])
+            if not thread:
+                raise ctypes.WinError(ctypes.get_last_error())
+            try:
+                if self.api.GetProcessIdOfThread(thread) != pid:
+                    raise OSError("primary thread ownership changed")
+                if self.api.ResumeThread(thread) != 1:
+                    raise OSError("primary thread was not exclusively suspended by the worker")
+            finally:
+                self.api.CloseHandle(thread)
+        finally:
+            self.api.CloseHandle(snapshot)
+
+    def terminate(self) -> None:
+        if not self.api.TerminateJobObject(self.handle, 1):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def process_handles(self) -> list[int]:
+        """Retain exit handles for current members, rejecting reused/nonmember PIDs."""
+        capacity = 64
+        while capacity <= 8192:
+            class ProcessIds(ctypes.Structure):
+                _fields_ = [
+                    ("NumberOfAssignedProcesses", wintypes.DWORD),
+                    ("NumberOfProcessIdsInList", wintypes.DWORD),
+                    ("ProcessIdList", ctypes.c_size_t * capacity),
+                ]
+
+            entries = ProcessIds()
+            if self.api.QueryInformationJobObject(
+                self.handle, 3, ctypes.byref(entries), ctypes.sizeof(entries), None,
+            ):
+                break
+            if ctypes.get_last_error() != 234:  # ERROR_MORE_DATA
+                raise ctypes.WinError(ctypes.get_last_error())
+            capacity *= 2
+        else:
+            raise OSError("owned process tree exceeds the bounded exit-handle capacity")
+        handles = []
+        try:
+            for pid in entries.ProcessIdList[:entries.NumberOfProcessIdsInList]:
+                # SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION.
+                handle = self.api.OpenProcess(0x00100000 | 0x1000, False, pid)
+                if not handle:
+                    if ctypes.get_last_error() == 87:  # Process already exited.
+                        continue
+                    raise ctypes.WinError(ctypes.get_last_error())
+                try:
+                    belongs = wintypes.BOOL()
+                    if not self.api.IsProcessInJob(handle, self.handle, ctypes.byref(belongs)):
+                        raise ctypes.WinError(ctypes.get_last_error())
+                    if not belongs.value:
+                        raise OSError("owned process identity changed during cleanup")
+                except BaseException:
+                    self.api.CloseHandle(handle)
+                    raise
+                handles.append(handle)
+            return handles
+        except BaseException:
+            self.close_process_handles(handles)
+            raise
+
+    def processes_exited(self, handles: list[int]) -> bool:
+        complete = True
+        for handle in handles:
+            status = self.api.WaitForSingleObject(handle, 0)
+            if status == 258:  # WAIT_TIMEOUT
+                complete = False
+            elif status != 0:  # WAIT_OBJECT_0
+                raise ctypes.WinError(ctypes.get_last_error())
+        return complete
+
+    def close_process_handles(self, handles: list[int]) -> None:
+        for handle in handles:
+            self.api.CloseHandle(handle)
+
+    def active_processes(self) -> int:
+        accounting = self.Accounting()
+        if not self.api.QueryInformationJobObject(
+            self.handle, 1, ctypes.byref(accounting), ctypes.sizeof(accounting), None,
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return int(accounting.ActiveProcesses)
+
+    def close(self) -> None:
+        if self.handle is not None:
+            if not self.api.CloseHandle(self.handle):
+                raise ctypes.WinError(ctypes.get_last_error())
+            self.handle = None
+
+
+async def _stop_process(process: asyncio.subprocess.Process, windows_job: _WindowsJob | None = None) -> None:
+    if windows_job is not None:
+        cleanup_error = None
+        handles = []
+        try:
+            handles = windows_job.process_handles()
+        except OSError as exc:
+            cleanup_error = exc
+        try:
+            windows_job.terminate()
+            deadline = time.monotonic() + 3
+            while windows_job.active_processes() or not windows_job.processes_exited(handles):
+                if time.monotonic() >= deadline:
+                    raise OSError("owned Windows process tree did not stop")
+                await asyncio.sleep(0.02)
+        except OSError as exc:
+            cleanup_error = exc
+        finally:
+            windows_job.close_process_handles(handles)
+            try:
+                windows_job.close()
+            except OSError as exc:
+                cleanup_error = cleanup_error or exc
+        # A failed assignment leaves the newly-created process suspended and
+        # outside the job. Stop that exact Popen handle too; it cannot have children.
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            except OSError as exc:
+                cleanup_error = cleanup_error or exc
+        try:
+            await asyncio.wait_for(process.wait(), timeout=2)
+        except TimeoutError:
+            raise CodingExecutionError(
+                "internal_worker_failure", "worker", "Pi process exit could not be confirmed",
+            ) from None
+        if cleanup_error is not None:
+            raise CodingExecutionError(
+                "internal_worker_failure", "worker", "Windows Pi process-tree cleanup could not be confirmed",
+            ) from cleanup_error
+        return
     if os.name == "posix":
         # start_new_session=True makes the child's PID its process-group ID．
         # The leader can exit while a tool subprocess remains in that group．
@@ -493,7 +762,50 @@ async def _stop_process(process: asyncio.subprocess.Process) -> None:
     except TimeoutError:
         with suppress(ProcessLookupError):
             process.kill()
-        await process.wait()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=2)
+        except TimeoutError:
+            raise CodingExecutionError(
+                "internal_worker_failure", "worker", "process exit could not be confirmed",
+            ) from None
+
+
+async def _watch_process_exit(process: asyncio.subprocess.Process) -> float:
+    # asyncio.Process.wait can itself wait for inherited stdout/stderr handles.
+    # returncode is populated when the actual leader exits, independently of EOF.
+    while process.returncode is None:
+        await asyncio.sleep(0.02)
+    return time.monotonic()
+
+
+async def _read_rpc_line(process: asyncio.subprocess.Process, exited: asyncio.Task) -> bytes:
+    assert process.stdout is not None
+    if exited.done() and time.monotonic() - exited.result() >= 0.25:
+        return b""
+    read = asyncio.create_task(process.stdout.readline(), name="pi-stdout-line")
+    try:
+        done, _ = await asyncio.wait((read, exited), return_when=asyncio.FIRST_COMPLETED)
+        if read in done:
+            return await read
+        # Permit final buffered bytes after leader exit, but never let an orphan
+        # tool hold this client open merely by inheriting stdout.
+        remaining = max(0.001, 0.25 - (time.monotonic() - exited.result()))
+        try:
+            return await asyncio.wait_for(read, timeout=remaining)
+        except TimeoutError:
+            return b""
+    finally:
+        if not read.done():
+            read.cancel()
+            with suppress(asyncio.CancelledError):
+                await read
+
+
+async def _finish_stderr(task: asyncio.Task[str]) -> str:
+    try:
+        return await asyncio.wait_for(task, timeout=2)
+    except TimeoutError:
+        raise CodingExecutionError("pi_rpc_failure", "agent", "Pi stderr did not close after shutdown") from None
 
 
 async def _read_capped(stream: asyncio.StreamReader | None, limit: int = MAX_LOG_BYTES) -> str:
@@ -539,6 +851,19 @@ async def _check_endpoint(profile: CodingModelProfile) -> None:
 class PiRpcRunner:
     """Strict JSONL client for ``pi --mode rpc``．"""
 
+    def __init__(
+        self,
+        *,
+        observer: Callable[[dict], None] | None = None,
+        child_environment: Mapping[str, str] | None = None,
+        process_observer: Callable[[int | None], None] | None = None,
+        required_ready_event: str | None = None,
+    ):
+        self.observer = observer
+        self.child_environment = dict(child_environment or {})
+        self.process_observer = process_observer
+        self.required_ready_event = required_ready_event
+
     def invocation(self, profile: CodingModelProfile) -> list[str]:
         return [
             profile.pi_executable,
@@ -566,8 +891,20 @@ class PiRpcRunner:
         await _check_endpoint(profile)
         command = _macos_write_guard(self.invocation(profile), job, worktree)
         environment = os.environ.copy()
+        environment.update(getattr(self, "child_environment", {}))
         environment["EPHY_NETWORK_POLICY"] = job.network_policy
-        kwargs = {"start_new_session": True} if os.name == "posix" else {}
+        windows_job = None
+        if os.name == "nt":
+            try:
+                windows_job = _WindowsJob()
+            except OSError:
+                raise CodingExecutionError(
+                    "sandbox_unavailable", "agent", "Windows Pi process-tree containment is unavailable",
+                ) from None
+        kwargs = (
+            {"start_new_session": True} if os.name == "posix"
+            else {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0) | _WindowsJob.CREATE_SUSPENDED}
+        )
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,
@@ -580,8 +917,14 @@ class PiRpcRunner:
                 **kwargs,
             )
         except OSError:
+            if windows_job is not None:
+                windows_job.close()
             code = "sandbox_unavailable" if job.macos_sandbox != "off" else "pi_executable_unavailable"
             raise CodingExecutionError(code, "agent", "Pi sandbox could not be started") from None
+        except BaseException:
+            if windows_job is not None:
+                windows_job.close()
+            raise
 
         prompt = (
             "Work only inside the current Git worktree. Do not commit, push, merge, download models, "
@@ -595,7 +938,44 @@ class PiRpcRunner:
         settled = False
         metrics = AgentMetrics(turns=0, tool_calls=0, retries=0)
         stderr_task = asyncio.create_task(_read_capped(process.stderr), name="pi-stderr")
+        exited = asyncio.create_task(_watch_process_exit(process), name="pi-leader-exit")
         try:
+            process_observer = getattr(self, "process_observer", None)
+            if process_observer is not None:
+                process_observer(process.pid)
+            if windows_job is not None:
+                try:
+                    windows_job.assign_and_resume(process.pid)
+                except OSError:
+                    raise CodingExecutionError(
+                        "sandbox_unavailable", "agent", "Windows Pi process-tree containment could not start",
+                    ) from None
+            ready_event = getattr(self, "required_ready_event", None)
+            if ready_event is not None:
+                assert process.stdout is not None
+                deadline = time.monotonic() + 10
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise CodingExecutionError("pi_rpc_failure", "agent", "required Pi guard did not start")
+                    try:
+                        line = await asyncio.wait_for(_read_rpc_line(process, exited), timeout=remaining)
+                        bootstrap = json.loads(line.decode("utf-8"))
+                    except (TimeoutError, UnicodeDecodeError, json.JSONDecodeError):
+                        raise CodingExecutionError(
+                            "pi_rpc_failure", "agent", "required Pi guard did not start"
+                        ) from None
+                    if not isinstance(bootstrap, dict) or bootstrap.get("type") in {
+                        "extension_error", "ephy_navigation_guard_failed", "ephy_navigation_guard_violation",
+                    }:
+                        raise CodingExecutionError("pi_rpc_failure", "agent", "required Pi guard failed")
+                    sanitized = _sanitize_event(bootstrap)
+                    events.append(json.dumps(sanitized, ensure_ascii=False, separators=(",", ":")))
+                    observer = getattr(self, "observer", None)
+                    if observer is not None:
+                        observer(sanitized)
+                    if bootstrap.get("type") == ready_event and bootstrap.get("version") == 1:
+                        break
             assert process.stdin is not None
             process.stdin.write(
                 (json.dumps({"id": "coding-job", "type": "prompt", "message": prompt}) + "\n").encode("utf-8")
@@ -603,10 +983,8 @@ class PiRpcRunner:
             await process.stdin.drain()
             assert process.stdout is not None
             while True:
-                line = await process.stdout.readline()
+                line = await _read_rpc_line(process, exited)
                 if not line:
-                    if process.returncode is None:
-                        await process.wait()
                     break
                 try:
                     event = json.loads(line.decode("utf-8", errors="strict").rstrip("\r\n"))
@@ -614,6 +992,11 @@ class PiRpcRunner:
                     raise CodingExecutionError(
                         "pi_rpc_failure", "agent", "Pi emitted invalid JSONL"
                     ) from None
+                if not isinstance(event, dict):
+                    raise CodingExecutionError("pi_rpc_failure", "agent", "Pi emitted a non-object event")
+                observer = getattr(self, "observer", None)
+                if observer is not None:
+                    observer(_sanitize_event(event))
                 events.append(json.dumps(_sanitize_event(event), ensure_ascii=False, separators=(",", ":")))
                 event_type = event.get("type")
                 event_error = _agent_error(event)
@@ -649,8 +1032,18 @@ class PiRpcRunner:
                     settled = True
                     break
         finally:
-            await _stop_process(process)
-            stderr = await stderr_task
+            try:
+                await _stop_process(process, windows_job)
+            finally:
+                try:
+                    stderr = await _finish_stderr(stderr_task)
+                finally:
+                    exited.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await exited
+                    process_observer = getattr(self, "process_observer", None)
+                    if process_observer is not None:
+                        process_observer(None)
         log = "\n".join(events) + ("\n" if events else "")
         if stderr:
             log += "[stderr]\n" + stderr
@@ -689,7 +1082,10 @@ async def _run_argv(
     environment = os.environ.copy()
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     environment["EPHY_NETWORK_POLICY"] = network_policy
-    kwargs = {"start_new_session": True} if os.name == "posix" else {}
+    kwargs = (
+        {"start_new_session": True} if os.name == "posix"
+        else {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+    )
     try:
         process = await asyncio.create_subprocess_exec(
             *_macos_write_guard(command, job, cwd),
