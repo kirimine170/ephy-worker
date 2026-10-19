@@ -50,6 +50,15 @@ from ephy_worker.formal_runtime import (
 REPOSITORY = Path(__file__).resolve().parents[1]
 
 
+@pytest.fixture(autouse=True)
+def synthetic_private_home(tmp_path, monkeypatch):
+    # Imported descriptor unit fixtures need the same disposable home as their
+    # originating module; real native controls still deny the actual user home.
+    home = tmp_path / "synthetic-home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: home)
+
+
 def contract():
     return {
         "allowed_files": ["docs/example.md"],
@@ -75,6 +84,71 @@ def contract():
         "max_log_bytes": 100000,
         "runtime_hashes": {},
     }
+
+
+def test_code_profile_requires_measured_descriptor_and_keeps_default_markdown_only(tmp_path):
+    from test_verifier_sandbox import descriptor_fixture
+
+    value = contract()
+    value["allowed_files"] = ["src/ephy_worker/search.py", "tests/test_search.py"]
+    with pytest.raises(GateFailure, match="need isolation"):
+        validate_contract(value)
+    value["execution_profile"] = "native_windows_code_v1"
+    with pytest.raises(GateFailure, match="explicit pinned"):
+        validate_contract(value)
+    value["verifier_sandbox"] = descriptor_fixture(tmp_path)
+    validate_contract(value)
+
+
+@pytest.mark.parametrize("path", [
+    "src/ephy_worker/formal_runtime.py", "src/ephy_worker/owner_repair.py",
+    "src/ephy_worker/verifier_sandbox.py", "src/ephy_worker/existing_llama_runtime.py",
+    "src/ephy_worker/strata_runtime.py", "docs/system-development-governance.md", "tools/unsafe.py",
+])
+def test_code_profile_cannot_modify_its_execution_controls(tmp_path, path):
+    from test_verifier_sandbox import descriptor_fixture
+
+    value = contract()
+    value.update(execution_profile="native_windows_code_v1", verifier_sandbox=descriptor_fixture(tmp_path))
+    value["allowed_files"] = [path]
+    with pytest.raises(GateFailure, match="protected execution controls"):
+        validate_contract(value)
+
+
+def test_executable_check_launches_only_native_sandbox(tmp_path, monkeypatch):
+    from contextlib import nullcontext
+
+    from test_verifier_sandbox import descriptor_fixture
+
+    controls = tmp_path / "controls"
+    controls.mkdir()
+    descriptor = descriptor_fixture(controls)
+    runner = verifier_runner(tmp_path)
+    checker = tmp_path / "checker" / "checker.py"
+    checker.parent.mkdir()
+    checker.write_text("synthetic")
+    runner.contract.update(execution_profile="native_windows_code_v1", verifier_sandbox=descriptor,
+                           checker=str(checker))
+    runner._isolated_verifier_command = True
+    runner._sandbox_controls = {"path": "synthetic-real-measurement-path", "sha256": "a" * 64}
+    launches = []
+
+    def launch(argv, **kwargs):
+        launches.append((argv, kwargs))
+        return SimpleNamespace(pid=987, returncode=0, poll=lambda: 0)
+
+    monkeypatch.setattr(subprocess, "Popen", launch)
+    monkeypatch.setattr("ephy_worker.verifier_sandbox.readonly_acl", lambda *args: nullcontext({"synthetic": True}))
+    monkeypatch.setattr("ephy_worker.verifier_sandbox.writable_acl", lambda *args: nullcontext({"synthetic": True}))
+    monkeypatch.setattr("ephy_worker.verifier_sandbox.metadata_acl", lambda *args: nullcontext({"synthetic": True}))
+    result = runner.command([sys.executable, "-V"], runner.candidate, "isolated-command", 10)
+    assert len(launches) == 1
+    outer = launches[0][0]
+    assert outer[0] == descriptor["codex"]["path"] and outer[1] == "sandbox"
+    assert outer[outer.index("--") + 1:] == [str(Path(sys.executable).resolve()), "-V"]
+    assert result["argv"] == [str(Path(sys.executable).resolve()), "-V"]
+    assert result["verifier_sandbox"]["argv"] == outer
+    assert result["verifier_sandbox"]["identity"]["capability"] == descriptor["capability"]
 
 
 def bundle_fixture(tmp_path):
@@ -2833,3 +2907,79 @@ def test_planner_prompt_retains_the_plan_and_candidate_without_audit_artifacts(p
     assert read_json(case.runner.directory / "retained-candidate-snapshot.json") == snapshot(case.runner.candidate)
     assert not (case.runner.directory / "audit-result.json").exists()
     assert not (case.runner.directory / "audit-bundle").exists()
+
+
+@pytest.mark.parametrize("profile,stage,whole,expected", [
+    (None, 1800, 14400, 600),
+    ("native_windows_code_v1", 1800, 14400, 1800),
+    ("native_windows_code_v1", 1800, 300, 300),
+    ("native_windows_code_v1", 60, 300, 60),
+])
+def test_verifier_command_budget_matches_actual_check_argument_and_attestation(
+    tmp_path, monkeypatch, profile, stage, whole, expected,
+):
+    from ephy_worker import verifier_sandbox
+
+    runner = verifier_runner(tmp_path)
+    runner.contract.update(stage_seconds=stage, timeout_seconds=whole)
+    if profile is not None:
+        # These units measure budget routing only; actual native capability
+        # controls are independently retained by the operator/verifier.
+        runner.contract.update(execution_profile=profile, verifier_sandbox={"synthetic": True})
+        runner.runtime["backend"] = "external_existing_llama"
+        module = Path(verifier_sandbox.__file__).resolve()
+        runner.contract["runtime_hashes"][str(module)] = file_hash(module)
+        monkeypatch.setattr(verifier_sandbox, "identity", lambda _: {"synthetic": "budget-only"})
+        monkeypatch.setattr(verifier_sandbox, "run_controls", lambda *_, **__: {"synthetic": True})
+        (runner.candidate / "pyproject.toml").write_text("# Fixed budget control\n", encoding="utf-8")
+        runner.baseline_snapshot = snapshot(runner.candidate)
+    runner.job["verifier_identity"] = observed_verifier_identity(runner.runtime, runner.contract)
+    calls = []
+
+    def command(argv, cwd, label, seconds):
+        calls.append((label, seconds, runner._isolated_verifier_command))
+        temp = runner.directory / "temp"
+        return {
+            "argv": [str(Path(sys.executable).resolve()), *argv[1:]], "cwd": str(cwd), "exit_code": 0,
+            "effective_environment_sha256": digest(encode(command_environment(cwd, temp))),
+            "temp_root": str(temp), "temp_variables": {name: str(temp) for name in ("TEMP", "TMP", "TMPDIR")},
+        }
+
+    runner.command = command
+    runner.run_diff_check = lambda _: {"id": "diff", "passed": True}
+    assert runner.run_checks("budget-control")["passed"]
+    assert len(calls) == 5
+    assert all(seconds == expected and isolated is (profile is not None) for _, seconds, isolated in calls)
+    observations = verifier_observations(runner)
+    assert observations and all(record["command_timeout_seconds"] == expected for record in observations)
+    assert all(record["observed_identity"] == runner.job["verifier_identity"] for record in observations)
+
+
+def test_native_verifier_budget_changes_invocation_identity_without_changing_legacy_identity(tmp_path, monkeypatch):
+    from ephy_worker import verifier_sandbox
+
+    runner = verifier_runner(tmp_path)
+    before = observed_verifier_identity(runner.runtime, runner.contract)
+    runner.contract.update(stage_seconds=1800, timeout_seconds=14400)
+    assert observed_verifier_identity(runner.runtime, runner.contract) == before
+    module = Path(verifier_sandbox.__file__).resolve()
+    runner.contract["runtime_hashes"][str(module)] = file_hash(module)
+    runner.contract.update(execution_profile="native_windows_code_v1", verifier_sandbox={"synthetic": True})
+    monkeypatch.setattr(verifier_sandbox, "identity", lambda _: {"synthetic": "budget-only"})
+    native_before = observed_verifier_identity(runner.runtime, runner.contract)
+    runner.contract["stage_seconds"] = 1200
+    native_after = observed_verifier_identity(runner.runtime, runner.contract)
+    assert native_after["runtime_sha256"] == native_before["runtime_sha256"]
+    assert native_after["invocation_config_sha256"] != native_before["invocation_config_sha256"]
+
+
+@pytest.mark.parametrize("field", ["stage_seconds", "timeout_seconds"])
+@pytest.mark.parametrize("invalid", [True, 0, -1, "1800", None])
+def test_native_verifier_budget_requires_frozen_positive_integers(field, invalid):
+    from ephy_worker.formal_runtime import verifier_command_seconds
+
+    value = contract()
+    value.update(execution_profile="native_windows_code_v1", stage_seconds=1800, timeout_seconds=14400)
+    value[field] = invalid
+    with pytest.raises(GateFailure, match="Invalid positive integer: " + field):
+        verifier_command_seconds(value)

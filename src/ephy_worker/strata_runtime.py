@@ -261,6 +261,10 @@ def make_runner(job_file: Path, *, initial_job: dict | None = None) -> FormalRun
     backend = job["runtime"].get("backend", "owned_llama")
     if backend == "external_strata":
         return StrataRunner(job_file, initial_job=job)
+    if backend == "external_existing_llama":
+        from .existing_llama_runtime import ExistingLlamaRunner
+
+        return ExistingLlamaRunner(job_file, initial_job=job)
     if backend != "owned_llama":
         raise GateFailure("Unknown frozen model backend")
     return FormalRunner(job_file, initial_job=job)
