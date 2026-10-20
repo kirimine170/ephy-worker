@@ -21,6 +21,7 @@ from .formal_runtime import (
 from .owner_repair import strict_object
 
 PROTECTED = ("src/ephy_worker/owner_repair", "src/ephy_worker/formal_", "src/ephy_worker/verifier_sandbox",
+    "src/ephy_worker/check_completion",
     "src/ephy_worker/existing_llama_runtime", "src/ephy_worker/strata_runtime",
     "docs/system-development-governance", "tests/test_owner_repair", "tests/test_formal_", ".")
 
@@ -31,6 +32,21 @@ def allowed_name(name: str, profile) -> bool:
         and not any(part in {"", ".", ".."} or part.startswith(".") for part in name.split("/"))
         and name.startswith(profile.allowed_prefixes) and not name.startswith(PROTECTED)
         and path.suffix in {".py", ".ts", ".tsx", ".js", ".json", ".md", ".css", ".html"})
+
+
+def preserve_collection_scope(names, original_snapshot):
+    """New Python modules cannot introduce an unguarded collection/plugin entry．"""
+    for name in names:
+        if not isinstance(name, str):
+            raise GateFailure("new_collection_module_not_allowed")
+        normalized = name.replace("\\", "/").casefold()
+        parts = normalized.split("/")
+        test_path = (any(part in {"test", "tests", "plugins"} for part in parts)
+            or parts[-1] == "conftest.py" or parts[-1].startswith(("test_", "pytest_"))
+            or parts[-1].endswith("_test.py") or "plugin" in parts[-1])
+        if ("\\" in name or any(part in {"", ".", ".."} for part in name.split("/"))
+                or (test_path or normalized.endswith(".py")) and original_snapshot.get(name) is None):
+            raise GateFailure("new_collection_module_not_allowed")
 
 
 def expand_control_edits(changes: dict, sources: dict[str, str | None]) -> dict[str, str]:
@@ -573,6 +589,7 @@ class LocalDiscovery:
             raise GateFailure("registered_source_not_clean")
         base = self._git(profile.source, "rev-parse", "HEAD").decode().strip()
         original_snapshot = snapshot(profile.source)
+        preserve_collection_scope(names, original_snapshot)
         sources = {}
         for name in names:
             path = profile.source / name
@@ -592,6 +609,8 @@ class LocalDiscovery:
             "instruction": "Create behavior acceptance checker independent of proposed implementation. Checks must reject "
                 "unchanged baseline and wrong behavior, and pass a genuinely repaired known-good control. "
                 "Controls are temporary verifier specimens, not the formal implementation. Preserve every existing test "
+                "Acceptance checker must return normally or raise AssertionError; do not launch child processes, "
+                "nested pytest, native loading or SystemExit. Pytest runs as a separate trusted registered check. "
                 "module's original AST prefix exactly, including imports, decorators, fixtures and assertions. Only "
                 "append new uniquely named test/helper functions without decorators, defaults, parameter/return "
                 "annotations or type parameters. No imports anywhere in appended functions. Their closed body DSL "
@@ -683,6 +702,7 @@ class LocalDiscovery:
         return result.stdout
 
     def measure_controls(self, profile, directory, prepared, checker, template) -> list[dict]:
+        from .check_completion import prepare_completion, verify_completion
         from .verifier_sandbox import run_isolated
         descriptor = template["contract"]["verifier_sandbox"]
         python = template["runtime"]["python"]
@@ -712,9 +732,19 @@ class LocalDiscovery:
             temporary.mkdir(parents=True)
             environment = command_environment(root, temporary)
             environment["PYTHONPATH"] = str(root / "src") if profile.github_repository.endswith("/ephy-worker") else str(root)
-            result = run_isolated(descriptor, [python, "-I", "-X", "utf8", str(checker), str(root)],
+            requested = [python, "-I", "-X", "utf8", str(checker), str(root)]
+            helper = Path(__file__).with_name("check_completion.py").resolve()
+            completion = prepare_completion(requested, checker=checker, helper=helper,
+                request_dir=checker.parent / "completion-requests", output_dir=temporary,
+                label="control-" + name, cwd=root)
+            result = run_isolated(descriptor, completion["argv"],
                 candidate=root, checker=checker, temp=temporary, cwd=root,
                 environment=environment, timeout=300)
+            result["requested_argv"] = requested
+            try:
+                result["completion"] = verify_completion(completion, result["exit_code"])
+            except ValueError as exc:
+                raise GateFailure(str(exc)) from None
             # The sandbox adapter returns actual subprocess evidence, never a model verdict．
             actual = result["exit_code"]
             specimen = {path.relative_to(root).as_posix(): file_hash(path) for path in root.rglob("*") if path.is_file()}
@@ -737,6 +767,12 @@ guard=json.loads((base/'checker-guard.json').read_text(encoding='utf-8'))
 actual={str(p.relative_to(root)).replace('\\\\','/'):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file() and '.git' not in p.relative_to(root).parts and '__pycache__' not in p.relative_to(root).parts}
 changed={name for name in set(actual)|set(guard['snapshot']) if actual.get(name)!=(guard['snapshot'].get(name) or {}).get('sha256')}
 assert changed <= set(guard['allowed']), 'scope_escape'
+for name in guard['allowed']:
+    assert '\\\\' not in name and all(p not in ('','.','..') for p in name.split('/')), 'new_collection_module_not_allowed'
+    lowered=name.casefold()
+    parts=lowered.split('/')
+    collection=any(p in ('test','tests','plugins') for p in parts) or parts[-1]=='conftest.py' or parts[-1].startswith(('test_','pytest_')) or parts[-1].endswith('_test.py') or 'plugin' in parts[-1]
+    assert not (collection or lowered.endswith('.py')) or guard['snapshot'].get(name) is not None, 'new_collection_module_not_allowed'
 for name, original in guard['authority'].items():
     assert authority_fingerprint((root/name).read_text(encoding='utf-8')) == original, 'protected_discord_authority_changed'
 for name, original in guard['tests'].items():

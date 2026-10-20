@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sqlite3
 import stat
 import time
@@ -14,6 +15,22 @@ from pathlib import Path
 from .store import output_root
 
 OWNER_USER_ID = 425581535748423680
+
+
+def request_release_limits(text: str) -> tuple[str, ...]:
+    """Explicit request restrictions never inherit the standing full-cycle grant．"""
+    lowered = text.casefold()
+    limits = []
+    for action, words in (("merge", r"merge|merging|マージ"),
+                          ("deploy", r"deploy(?:ment)?|デプロイ|本番(?:には|へは|へ|に)?(?:反映|適用|更新)|反映"),
+                          ("push", r"push(?:ing)?|プッシュ"), ("commit", r"commit(?:ting)?|コミット"),
+                          ("restart", r"restart(?:ing)?|再起動")):
+        if (re.search(r"(?:no[-\s]+|(?:do\s+not|don't|must\s+not|never|without)\s+)(?:\w+\s+){0,2}(?:" + words + r")\b", lowered)
+                or re.search(r"(?:" + words + r")\s*(?:は|を|まで)?\s*(?:まだ|絶対に|決して|今回は|今は)?(?:しない|しなく|せず|するな|禁止|不要|しちゃだめ|行わない|行わず|実施しない)", lowered)):
+            limits.append(action)
+    if re.search(r"proposal[ -]only|only\s+(?:propose|investigate|review)|do\s+not\s+(?:implement|change)|(?:提案|調査|確認|説明|pr(?:作成)?|プルリク(?:エスト)?)(?:だけ|のみ|まで)|(?:コミット|commit|push|プッシュ)まで|実装(?:だけ|のみ)|本番.*(?:触らない|触らず)", lowered):
+        limits.append("proposal_only")
+    return tuple(limits)
 
 
 def strict_object(raw: str) -> dict:
@@ -50,6 +67,60 @@ class RepairStore:
         with self.db() as db:
             db.execute("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, guild TEXT, channel TEXT, message TEXT, author TEXT, text TEXT, previous TEXT, stage TEXT, data TEXT, created REAL, updated REAL, UNIQUE(guild,channel,message))")
             db.execute("CREATE TABLE IF NOT EXISTS outbox (job TEXT, ordinal INTEGER, text TEXT, state TEXT, message TEXT, PRIMARY KEY(job,ordinal))")
+            db.execute("CREATE TABLE IF NOT EXISTS intakes (id TEXT PRIMARY KEY,guild TEXT,channel TEXT,message TEXT,author TEXT,text TEXT,previous TEXT,route TEXT,receipt INTEGER,done INTEGER,consumer TEXT,created REAL,UNIQUE(guild,channel,message))")
+
+    def capture_intake(self, *, guild_id: int, channel_id: int, message_id: int, author_id: int,
+                       text: str, previous_answer: str | None = None) -> str:
+        if type(author_id) is not int or author_id != OWNER_USER_ID:
+            raise ValueError("repair_owner_required")
+        if (any(type(value) is not int or not 0 < value < 2**64 for value in (guild_id, channel_id, message_id))
+                or not isinstance(text, str) or not text.strip() or len(text) > 4000
+                or previous_answer is not None and (not isinstance(previous_answer, str) or len(previous_answer) > 8000)):
+            raise ValueError("repair_intake_invalid")
+        identifier = "repair-" + hashlib.sha256(f"{guild_id}:{channel_id}:{message_id}:{author_id}".encode()).hexdigest()[:32]
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            old = db.execute("SELECT * FROM intakes WHERE id=?", (identifier,)).fetchone()
+            if old:
+                if old["text"] != text or old["previous"] != previous_answer:
+                    raise RuntimeError("duplicate_repair_payload_changed")
+            else:
+                if db.execute("SELECT count(*) FROM intakes").fetchone()[0] >= 10000:
+                    raise RuntimeError("repair_queue_full")
+                db.execute("INSERT INTO intakes VALUES (?,?,?,?,?,?,?,NULL,0,0,NULL,?)", (identifier,
+                    str(guild_id), str(channel_id), str(message_id), str(author_id), text, previous_answer, time.time()))
+        return identifier
+
+    def pending_intakes(self, *, guild_id: int, channel_ids: tuple[int, ...]) -> list[dict]:
+        with self.db() as db:
+            rows = db.execute("SELECT * FROM intakes WHERE done=0 ORDER BY created").fetchall()
+        return [dict(row) for row in rows if row["guild"] == str(guild_id)
+            and int(row["channel"]) in channel_ids and row["author"] == str(OWNER_USER_ID)]
+
+    def claim_intake(self, identifier: str, consumer: str) -> dict | None:
+        import psutil
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM intakes WHERE id=? AND done=0", (identifier,)).fetchone()
+            if row is None:
+                return None
+            if row["consumer"]:
+                pid, created = row["consumer"].split(":")
+                try:
+                    if row["consumer"] != consumer and psutil.Process(int(pid)).create_time() == float(created):
+                        return None
+                except psutil.NoSuchProcess:
+                    pass  # A dead consumer cannot resume this durable intake．
+            db.execute("UPDATE intakes SET consumer=? WHERE id=?", (consumer, identifier))
+            return dict(row)
+
+    def update_intake(self, identifier: str, consumer: str, *, route: str | None = None,
+                      receipt: bool = False, done: bool = False, release: bool = False) -> None:
+        if route not in {None, "repair", "conversation"}:
+            raise ValueError("repair_intake_route_invalid")
+        with self.db() as db:
+            db.execute("UPDATE intakes SET route=COALESCE(?,route),receipt=MAX(receipt,?),done=MAX(done,?),consumer=CASE WHEN ? THEN NULL ELSE consumer END WHERE id=? AND consumer=?",
+                (route, int(receipt), int(done), int(release), identifier, consumer))
 
     @contextmanager
     def db(self):

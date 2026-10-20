@@ -540,6 +540,8 @@ class RuntimeDiscordBridge:
         self.outbox_inflight = 0
         self.repairs = None
         self.process_created = psutil.Process().create_time()
+        self.intake_consumer = f"{os.getpid()}:{self.process_created}"
+        self.intake_active = set()
         if settings.owner_repair_config is not None:
             from .owner_repair import RepairStore
             from .owner_repair_pipeline import load_config
@@ -606,42 +608,29 @@ class RuntimeDiscordBridge:
             return
         task, entered = None, False
         try:
-            previous = await asyncio.to_thread(self.ledger.previous, event)
+            from .owner_repair import OWNER_USER_ID
+            owner_route = self.repairs is not None and event.user_id == OWNER_USER_ID
+            previous = self.ledger.previous(event) if owner_route else await asyncio.to_thread(self.ledger.previous, event)
             if not event.mentioned and previous is None:
                 return
             if self.repairs is not None and self.drain_token() is not None:
                 self.activity()
                 return
+            question = re.sub(rf"<@!?{self.settings.application_id}>", "", event.content).strip()
+            intake = None
+            if owner_route:
+                # Local durable capture precedes the first receipt/model/network await．
+                intake = self.repairs.capture_intake(guild_id=event.guild_id, channel_id=event.channel_id,
+                    message_id=event.message_id, author_id=event.user_id, text=question, previous_answer=previous)
             if self.inflight >= 2:
                 await send("今は別の調査を進めています．少し待ってからお願いします．")
                 return
             self.inflight += 1
             entered = True
             self.activity()
-            question = re.sub(rf"<@!?{self.settings.application_id}>", "", event.content).strip()
-            from .owner_repair import OWNER_USER_ID
-            owner_route = self.repairs is not None and event.user_id == OWNER_USER_ID
             if owner_route:
-                if await asyncio.to_thread(self.ledger.seen, event.message_id):
-                    return
-                await send(RECEIPT)
-                task = asyncio.create_task(self.gateway.classify_repair(question, previous))
-                done, _ = await asyncio.wait({task}, timeout=self.progress_seconds)
-                if not done:
-                    await send(PROGRESS)
-                repair = await task
-                task = None
-                if repair:
-                    identifier = await asyncio.to_thread(self.repairs.enqueue, guild_id=event.guild_id,
-                        channel_id=event.channel_id, message_id=event.message_id, author_id=event.user_id,
-                        text=question, previous_answer=previous)
-                    # A durable claim may suppress replay only after the repair
-                    # exists；enqueue itself deduplicates concurrent deliveries．
-                    if not await asyncio.to_thread(self.ledger.claim, event.message_id):
-                        return
-                    await send("修正依頼として受け付けました．修正，テストと独立レビューを進め，"
-                        "条件を満たしたら本番への反映と再起動まで行います．受付番号：" + identifier)
-                    return
+                await self.process_intake(intake, send)
+                return
             try:
                 validate_public_text(question, max_chars=4000)
             except QueryPrivacyError:
@@ -674,6 +663,99 @@ class RuntimeDiscordBridge:
                 self.inflight -= 1
                 self.activity()
 
+    async def process_intake(self, identifier: str, send) -> None:
+        from .owner_repair import request_release_limits
+        if identifier in self.intake_active:
+            return
+        row = self.repairs.claim_intake(identifier, self.intake_consumer)
+        if row is None:
+            return
+        self.intake_active.add(identifier)
+        task = None
+        try:
+            if self.ledger.seen(int(row["message"])):
+                with self.repairs.db() as db:
+                    durable = db.execute("SELECT 1 FROM jobs WHERE id=?", (identifier,)).fetchone()
+                if durable:
+                    self.repairs.update_intake(identifier, self.intake_consumer, done=True)
+                    return
+            if not row["receipt"]:
+                await send(RECEIPT)
+                self.repairs.update_intake(identifier, self.intake_consumer, receipt=True)
+            route = row["route"]
+            if route is None:
+                task = asyncio.create_task(self.gateway.classify_repair(row["text"], row["previous"]))
+                done, _ = await asyncio.wait({task}, timeout=self.progress_seconds)
+                if not done:
+                    await send(PROGRESS)
+                route = "repair" if await task else "conversation"
+                task = None
+                if route == "conversation":
+                    self.repairs.update_intake(identifier, self.intake_consumer, route=route)
+            if route == "repair":
+                if request_release_limits(row["text"]):
+                    await send("この依頼には操作の制限があるため，全自動の修正・本番反映は開始していません．"
+                        "この自動経路では提案だけの実行には対応していません．")
+                    self.repairs.update_intake(identifier, self.intake_consumer, done=True)
+                    return
+                job = self.repairs.enqueue(guild_id=int(row["guild"]), channel_id=int(row["channel"]),
+                    message_id=int(row["message"]), author_id=int(row["author"]),
+                    text=row["text"], previous_answer=row["previous"])
+                claimed = self.ledger.claim(int(row["message"]))
+                self.repairs.update_intake(identifier, self.intake_consumer, done=True)
+                if claimed:
+                    await send("修正依頼として受け付けました．修正，テストと独立レビューを進め，"
+                        "条件を満たしたら本番への反映と再起動まで行います．受付番号：" + job)
+                return
+            try:
+                validate_public_text(row["text"], max_chars=4000)
+            except QueryPrivacyError:
+                raise BridgeError("question_not_public") from None
+            self.ledger.claim(int(row["message"]))
+            task = asyncio.create_task(self.gateway.answer(row["text"], row["previous"]))
+            done, _ = await asyncio.wait({task}, timeout=self.progress_seconds)
+            if not done:
+                await send(PROGRESS)
+            answer = await task
+            task = None
+            event = DiscordEvent(message_id=int(row["message"]), guild_id=int(row["guild"]),
+                channel_id=int(row["channel"]), user_id=int(row["author"]), content=row["text"])
+            for part in split_discord_text(answer):
+                answer_id = await send(part)
+                if type(answer_id) is int and answer_id > 0:
+                    self.ledger.remember(answer_id, event, part)
+            self.repairs.update_intake(identifier, self.intake_consumer, done=True)
+        except BridgeError as exc:
+            if exc.code != "repair_classification_failed":
+                self.repairs.update_intake(identifier, self.intake_consumer, done=True)
+            raise
+        finally:
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            self.repairs.update_intake(identifier, self.intake_consumer, release=True)
+            self.intake_active.discard(identifier)
+
+    async def recover_intakes(self, send) -> None:
+        for row in self.repairs.pending_intakes(guild_id=self.settings.guild_id,
+                channel_ids=self.settings.allowed_channel_ids):
+            if self.drain_token() is not None or self.inflight >= 2:
+                self.activity()
+                return
+            self.inflight += 1
+            self.activity()
+            try:
+                async def deliver(text, current=row):
+                    return await send(current, text)
+                await self.process_intake(row["id"], deliver)
+            except BridgeError as exc:
+                await send(row, _FAILURES.get(exc.code, "処理に失敗しました．結果を確認できていません．"))
+            except Exception as exc:  # noqa: BLE001 — durable pending intake is retried after transport failure．
+                logging.getLogger(__name__).error("repair_intake_recovery_failed:%s", type(exc).__name__)
+            finally:
+                self.inflight -= 1
+                self.activity()
+
 
 async def run_discord(settings: DiscordRuntimeSettings) -> int:
     try:
@@ -690,7 +772,20 @@ async def run_discord(settings: DiscordRuntimeSettings) -> int:
     intents.message_content = settings.read_message_content
     client = discord.Client(intents=intents, allowed_mentions=discord.AllowedMentions.none(),
         application_id=settings.application_id, max_messages=None)
-    active, identity_ok, outbox_task, drain_task = set(), False, None, None
+    active, identity_ok, outbox_task, drain_task, intake_task = set(), False, None, None, None
+
+    async def recover_pending():
+        while not client.is_closed():
+            async def send(row, text):
+                channel = client.get_channel(int(row["channel"]))
+                if channel is None:
+                    channel = await client.fetch_channel(int(row["channel"]))
+                if channel.guild.id != settings.guild_id:
+                    raise BridgeError("repair_delivery_scope_mismatch")
+                result = await channel.send(text, allowed_mentions=discord.AllowedMentions.none(), suppress_embeds=True)
+                return result.id
+            await bridge.recover_intakes(send)
+            await asyncio.sleep(2)
 
     async def drain_outbox():
         while not client.is_closed():
@@ -708,7 +803,7 @@ async def run_discord(settings: DiscordRuntimeSettings) -> int:
 
     @client.event
     async def on_ready():
-        nonlocal identity_ok, outbox_task, drain_task
+        nonlocal identity_ok, outbox_task, drain_task, intake_task
         if (client.application_id != settings.application_id or client.user is None
                 or client.user.id != settings.application_id):
             await client.close()
@@ -719,6 +814,8 @@ async def run_discord(settings: DiscordRuntimeSettings) -> int:
                 outbox_task = asyncio.create_task(drain_outbox())
             if bridge.repairs is not None and (drain_task is None or drain_task.done()):
                 drain_task = asyncio.create_task(bridge.watch_drain())
+            if bridge.repairs is not None and (intake_task is None or intake_task.done()):
+                intake_task = asyncio.create_task(recover_pending())
 
     @client.event
     async def on_message(message):
@@ -749,6 +846,9 @@ async def run_discord(settings: DiscordRuntimeSettings) -> int:
     except discord.LoginFailure:
         raise BridgeError("discord_auth_failed") from None
     finally:
+        if intake_task is not None:
+            intake_task.cancel()
+            await asyncio.gather(intake_task, return_exceptions=True)
         if drain_task is not None:
             drain_task.cancel()
             await asyncio.gather(drain_task, return_exceptions=True)

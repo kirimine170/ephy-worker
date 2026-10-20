@@ -2983,3 +2983,131 @@ def test_native_verifier_budget_requires_frozen_positive_integers(field, invalid
     value[field] = invalid
     with pytest.raises(GateFailure, match="Invalid positive integer: " + field):
         verifier_command_seconds(value)
+
+
+def _review_v13_completion_command(tmp_path, code, *, pytest_mode=False, trusted=False):
+    from ephy_worker import check_completion
+    candidate = tmp_path / "candidate"
+    candidate.mkdir(parents=True, exist_ok=True)
+    checker = tmp_path / "checker" / ("registered_checks.py" if trusted else "checker.py")
+    checker.parent.mkdir()
+    checker.write_text(code, encoding="utf-8")
+    if pytest_mode:
+        test = candidate / "test_subject.py"
+        test.write_text(code, encoding="utf-8")
+        config = candidate / "pytest.ini"
+        config.write_text("[pytest]\n", encoding="utf-8")
+        argv = [sys.executable, "-I", "-X", "utf8", "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider",
+            "-c", str(config), "--basetemp", str(tmp_path / "pytest-temp"), str(test)]
+    elif trusted:
+        (candidate / "tests").mkdir()
+        (candidate / "tests/test_subject.py").write_text("def test_answer():\n    assert 1 + 1 == 2\n")
+        (candidate / "pytest.ini").write_text("[pytest]\n")
+        argv = [sys.executable, "-I", "-X", "utf8", str(checker), "regression", str(candidate), str(checker)]
+    else:
+        argv = [sys.executable, "-I", "-X", "utf8", "-B", str(checker)]
+    plan = check_completion.prepare_completion(argv, checker=tmp_path / "other-checker.py" if trusted else checker,
+        helper=Path(check_completion.__file__).resolve(), request_dir=checker.parent / "requests",
+        output_dir=tmp_path / "records", label="actual-check", cwd=candidate,
+        trusted_scripts={str(checker.resolve()): file_hash(checker)} if trusted else {})
+    result = subprocess.run(plan["argv"], cwd=candidate, env=command_environment(candidate, tmp_path / "temp"),
+        capture_output=True, check=False, timeout=30)
+    return plan, result
+
+
+@pytest.mark.parametrize("code", ["import os\nos._exit(0)\n", "raise SystemExit(0)\n"])
+def test_review_v13_actual_checker_early_exit_zero_lacks_completion(tmp_path, code):
+    from ephy_worker.check_completion import verify_completion
+    plan, result = _review_v13_completion_command(tmp_path, code)
+    assert result.returncode == 0
+    with pytest.raises(ValueError, match="completion_record_missing"):
+        verify_completion(plan, result.returncode)
+
+
+@pytest.mark.parametrize("early_exit", [False, True])
+def test_review_v13_actual_pytest_import_exit_is_not_normal_completion(tmp_path, early_exit):
+    from ephy_worker.check_completion import verify_completion
+    code = "import os\nos._exit(0)\n" if early_exit else "def test_answer():\n    assert 1 + 1 == 2\n"
+    plan, result = _review_v13_completion_command(tmp_path, code, pytest_mode=True)
+    assert result.returncode == 0, result.stderr
+    if early_exit:
+        with pytest.raises(ValueError, match="completion_record_missing"):
+            verify_completion(plan, result.returncode)
+    else:
+        record = verify_completion(plan, result.returncode)
+        assert record["record"]["outcome"] == "returned" and record["record"]["reported_pid"] > 0
+
+
+@pytest.mark.parametrize("field", ["nonce", "label", "argv_sha256", "request_sha256", "cwd", "exit_code"])
+def test_review_v13_actual_completion_tampering_and_replay_reject(tmp_path, field):
+    from ephy_worker.check_completion import verify_completion
+    plan, result = _review_v13_completion_command(tmp_path / "first", "assert 1 + 1 == 2\n")
+    assert verify_completion(plan, result.returncode)["record"]["exit_code"] == 0
+    path = Path(plan["record"])
+    original = path.read_bytes()
+    record = json.loads(original)
+    record[field] = 1 if field == "exit_code" else "different-invocation"
+    path.write_text(json.dumps(record), encoding="utf-8")
+    with pytest.raises(ValueError, match="completion_record_invalid"):
+        verify_completion(plan, result.returncode)
+    other, other_result = _review_v13_completion_command(tmp_path / "second", "assert 1 + 1 == 2\n")
+    Path(other["record"]).write_bytes(original)
+    with pytest.raises(ValueError, match="completion_record_invalid"):
+        verify_completion(other, other_result.returncode)
+    Path(other["record"]).unlink()
+    with pytest.raises(ValueError, match="completion_record_missing"):
+        verify_completion(other, other_result.returncode)
+
+
+def test_review_v13_opaque_nested_pytest_checker_is_rejected(tmp_path):
+    from ephy_worker.check_completion import verify_completion
+    plan, result = _review_v13_completion_command(tmp_path,
+        "import subprocess,sys\nsubprocess.run([sys.executable,'-m','pytest','--version'],check=True)\n")
+    assert result.returncode == 1 and b"unsupported_nested_checker_command" in result.stderr
+    assert verify_completion(plan, result.returncode)["record"]["outcome"] == "exception"
+
+
+def test_review_v13_actual_candidate_import_exit_zero_has_no_completion(tmp_path):
+    from ephy_worker.check_completion import verify_completion
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    (candidate / "feature.py").write_text("import os\nos._exit(0)\n")
+    plan, result = _review_v13_completion_command(tmp_path,
+        "import sys\nsys.path.insert(0," + repr(str(candidate)) + ")\nimport feature\n")
+    assert result.returncode == 0
+    with pytest.raises(ValueError, match="completion_record_missing"):
+        verify_completion(plan, result.returncode)
+
+
+def test_review_v13_registered_regression_shape_returns_after_pytest_main(tmp_path):
+    from ephy_worker.check_completion import verify_completion
+    code = ("import sys,pytest\nfrom pathlib import Path\n"
+        "def main():\n    assert sys.argv[1]=='regression'\n"
+        "    return int(pytest.main(['-q','-p','no:cacheprovider','-c',str(Path(sys.argv[2])/'pytest.ini'),"
+        "'--basetemp',str(Path(sys.argv[2])/'temp'),str(Path(sys.argv[2])/'tests')]))\n"
+        "if __name__=='__main__':\n    raise SystemExit(main())\n")
+    plan, result = _review_v13_completion_command(tmp_path, code, trusted=True)
+    assert result.returncode == 0, result.stderr
+    record = verify_completion(plan, result.returncode)["record"]
+    assert record["outcome"] == "returned"
+    assert json.loads(Path(plan["request"]).read_bytes())["mode"] == "registered"
+
+
+def test_review_v13_outside_formal_runner_rejects_bare_exit_zero(tmp_path):
+    from ephy_worker import check_completion
+    runner = verifier_runner(tmp_path)
+    helper = Path(check_completion.__file__).resolve()
+    runner.contract.update(execution_profile="native_windows_code_v1")
+    runner.contract["runtime_hashes"][str(helper)] = file_hash(helper)
+    checker = tmp_path / "checker" / "checker.py"
+    checker.parent.mkdir()
+    checker.write_text("assert 1 + 1 == 2\n")
+    runner.contract["checker"] = str(checker)
+    argv = [sys.executable, "-I", "-X", "utf8", str(checker)]
+    good = runner.command(argv, runner.candidate, "completion-good", 30)
+    assert good["exit_code"] == 0 and good["completion"]["record"]["outcome"] == "returned"
+    assert good["argv"] == [str(Path(sys.executable).resolve()), *argv[1:]]
+    assert good["completion_transport_argv"] != good["argv"]
+    checker.write_text("import os\nos._exit(0)\n")
+    with pytest.raises(GateFailure, match="completion_record_missing"):
+        runner.command(argv, runner.candidate, "completion-missing", 30)

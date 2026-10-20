@@ -385,7 +385,9 @@ def test_runtime_controls_use_runtime_python_and_candidate_root(tmp_path, monkey
     calls = []
     def run_isolated(_descriptor, argv, **kwargs):
         calls.append((argv, kwargs))
-        return {"exit_code": 0 if kwargs["candidate"].name == "known_good" else 1}
+        exit_code = 0 if kwargs["candidate"].name == "known_good" else 1
+        _review_v13_fixture_completion(argv, exit_code)
+        return {"exit_code": exit_code}
     monkeypatch.setitem(sys.modules, "ephy_worker.verifier_sandbox", SimpleNamespace(run_isolated=run_isolated))
     directory = tmp_path / "execution" / "request"
     directory.mkdir(parents=True)
@@ -425,6 +427,7 @@ async def test_drain_watch_acknowledges_only_current_nonce(tmp_path):
 @pytest.mark.asyncio
 async def test_request_waiting_for_ledger_is_not_admitted_after_drain_marker(tmp_path, monkeypatch):
     bridge, gateway, event = bridge_fixture(tmp_path)
+    event = replace(event, user_id=533693210879459338)
     started, finish = threading.Event(), threading.Event()
     def previous(_):
         started.set()
@@ -611,11 +614,13 @@ def test_all_discovery_control_argv_explicitly_select_utf8_with_real_japanese_ou
         encoding="utf-8")
     calls = []
     def run_isolated(_descriptor, argv, **kwargs):
-        calls.append((argv, kwargs))
-        result = subprocess.run(argv, cwd=kwargs["cwd"], env=kwargs["environment"],
+        requested = json.loads(Path(argv[argv.index("--request") + 1]).read_text())["argv"]
+        calls.append((requested, kwargs))
+        result = subprocess.run(requested, cwd=kwargs["cwd"], env=kwargs["environment"],
             capture_output=True, check=False, timeout=30)
         assert result.stdout.decode("utf-8").strip() == "日本語の検証結果"
         assert not result.stderr
+        _review_v13_fixture_completion(argv, result.returncode)
         return {"exit_code": result.returncode, "stdout": result.stdout.decode("utf-8"), "stderr": ""}
     monkeypatch.setitem(sys.modules, "ephy_worker.verifier_sandbox", SimpleNamespace(run_isolated=run_isolated))
     discovery = LocalDiscovery(SimpleNamespace(state_dir=tmp_path / "state"))
@@ -754,6 +759,7 @@ async def test_review_revision_owner_conversation_and_classifier_failure_remain_
     await bridge.handle(event, send)
     assert not bridge.ledger.seen(event.message_id) and bridge.repairs.next() is None
     assert gateway.answers == [] and "公開の質問" in sent[-1]
+    event = replace(event, message_id=event.message_id + 1)
     public = replace(event, content="<@10> 先ほどの回答の数字はどうですか")
     await bridge.handle(public, send)
     assert bridge.ledger.seen(event.message_id) and bridge.repairs.next() is None
@@ -1022,3 +1028,167 @@ def test_review_v11_actual_prepare_emits_identical_body_guard_and_explicit_featu
     assert len(observed) == 3
     assert "No imports anywhere" in prompts[1]
     assert json.loads(prompts[1])["approved_subject_calls_by_test_file"] == {names[1]: ["answer"]}
+
+
+def _review_v13_fixture_completion(argv, exit_code):
+    """The existing fake isolation transport supplies the new child protocol．"""
+    from ephy_worker.check_completion import _bytes, _hash
+    request_path = Path(argv[argv.index("--request") + 1])
+    request = json.loads(request_path.read_bytes())
+    record = {"schema": "ephy.check-completion-record.v1", "nonce": request["nonce"],
+        "label": request["label"], "request_sha256": _hash(request_path.read_bytes()),
+        "argv_sha256": _hash(_bytes(request["argv"])), "cwd": request["cwd"],
+        "exit_code": exit_code, "reported_pid": os.getpid(), "outcome": "returned"}
+    Path(request["record"]).write_bytes(_bytes(record))
+
+
+@pytest.mark.parametrize("phase", ["before_receipt", "during_classification"])
+@pytest.mark.asyncio
+async def test_review_v13_real_process_crash_recovers_pending_without_event_replay(tmp_path, phase):
+    from ephy_worker.formal_runtime import command_environment
+    state = tmp_path / "repair"
+    payload = directive()
+    code = ("import os,psutil\nfrom pathlib import Path\nfrom ephy_worker.owner_repair import RepairStore\n"
+        + "store=RepairStore(Path(" + repr(str(state)) + "))\n"
+        + "identifier=store.capture_intake(**" + repr(payload) + ")\n"
+        + "consumer=str(os.getpid())+':'+str(psutil.Process().create_time())\n"
+        + "store.claim_intake(identifier,consumer)\n"
+        + ("store.update_intake(identifier,consumer,receipt=True)\n" if phase == "during_classification" else "")
+        + "os._exit(0)\n")
+    environment = command_environment(tmp_path)
+    environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+    child = await asyncio.to_thread(subprocess.run, [sys.executable, "-X", "utf8", "-B", "-c", code],
+        env=environment, cwd=tmp_path, capture_output=True, check=False, timeout=30)
+    assert child.returncode == 0, child.stderr
+    bridge, gateway, _ = bridge_fixture(tmp_path)
+    sent = []
+    async def send(row, text):
+        assert row["author"] == str(OWNER_USER_ID)
+        sent.append(text)
+        return len(sent) + 9000
+    await bridge.recover_intakes(send)
+    await bridge.recover_intakes(send)
+    assert gateway.classifications == [(payload["text"], None)] and gateway.answers == []
+    with bridge.repairs.db() as db:
+        assert db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 1
+        assert db.execute("SELECT done FROM intakes").fetchone()[0] == 1
+    assert sum("修正依頼として" in text for text in sent) == 1
+    assert bridge.ledger.seen(payload["message_id"])
+
+
+@pytest.mark.asyncio
+async def test_review_v13_capture_is_durable_at_first_receipt_and_concurrent_recovery_dedups(tmp_path):
+    bridge, gateway, event = bridge_fixture(tmp_path)
+    started, finish = asyncio.Event(), asyncio.Event()
+    async def classify(text, previous):
+        gateway.classifications.append((text, previous))
+        started.set()
+        await finish.wait()
+        return True
+    gateway.classify_repair = classify
+    sent = []
+    async def send(text):
+        with bridge.repairs.db() as db:
+            assert db.execute("SELECT count(*) FROM intakes").fetchone()[0] == 1
+        sent.append(text)
+        return 9000
+    first = asyncio.create_task(bridge.handle(event, send))
+    await asyncio.wait_for(started.wait(), 5)
+    await bridge.handle(event, send)
+    async def recovered(_row, text):
+        return await send(text)
+    await bridge.recover_intakes(recovered)
+    finish.set()
+    await first
+    assert len(gateway.classifications) == 1 and sum("修正依頼として" in text for text in sent) == 1
+    assert bridge.repairs.next() is not None
+
+
+@pytest.mark.parametrize("text", ["修正して，マージしないで", "修正して，本番には反映しないで", "修正して，反映は不要",
+    "修正して，再起動はしないで", "修正して，コミットせずに", "fix it; no-merge", "fix it; do not deploy",
+    "fix it; don't push", "fix it; no commit", "fix it; no restart", "proposal-only repair"])
+@pytest.mark.asyncio
+async def test_review_v13_request_limits_stop_automatic_full_cycle_before_enqueue(tmp_path, text):
+    bridge, gateway, event = bridge_fixture(tmp_path)
+    sent = []
+    async def send(value):
+        sent.append(value)
+    await bridge.handle(replace(event, content="<@10> " + text), send)
+    assert len(gateway.classifications) == 1 and bridge.repairs.next() is None and gateway.answers == []
+    assert "操作の制限" in sent[-1] and "開始していません" in sent[-1]
+
+
+@pytest.mark.parametrize("name", ["tests/conftest.py", "tests/test_new.py", "src/ephy_worker/pytest_hidden.py",
+    "src/ephy_worker/ordinary_alias.py", "tests\\test_hidden.py", "tests/../test_hidden.py", "Tests/test_hidden.py"])
+def test_review_v13_collection_scope_rejects_new_or_alternate_paths(tmp_path, name):
+    from ephy_worker.formal_artifacts import GateFailure
+    from ephy_worker.owner_repair_discovery import _CHECKER, preserve_collection_scope
+    with pytest.raises(GateFailure, match="new_collection_module_not_allowed"):
+        preserve_collection_scope([name], {})
+    directory, candidate = tmp_path / "checker", tmp_path / "candidate"
+    directory.mkdir()
+    candidate.mkdir()
+    checker = directory / "checker.py"
+    checker.write_text(_CHECKER, encoding="utf-8")
+    (directory / "checker-guard.json").write_text(json.dumps({"allowed": [name], "snapshot": {},
+        "authority": {}, "tests": {}}), encoding="utf-8")
+    marker = tmp_path / "unexpected-acceptance"
+    (directory / "acceptance.py").write_text("from pathlib import Path\nPath(" + repr(str(marker)) + ").touch()\n")
+    result = subprocess.run([sys.executable, "-I", "-X", "utf8", "-B", str(checker), str(candidate)],
+        capture_output=True, check=False, timeout=30)
+    assert result.returncode != 0 and b"new_collection_module_not_allowed" in result.stderr
+    assert not marker.exists()
+
+
+def test_review_v13_existing_test_scope_remains_appendable():
+    from ephy_worker.owner_repair_discovery import preserve_collection_scope
+    preserve_collection_scope(["tests/test_existing.py", "src/ephy_worker/feature.py"],
+        {"tests/test_existing.py": {"sha256": "a" * 64}, "src/ephy_worker/feature.py": {"sha256": "b" * 64}})
+
+
+def test_review_v13_actual_prepare_emits_new_collection_guard(tmp_path, monkeypatch):
+    import hashlib
+    import shutil
+
+    from ephy_worker.formal_artifacts import GateFailure, file_hash, write_json
+    source = tmp_path / "source"
+    names = ["src/ephy_worker/feature.py", "tests/test_feature.py"]
+    originals = {names[0]: "def answer(value):\n    return value\n",
+        names[1]: "def test_original():\n    assert True\n"}
+    for name, text in originals.items():
+        path = source / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    observed_snapshot = {name: {"sha256": hashlib.sha256(text.encode()).hexdigest()} for name, text in originals.items()}
+    monkeypatch.setattr("ephy_worker.owner_repair_discovery.snapshot", lambda _: observed_snapshot)
+    template = tmp_path / "template.json"
+    write_json(template, {"runtime": {}, "contract": {}})
+    profile = SimpleNamespace(source=source, formal_template=template, formal_template_sha256=file_hash(template),
+        allowed_prefixes=("src/", "tests/"), origin="https://github.com/kirimine170/ephy-worker.git")
+    discovery = LocalDiscovery(SimpleNamespace(repositories={"ephy-worker": profile}))
+    responses = iter([{"repository": "ephy-worker", "allowed_files": names, "semantic_scope": "Correct answer"},
+        {"checker_python": "assert True\n", "known_good": {names[0]: "def answer(value):\n    return value + 1\n"},
+            "wrong_answer": {names[0]: "def answer(value):\n    return value - 1\n"}}])
+    monkeypatch.setattr(discovery, "completion", lambda *_: next(responses))
+    monkeypatch.setattr(discovery, "_git", lambda _root, *args: ("\n".join(names) if args[0] == "ls-files"
+        else profile.origin if args[0] == "remote" else "" if args[0] == "status" else "d" * 40).encode())
+    observed = []
+    def controls(_profile, directory, _prepared, checker, _template):
+        for ordinal, name in enumerate(("tests/conftest.py", "src/ephy_worker/test_alias.py")):
+            candidate = tmp_path / ("specimen-" + str(ordinal))
+            shutil.copytree(source, candidate)
+            (candidate / name).write_text("import os\nos._exit(0)\n")
+            guard_path = directory / "checker-guard.json"
+            guard = json.loads(guard_path.read_text())
+            guard["allowed"] = [*names, name]
+            guard["roles"] = {name: "ordinary_source"}
+            guard_path.write_text(json.dumps(guard), encoding="utf-8")
+            result = subprocess.run([sys.executable, "-I", "-X", "utf8", "-B", str(checker), str(candidate)],
+                capture_output=True, check=False, timeout=30)
+            assert result.returncode != 0 and b"new_collection_module_not_allowed" in result.stderr
+            observed.append(name)
+        raise GateFailure("fixture_emitted_collection_guard_checked")
+    monkeypatch.setattr(discovery, "measure_controls", controls)
+    with pytest.raises(GateFailure, match="fixture_emitted_collection_guard_checked"):
+        discovery.prepare({"text": "synthetic repair", "previous": None}, tmp_path / "discovery")
+    assert observed == ["tests/conftest.py", "src/ephy_worker/test_alias.py"]

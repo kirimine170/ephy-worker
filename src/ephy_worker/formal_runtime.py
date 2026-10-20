@@ -162,6 +162,10 @@ def runtime_artifact_paths(runtime: dict) -> list[Path]:
     """Classify the one coordination field before constructing content pins."""
     paths = [Path(value) for key, value in runtime.items()
              if key != "resource_lock" and isinstance(value, str) and Path(value).is_file()]
+    if isinstance(runtime.get("governance_root"), str):
+        completion = Path(runtime["governance_root"]) / "src/ephy_worker/check_completion.py"
+        if completion.is_file():
+            paths.append(completion.resolve())
     validate_resource_lock_pins(runtime.get("resource_lock"), paths)
     return paths
 
@@ -255,7 +259,7 @@ def validate_contract(contract: dict) -> None:
         if executable_profile is not None:
             if (
                 not name.startswith(("src/", "apps/", "packages/", "tests/", "docs/"))
-                or name.startswith(("src/ephy_worker/formal_", "src/ephy_worker/owner_repair"))
+                or name.startswith(("src/ephy_worker/formal_", "src/ephy_worker/owner_repair", "src/ephy_worker/check_completion"))
                 or name in {
                     "src/ephy_worker/verifier_sandbox.py", "src/ephy_worker/existing_llama_runtime.py",
                     "src/ephy_worker/strata_runtime.py", "docs/system-development-governance.md",
@@ -939,6 +943,21 @@ class FormalRunner:
         executable = executable_identity(argv[0])
         argv = [executable["path"], *argv[1:]]
         launched_argv = argv
+        completion = None
+        if (self.contract.get("execution_profile") is not None
+                and executable["path"] == str(Path(self.runtime["python"]).resolve())):
+            from .check_completion import prepare_completion
+
+            helper = Path(__file__).with_name("check_completion.py").resolve()
+            trusted = {str(Path(path).resolve()): pin for path, pin in self.contract["runtime_hashes"].items()
+                if Path(path).name in {"registered_checks.py", "registered_checks_v3.py"}}
+            completion = prepare_completion(argv, checker=self.contract["checker"], helper=helper,
+                request_dir=Path(self.contract["checker"]).parent / "completion-requests", output_dir=temp,
+                label=label, cwd=cwd, trusted_scripts=trusted)
+            if completion is not None:
+                if self.contract["runtime_hashes"].get(str(helper)) != file_hash(helper):
+                    raise GateFailure("Completion helper is not frozen")
+                launched_argv = completion["argv"]
         sandbox = None
         acl_context = nullcontext()
         writable_context = nullcontext()
@@ -957,7 +976,7 @@ class FormalRunner:
             profile = profile_override(
                 descriptor, candidate=self.candidate, checker=Path(self.contract["checker"]), temporary=temp,
             )
-            launched_argv = sandbox_argv(descriptor, cwd, profile, argv)
+            launched_argv = sandbox_argv(descriptor, cwd, profile, launched_argv)
             sandbox = {
                 "identity": sandbox_identity(descriptor), "profile": profile,
                 "profile_sha256": digest(profile.encode()), "argv": launched_argv,
@@ -1022,6 +1041,14 @@ class FormalRunner:
             sandbox["writable_temp_acl"] = writable_record
             sandbox["parent_metadata_acl"] = metadata_record
             record["verifier_sandbox"] = sandbox
+        if completion is not None:
+            from .check_completion import verify_completion
+
+            record["completion_transport_argv"] = completion["argv"]
+            try:
+                record["completion"] = verify_completion(completion, process.returncode)
+            except ValueError as exc:
+                raise GateFailure(str(exc)) from None
         self.transcripts.append(
             {
                 **record,
@@ -1370,6 +1397,8 @@ class FormalRunner:
             str(Path(__file__).with_name(name))
             for name in ("__init__.py", "formal_runtime.py", "formal_artifacts.py", "formal_campaign.py", "strata_runtime.py")
         )
+        if self.contract.get("execution_profile") is not None:
+            required_runtime.add(str(Path(__file__).with_name("check_completion.py").resolve()))
         required_runtime.add(str(Path(self.runtime["stage_guard"]).with_name("formal-stage-stop.ts").resolve()))
         context_pins = injected_context_pins(self.runtime, self.job["controls"])
         context_pins[self.runtime["policy"]] = self.job["controls"]["system_development_policy"]

@@ -702,6 +702,21 @@ def test_review_v12_pr_fixture_fills_only_missing_identity_without_mutating_orig
     release._pr_identity(result, "kirimine170/ephy-worker", 9, HEAD)
 
 
+@pytest.mark.parametrize("text", ["修正して，マージしないで", "本番には反映しないで修正して", "コミットはしないで修正して",
+    "再起動はしないで", "fix without push", "fix it; do not deploy", "proposal-only"])
+def test_review_v13_canonical_directive_limits_precede_all_release_side_effects(tmp_path, monkeypatch, text):
+    store = RepairStore(tmp_path / "state")
+    identifier = store.enqueue(guild_id=11, channel_id=20, message_id=100, author_id=OWNER_USER_ID, text=text)
+    release = GitHubRelease(SimpleNamespace(guild_id=11, channel_ids=(20,), state_dir=store.root))
+    calls = []
+    monkeypatch.setattr(release, "api", lambda *_: calls.append("api"))
+    monkeypatch.setattr(release, "git", lambda *_: calls.append("git"))
+    monkeypatch.setattr(release, "_proposal", lambda *_: calls.append("proposal"))
+    with pytest.raises(GateFailure, match="request_release_restricted"):
+        release.advance(store, store.get(identifier))
+    assert calls == [] and store.get(identifier)["text"] == text
+
+
 @pytest.mark.parametrize("method,path,response", [
     ("POST", "/repos/kirimine170/ephy-worker/pulls/9", {"number": None}),
     ("PUT", "/repos/kirimine170/ephy-worker/pulls/9/merge", {"merged": False}),

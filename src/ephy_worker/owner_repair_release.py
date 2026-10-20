@@ -13,7 +13,7 @@ import httpx
 
 from .formal_artifacts import GateFailure, digest, encode, file_hash, read_json, safe_path, write_json
 from .formal_runtime import command_environment, snapshot
-from .owner_repair import OWNER_USER_ID, strict_object
+from .owner_repair import OWNER_USER_ID, request_release_limits, strict_object
 from .search import QueryPrivacyError, validate_public_text
 
 SHA = re.compile(r"[0-9a-f]{40}\Z")
@@ -283,6 +283,8 @@ class GitHubRelease:
                 or previous is not None and (not isinstance(previous, str) or len(previous) > 8000)
                 or any(job.get(name) != current.get(name) for name in ("text", "previous"))):
             raise GateFailure("release_event_payload_invalid")
+        if request_release_limits(text):
+            raise GateFailure("request_release_restricted")
         alias = current["data"].get("repository")
         if alias not in {"ephy-worker", "ephy-runtime"} or alias not in self.config.repositories:
             raise GateFailure("release_repository_not_registered")
