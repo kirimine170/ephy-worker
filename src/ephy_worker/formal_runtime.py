@@ -162,7 +162,7 @@ def runtime_artifact_paths(runtime: dict) -> list[Path]:
     """Classify the one coordination field before constructing content pins."""
     paths = [Path(value) for key, value in runtime.items()
              if key != "resource_lock" and isinstance(value, str) and Path(value).is_file()]
-    if isinstance(runtime.get("governance_root"), str):
+    if all(isinstance(runtime.get(key), str) for key in ("python", "managed_dir", "governance_root")):
         completion = Path(runtime["governance_root"]) / "src/ephy_worker/check_completion.py"
         if completion.is_file():
             paths.append(completion.resolve())

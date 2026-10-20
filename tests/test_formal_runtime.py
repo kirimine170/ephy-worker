@@ -3111,3 +3111,25 @@ def test_review_v13_outside_formal_runner_rejects_bare_exit_zero(tmp_path):
     checker.write_text("import os\nos._exit(0)\n")
     with pytest.raises(GateFailure, match="completion_record_missing"):
         runner.command(argv, runner.candidate, "completion-missing", 30)
+
+
+def test_review_v14_completion_helper_pin_requires_managed_runtime(tmp_path):
+    from ephy_worker.formal_runtime import runtime_artifact_paths
+
+    artifact = tmp_path / "provider.py"
+    artifact.write_bytes(b"# frozen provider\n")
+    lock = tmp_path / "resource.lock"
+    lock.write_bytes(b"0")
+    minimal = {"governance_root": str(REPOSITORY), "resource_lock": str(lock), "provider": str(artifact)}
+    assert runtime_artifact_paths(minimal) == [artifact]
+    assert runtime_artifact_paths({**minimal, "python": sys.executable}) == [artifact, Path(sys.executable)]
+    assert runtime_artifact_paths({**minimal, "managed_dir": str(tmp_path / "managed")}) == [artifact]
+
+    managed = {**minimal, "backend": "external_existing_llama", "provider_id": "dual-local",
+        "review_mode": "formal", "python": sys.executable, "managed_dir": str(tmp_path / "managed")}
+    helper = (REPOSITORY / "src/ephy_worker/check_completion.py").resolve()
+    paths = runtime_artifact_paths(managed)
+    pins = {str(path.resolve()): file_hash(path) for path in paths}
+    assert paths == [artifact, Path(sys.executable), helper]
+    assert pins[str(helper)] == file_hash(helper)
+    assert str(lock.resolve()) not in pins
