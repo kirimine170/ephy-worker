@@ -39,3 +39,78 @@ SQLiteへmessage IDをHTTPより前に確保し，並行配信や再起動後の
 同時調査は最大2件です．取消時はローカルtaskとHTTP接続を解放し，Runtimeへ取消をbest effortで送ります．検証済みの`allow` planまたは明示設定による承認を検証済みの`confirm` planでpending回数の上限に達した場合や，chatの通信・protocol・回答検査が失敗した場合も，同じplanの取消を1回試みてから元の失敗を返します．取消requestが失敗しても元の失敗理由を置き換えず，新しいplanやJobを作り直しません．正常完了や未承認・不正なplanには取消を送りません．遠隔Workerの停止完了をtransportだけで保証するものではありません．失敗は固定した短い説明で返し，例外本文やHTTP response本文をlogへ出しません．全てのDiscord返信で`allowed_mentions=none`とembed抑制を指定し，UTF-16で1800単位以内に制限します．
 
 offline testsはSDKの有無によらず許可，pending再開，SSE，重複，返信contextと失敗を確認します．実Discord投稿や本番Bot restartはtestに含めません．
+## 所有者からの自然文による修正依頼
+
+`owner_repair_config`を省略した場合，既存の調査・会話だけを実行します．有効にする場合は，Discord設定へ次を追加します．
+
+```toml
+owner_repair_config = "E:/ephy-work/discord-launch/owner-repair.json"
+```
+
+実際のDiscord author IDが`425581535748423680`の場合だけ，Runtimeのローカル会話APIで自然文を分類します．接頭辞は不要です．製品の実装・動作・設定の修正と，通常の質問や回答内容の訂正を区別します．分類結果は`{"action":"repair"}`または`{"action":"conversation"}`の厳密なJSONだけを受理します．表示名，引用された会話，model出力は権限を付与しません．他の許可ユーザーは従来の調査・会話を利用します．分類失敗時は修正も外部検索も実行しません．修正の分類を公開検索の検査より先に行い，私的なコード修正依頼を外部の検索語へ変換しません．
+
+controllerはBotと別processで起動します．`state_dir`にSQLiteの依頼，stage，結果，送信outboxを保持し，Bot／Runtimeを再起動しても依頼を失いません．実行中のmodel stageでcontrollerが落ちた場合は，証拠を残して停止します．同じDiscord message IDの依頼を勝手に再実装しません．送信開始後の通信切断は` sending `状態を保存し，重複送信を避けるため自動再送しません．この曖昧な状態の配送確認は運用側で行います．
+
+controller設定の例です．pathとSHA-256は運用者が配置した実在ファイルへ置き換えます．Discord本文やmodel出力からこの設定，repository，command，remoteを作成しません．
+
+```json
+{
+  "state_dir": "E:/ephy-work/discord-launch/data/bridge/owner-repair",
+  "guild_id": 1539224877209485392,
+  "channel_ids": [1560630456070967386],
+  "python": "E:/ephy-work/discord-chat-20261016/.venv/Scripts/python.exe",
+  "git": "C:/Users/ephy/.cache/codex-runtimes/codex-primary-runtime/dependencies/native/git/cmd/git.exe",
+  "gh": "C:/Program Files/GitHub CLI/gh.exe",
+  "powershell": "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+  "release_adapter": "E:/ephy-work/discord-launch/Invoke-OwnerRepairRelease.ps1",
+  "release_adapter_sha256": "<64 hexadecimal characters>",
+  "poll_seconds": 5,
+  "repositories": {
+    "ephy-worker": {
+      "source": "E:/ephy-work/worker-production-20261019",
+      "production": "E:/ephy-work/worker-production-20261019",
+      "origin": "https://github.com/kirimine170/ephy-worker.git",
+      "github_repository": "kirimine170/ephy-worker",
+      "branch": "main",
+      "allowed_prefixes": ["src/", "tests/", "docs/"],
+      "required_checks": ["<actual required GitHub Actions check name>"],
+      "formal_template": "E:/ephy-work/discord-launch/owner-worker-template.json",
+      "formal_template_sha256": "<64 hexadecimal characters>"
+    }
+  }
+}
+```
+
+`ephy-runtime`も同じ形式で登録できます．許可remoteは`kirimine170/ephy-worker`と`kirimine170/ephy-runtime`のHTTPS remoteに固定します．Runtimeでは必要に応じて`packages/`と`apps/`をprefixへ指定します．controller，governance，検証・採用gate，秘密情報，隠し設定は自動修正scopeへ含めません．これらを変更する依頼は通常の自律修正Jobへ流さず，別の運用scopeとして扱います．
+
+`formal_template`は運用者が固定した`{"runtime":{...},"contract":{...}}`です．runtimeには既存modelのidentity，managed Pi，provider，governance gate，worker agent，resource lockなど正式runnerの全設定を含めます．contractには予算，5本の固定argv検証，runtime pinsと明示的な実行profile／sandbox descriptorを含めます．discoveryはこのcommandを変更しません．scopeと受入checkerの提案を読み取り専用のlocal model呼出しで作り，known_good／unchanged／wrong_answer／test_weakening／scope_escapeの5つの実測controlを通してから契約をfreezeします．checkerはcandidateと別の読み取り専用領域に置き，実行は選択済みのnative sandboxだけを使います．sandboxの保証範囲と観測されたloopback制約は[実行profile文書](discord-owner-repair-execution.md)で確認します．
+
+discoveryは既存file全体をcontrolの出力として再生成させず，scope内のpathごとに`[{"old":"完全一致する一意な部分文字列","new":"置換後"}]`または`[{"append":"追加test"}]`という小さな編集を受け取ります．controllerが元のsourceへ展開し，曖昧な一致，scope外，未知fieldを拒否します．既存のassertionを残した回帰testの追加を必須にします．選択したmodelの`apply-template`と`tokenize`で実際の入力token数を測り，4096 completion tokenを予約できない入力は生成前に停止します．切り詰めて続行しません．
+
+固定checkerのargvは`["{python}","-I","{checker}","{candidate}"]`とします．`-I`でcandidate由来の`ast.py`などによる標準libraryの乗っ取りを防ぎ，scope／assertion／authority guardを通過した後だけcandidateのimport pathを追加します．control実行も同じargvを使います．
+
+依存関係の異なるrepositoryには，各templateの`runtime.python`へ対応する検証用Pythonを固定します．契約のverifier identity freeze，formal runner，採用直前のproposal再検証は，その実際のPythonを使った別processで実行します．現在のcontrollerのPythonを別の検証環境だと申告しません．childのimport pathは固定Worker governance rootの`src`だけとし，native Gitのpathを固定してcredential環境を除去します．Runtimeのcontrolと受入checkerには対象candidate rootもimport pathとして渡します．
+
+`discord_runtime.py`では`safe_final`，`split_discord_text`，`bounded_text`の本文とliteralの`PERSONA`だけを自動修正の候補にできます．関数signatureとその他の全top-level ASTをchecker外の固定guardへ保存し，所有者認証，設定，token，受理・分類・実行routeの変更を拒否します．reply helperへdynamic import，global操作，dunder accessなどを追加する変更も拒否し，既存test／assertionと独立レビューの検査を維持します．
+
+reply helperのfree nameは純粋なbuiltin，固定した文字列／正規表現と検査済みのreply helperだけに限定します．`os`，`httpx`，`Path`，`asyncio`，`sqlite3`，`psutil`などの権限を持つglobalやそのalias／closureを参照できません．nested functionとcomprehensionのlocal scopeを区別し，正規表現moduleの操作とdata methodも明示した集合だけを許可します．
+
+既存test moduleは，imports，fixtures，decorators，function bodyを含む元のtop-level ASTを変更できません．末尾への一意な新しいtest／helper functionの追加だけを受理し，既存bindingやtest名の上書き，skip／xfailの追加を拒否します．assertionを`if False`へ移す変更も元のASTが変わるため拒否します．追加したtestの妥当性は固定checkerと独立レビューでも確認します．
+
+正式なplanner，Pi implementer，独立検証，freshな読み取り専用監査を通過したproposalだけを別roleのrelease adapterへ渡します．同じ最終headの必須CI，独立Codex Review，未解決review threadがないことを機械的に確認するまでmergeしません．review権限やサービスが利用できなければ`review_pending`で待機します．GitHub credentialはrelease subprocessだけで取得し，modelとcheckerの環境へ渡しません．
+
+接続済み所有者のGitHubからreviewを依頼する場合だけ，運用者が`review_adapter`，`review_adapter_sha256`，`review_adapter_python`，`review_adapter_python_sha256`，`review_adapter_config`，`review_adapter_config_sha256`の6項目をすべて指定します．pathは絶対path，pinは実在する固定fileのSHA-256です．未指定時は既存のGitHub CLI認証で依頼します．host callbackのargvは`[python,"-I",adapter,"--config",config,"--request",request]`に固定し，modelやDiscord本文からcommandを作りません．callbackのconfigは`{"schema":"ephy.github-review-relay-config.v1","codex_executable":"<absolute pinned Codex executable>","codex_sha256":"<actual SHA-256>"}`です．
+
+relay requestは`ephy.owner-review-request.v1`と`repair_id`，登録済み`repository`，`pr_number`，`head_sha`だけです．公式App Serverのstdio RPCでephemeral／read-only threadを作り，接続済みGitHubの実profileが`kirimine170`／`78987919`であること，PRが登録repository内のopen・main向け・同一repositoryのheadであることを確認します．model turn，shell，承認自動応答は使いません．固定の`@codex review`文面を投稿し，所有者による同じheadのmarker／本文を読み戻してから依頼済みとします．依頼本文に生のtaskや会話は含めません．pin変更，別所有者，head変更，未知response，承認要求，投稿結果不明は停止または`review_pending`となります．再試行時は所有者の同一markerで重複を防ぎます．このrelayはreview依頼だけを行い，CI，独立Codex Review，未解決finding，merge，本番healthのgateを変更しません．
+
+PRには，検証commandと実測exit／安全な出力，base／head／treeとfile hash，checker source，公開baseに対するcontrol差分と展開後hash，policyと観測済みACK／session identity，独立監査のcheck内容とbindingを公開します．元のDiscord依頼，過去回答，prompt，CoT，tool本文は含めません．public goalとcheckerを含む公開資料に秘密情報や私的pathが残る場合は投稿前に停止します．公開reportはpathを正規化した派生物であることを明記し，private raw artifactのhashと混同しません．長いreportはUTF-8境界を保って複数commentへ完全に分割し，report自身のSHA-256と順序を固定します．検証hashや自己申告だけで外部reviewを依頼しません．
+
+運用release callbackは固定SHA-256のPowerShellへ`-RepairRequest <absolute-json-path>`を渡します．request schemaは`ephy.owner-repair-release.v1`で，`repair_id`，`owner_user_id`，`repository`，`deployed_commit`，`pr_number`，`head_sha`を含みます．callbackは既存modelを必須とし，modelの起動・停止・unloadをせず，本番反映，対象serviceの再起動，health，model identity不変を実測します．stdoutは`{"deployed_commit":"<merged SHA>","healthy":true,"model_identity_unchanged":true}`だけを返します．成功確認前に完了通知を作成しません．
+
+Botの`state_dir/repair-drain`へdeploymentごとのnonceを保存し，存在する間は新規処理と新しいoutbox chunkの送信を始めません．`repair-active.json`には`pid`，`created_at`（実processのUNIX開始時刻），`active`，`updated_at`，Botが現在観測した`drain_token`を保存します．同じevent loopのwatcherが1秒ごとに更新します．release callbackはPIDと開始時刻，今回のnonceへの新しいackを照合し，生成とoutbox送信の両方が0になるのを待ってからBotを再起動します．古いidle snapshotは採用しません．すでに受理した生成や送信は最後まで待ち，controller自体は停止しません．
+
+```powershell
+python -m ephy_worker.owner_repair --config E:/ephy-work/discord-launch/owner-repair.json
+```
+
+設定と永続storeを検証し，singleton lockを取得した後に`EPHY_OWNER_REPAIR_CONTROLLER_READY`を出力します．生の依頼とsourceを含むprivate stateやdiscovery／checker記録はGitへ追加しません．

@@ -50,6 +50,15 @@ from ephy_worker.formal_runtime import (
 REPOSITORY = Path(__file__).resolve().parents[1]
 
 
+@pytest.fixture(autouse=True)
+def synthetic_private_home(tmp_path, monkeypatch):
+    # Imported descriptor unit fixtures need the same disposable home as their
+    # originating module; real native controls still deny the actual user home.
+    home = tmp_path / "synthetic-home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: home)
+
+
 def contract():
     return {
         "allowed_files": ["docs/example.md"],
@@ -75,6 +84,71 @@ def contract():
         "max_log_bytes": 100000,
         "runtime_hashes": {},
     }
+
+
+def test_code_profile_requires_measured_descriptor_and_keeps_default_markdown_only(tmp_path):
+    from test_verifier_sandbox import descriptor_fixture
+
+    value = contract()
+    value["allowed_files"] = ["src/ephy_worker/search.py", "tests/test_search.py"]
+    with pytest.raises(GateFailure, match="need isolation"):
+        validate_contract(value)
+    value["execution_profile"] = "native_windows_code_v1"
+    with pytest.raises(GateFailure, match="explicit pinned"):
+        validate_contract(value)
+    value["verifier_sandbox"] = descriptor_fixture(tmp_path)
+    validate_contract(value)
+
+
+@pytest.mark.parametrize("path", [
+    "src/ephy_worker/formal_runtime.py", "src/ephy_worker/owner_repair.py",
+    "src/ephy_worker/verifier_sandbox.py", "src/ephy_worker/existing_llama_runtime.py",
+    "src/ephy_worker/strata_runtime.py", "docs/system-development-governance.md", "tools/unsafe.py",
+])
+def test_code_profile_cannot_modify_its_execution_controls(tmp_path, path):
+    from test_verifier_sandbox import descriptor_fixture
+
+    value = contract()
+    value.update(execution_profile="native_windows_code_v1", verifier_sandbox=descriptor_fixture(tmp_path))
+    value["allowed_files"] = [path]
+    with pytest.raises(GateFailure, match="protected execution controls"):
+        validate_contract(value)
+
+
+def test_executable_check_launches_only_native_sandbox(tmp_path, monkeypatch):
+    from contextlib import nullcontext
+
+    from test_verifier_sandbox import descriptor_fixture
+
+    controls = tmp_path / "controls"
+    controls.mkdir()
+    descriptor = descriptor_fixture(controls)
+    runner = verifier_runner(tmp_path)
+    checker = tmp_path / "checker" / "checker.py"
+    checker.parent.mkdir()
+    checker.write_text("synthetic")
+    runner.contract.update(execution_profile="native_windows_code_v1", verifier_sandbox=descriptor,
+                           checker=str(checker))
+    runner._isolated_verifier_command = True
+    runner._sandbox_controls = {"path": "synthetic-real-measurement-path", "sha256": "a" * 64}
+    launches = []
+
+    def launch(argv, **kwargs):
+        launches.append((argv, kwargs))
+        return SimpleNamespace(pid=987, returncode=0, poll=lambda: 0)
+
+    monkeypatch.setattr(subprocess, "Popen", launch)
+    monkeypatch.setattr("ephy_worker.verifier_sandbox.readonly_acl", lambda *args: nullcontext({"synthetic": True}))
+    monkeypatch.setattr("ephy_worker.verifier_sandbox.writable_acl", lambda *args: nullcontext({"synthetic": True}))
+    monkeypatch.setattr("ephy_worker.verifier_sandbox.metadata_acl", lambda *args: nullcontext({"synthetic": True}))
+    result = runner.command([sys.executable, "-V"], runner.candidate, "isolated-command", 10)
+    assert len(launches) == 1
+    outer = launches[0][0]
+    assert outer[0] == descriptor["codex"]["path"] and outer[1] == "sandbox"
+    assert outer[outer.index("--") + 1:] == [str(Path(sys.executable).resolve()), "-V"]
+    assert result["argv"] == [str(Path(sys.executable).resolve()), "-V"]
+    assert result["verifier_sandbox"]["argv"] == outer
+    assert result["verifier_sandbox"]["identity"]["capability"] == descriptor["capability"]
 
 
 def bundle_fixture(tmp_path):
@@ -2833,3 +2907,229 @@ def test_planner_prompt_retains_the_plan_and_candidate_without_audit_artifacts(p
     assert read_json(case.runner.directory / "retained-candidate-snapshot.json") == snapshot(case.runner.candidate)
     assert not (case.runner.directory / "audit-result.json").exists()
     assert not (case.runner.directory / "audit-bundle").exists()
+
+
+@pytest.mark.parametrize("profile,stage,whole,expected", [
+    (None, 1800, 14400, 600),
+    ("native_windows_code_v1", 1800, 14400, 1800),
+    ("native_windows_code_v1", 1800, 300, 300),
+    ("native_windows_code_v1", 60, 300, 60),
+])
+def test_verifier_command_budget_matches_actual_check_argument_and_attestation(
+    tmp_path, monkeypatch, profile, stage, whole, expected,
+):
+    from ephy_worker import verifier_sandbox
+
+    runner = verifier_runner(tmp_path)
+    runner.contract.update(stage_seconds=stage, timeout_seconds=whole)
+    if profile is not None:
+        # These units measure budget routing only; actual native capability
+        # controls are independently retained by the operator/verifier.
+        runner.contract.update(execution_profile=profile, verifier_sandbox={"synthetic": True})
+        runner.runtime["backend"] = "external_existing_llama"
+        module = Path(verifier_sandbox.__file__).resolve()
+        runner.contract["runtime_hashes"][str(module)] = file_hash(module)
+        monkeypatch.setattr(verifier_sandbox, "identity", lambda _: {"synthetic": "budget-only"})
+        monkeypatch.setattr(verifier_sandbox, "run_controls", lambda *_, **__: {"synthetic": True})
+        (runner.candidate / "pyproject.toml").write_text("# Fixed budget control\n", encoding="utf-8")
+        runner.baseline_snapshot = snapshot(runner.candidate)
+    runner.job["verifier_identity"] = observed_verifier_identity(runner.runtime, runner.contract)
+    calls = []
+
+    def command(argv, cwd, label, seconds):
+        calls.append((label, seconds, runner._isolated_verifier_command))
+        temp = runner.directory / "temp"
+        return {
+            "argv": [str(Path(sys.executable).resolve()), *argv[1:]], "cwd": str(cwd), "exit_code": 0,
+            "effective_environment_sha256": digest(encode(command_environment(cwd, temp))),
+            "temp_root": str(temp), "temp_variables": {name: str(temp) for name in ("TEMP", "TMP", "TMPDIR")},
+        }
+
+    runner.command = command
+    runner.run_diff_check = lambda _: {"id": "diff", "passed": True}
+    assert runner.run_checks("budget-control")["passed"]
+    assert len(calls) == 5
+    assert all(seconds == expected and isolated is (profile is not None) for _, seconds, isolated in calls)
+    observations = verifier_observations(runner)
+    assert observations and all(record["command_timeout_seconds"] == expected for record in observations)
+    assert all(record["observed_identity"] == runner.job["verifier_identity"] for record in observations)
+
+
+def test_native_verifier_budget_changes_invocation_identity_without_changing_legacy_identity(tmp_path, monkeypatch):
+    from ephy_worker import verifier_sandbox
+
+    runner = verifier_runner(tmp_path)
+    before = observed_verifier_identity(runner.runtime, runner.contract)
+    runner.contract.update(stage_seconds=1800, timeout_seconds=14400)
+    assert observed_verifier_identity(runner.runtime, runner.contract) == before
+    module = Path(verifier_sandbox.__file__).resolve()
+    runner.contract["runtime_hashes"][str(module)] = file_hash(module)
+    runner.contract.update(execution_profile="native_windows_code_v1", verifier_sandbox={"synthetic": True})
+    monkeypatch.setattr(verifier_sandbox, "identity", lambda _: {"synthetic": "budget-only"})
+    native_before = observed_verifier_identity(runner.runtime, runner.contract)
+    runner.contract["stage_seconds"] = 1200
+    native_after = observed_verifier_identity(runner.runtime, runner.contract)
+    assert native_after["runtime_sha256"] == native_before["runtime_sha256"]
+    assert native_after["invocation_config_sha256"] != native_before["invocation_config_sha256"]
+
+
+@pytest.mark.parametrize("field", ["stage_seconds", "timeout_seconds"])
+@pytest.mark.parametrize("invalid", [True, 0, -1, "1800", None])
+def test_native_verifier_budget_requires_frozen_positive_integers(field, invalid):
+    from ephy_worker.formal_runtime import verifier_command_seconds
+
+    value = contract()
+    value.update(execution_profile="native_windows_code_v1", stage_seconds=1800, timeout_seconds=14400)
+    value[field] = invalid
+    with pytest.raises(GateFailure, match="Invalid positive integer: " + field):
+        verifier_command_seconds(value)
+
+
+def _review_v13_completion_command(tmp_path, code, *, pytest_mode=False, trusted=False):
+    from ephy_worker import check_completion
+    candidate = tmp_path / "candidate"
+    candidate.mkdir(parents=True, exist_ok=True)
+    checker = tmp_path / "checker" / ("registered_checks.py" if trusted else "checker.py")
+    checker.parent.mkdir()
+    checker.write_text(code, encoding="utf-8")
+    if pytest_mode:
+        test = candidate / "test_subject.py"
+        test.write_text(code, encoding="utf-8")
+        config = candidate / "pytest.ini"
+        config.write_text("[pytest]\n", encoding="utf-8")
+        argv = [sys.executable, "-I", "-X", "utf8", "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider",
+            "-c", str(config), "--basetemp", str(tmp_path / "pytest-temp"), str(test)]
+    elif trusted:
+        (candidate / "tests").mkdir()
+        (candidate / "tests/test_subject.py").write_text("def test_answer():\n    assert 1 + 1 == 2\n")
+        (candidate / "pytest.ini").write_text("[pytest]\n")
+        argv = [sys.executable, "-I", "-X", "utf8", str(checker), "regression", str(candidate), str(checker)]
+    else:
+        argv = [sys.executable, "-I", "-X", "utf8", "-B", str(checker)]
+    plan = check_completion.prepare_completion(argv, checker=tmp_path / "other-checker.py" if trusted else checker,
+        helper=Path(check_completion.__file__).resolve(), request_dir=checker.parent / "requests",
+        output_dir=tmp_path / "records", label="actual-check", cwd=candidate,
+        trusted_scripts={str(checker.resolve()): file_hash(checker)} if trusted else {})
+    result = subprocess.run(plan["argv"], cwd=candidate, env=command_environment(candidate, tmp_path / "temp"),
+        capture_output=True, check=False, timeout=30)
+    return plan, result
+
+
+@pytest.mark.parametrize("code", ["import os\nos._exit(0)\n", "raise SystemExit(0)\n"])
+def test_review_v13_actual_checker_early_exit_zero_lacks_completion(tmp_path, code):
+    from ephy_worker.check_completion import verify_completion
+    plan, result = _review_v13_completion_command(tmp_path, code)
+    assert result.returncode == 0
+    with pytest.raises(ValueError, match="completion_record_missing"):
+        verify_completion(plan, result.returncode)
+
+
+@pytest.mark.parametrize("early_exit", [False, True])
+def test_review_v13_actual_pytest_import_exit_is_not_normal_completion(tmp_path, early_exit):
+    from ephy_worker.check_completion import verify_completion
+    code = "import os\nos._exit(0)\n" if early_exit else "def test_answer():\n    assert 1 + 1 == 2\n"
+    plan, result = _review_v13_completion_command(tmp_path, code, pytest_mode=True)
+    assert result.returncode == 0, result.stderr
+    if early_exit:
+        with pytest.raises(ValueError, match="completion_record_missing"):
+            verify_completion(plan, result.returncode)
+    else:
+        record = verify_completion(plan, result.returncode)
+        assert record["record"]["outcome"] == "returned" and record["record"]["reported_pid"] > 0
+
+
+@pytest.mark.parametrize("field", ["nonce", "label", "argv_sha256", "request_sha256", "cwd", "exit_code"])
+def test_review_v13_actual_completion_tampering_and_replay_reject(tmp_path, field):
+    from ephy_worker.check_completion import verify_completion
+    plan, result = _review_v13_completion_command(tmp_path / "first", "assert 1 + 1 == 2\n")
+    assert verify_completion(plan, result.returncode)["record"]["exit_code"] == 0
+    path = Path(plan["record"])
+    original = path.read_bytes()
+    record = json.loads(original)
+    record[field] = 1 if field == "exit_code" else "different-invocation"
+    path.write_text(json.dumps(record), encoding="utf-8")
+    with pytest.raises(ValueError, match="completion_record_invalid"):
+        verify_completion(plan, result.returncode)
+    other, other_result = _review_v13_completion_command(tmp_path / "second", "assert 1 + 1 == 2\n")
+    Path(other["record"]).write_bytes(original)
+    with pytest.raises(ValueError, match="completion_record_invalid"):
+        verify_completion(other, other_result.returncode)
+    Path(other["record"]).unlink()
+    with pytest.raises(ValueError, match="completion_record_missing"):
+        verify_completion(other, other_result.returncode)
+
+
+def test_review_v13_opaque_nested_pytest_checker_is_rejected(tmp_path):
+    from ephy_worker.check_completion import verify_completion
+    plan, result = _review_v13_completion_command(tmp_path,
+        "import subprocess,sys\nsubprocess.run([sys.executable,'-m','pytest','--version'],check=True)\n")
+    assert result.returncode == 1 and b"unsupported_nested_checker_command" in result.stderr
+    assert verify_completion(plan, result.returncode)["record"]["outcome"] == "exception"
+
+
+def test_review_v13_actual_candidate_import_exit_zero_has_no_completion(tmp_path):
+    from ephy_worker.check_completion import verify_completion
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    (candidate / "feature.py").write_text("import os\nos._exit(0)\n")
+    plan, result = _review_v13_completion_command(tmp_path,
+        "import sys\nsys.path.insert(0," + repr(str(candidate)) + ")\nimport feature\n")
+    assert result.returncode == 0
+    with pytest.raises(ValueError, match="completion_record_missing"):
+        verify_completion(plan, result.returncode)
+
+
+def test_review_v13_registered_regression_shape_returns_after_pytest_main(tmp_path):
+    from ephy_worker.check_completion import verify_completion
+    code = ("import sys,pytest\nfrom pathlib import Path\n"
+        "def main():\n    assert sys.argv[1]=='regression'\n"
+        "    return int(pytest.main(['-q','-p','no:cacheprovider','-c',str(Path(sys.argv[2])/'pytest.ini'),"
+        "'--basetemp',str(Path(sys.argv[2])/'temp'),str(Path(sys.argv[2])/'tests')]))\n"
+        "if __name__=='__main__':\n    raise SystemExit(main())\n")
+    plan, result = _review_v13_completion_command(tmp_path, code, trusted=True)
+    assert result.returncode == 0, result.stderr
+    record = verify_completion(plan, result.returncode)["record"]
+    assert record["outcome"] == "returned"
+    assert json.loads(Path(plan["request"]).read_bytes())["mode"] == "registered"
+
+
+def test_review_v13_outside_formal_runner_rejects_bare_exit_zero(tmp_path):
+    from ephy_worker import check_completion
+    runner = verifier_runner(tmp_path)
+    helper = Path(check_completion.__file__).resolve()
+    runner.contract.update(execution_profile="native_windows_code_v1")
+    runner.contract["runtime_hashes"][str(helper)] = file_hash(helper)
+    checker = tmp_path / "checker" / "checker.py"
+    checker.parent.mkdir()
+    checker.write_text("assert 1 + 1 == 2\n")
+    runner.contract["checker"] = str(checker)
+    argv = [sys.executable, "-I", "-X", "utf8", str(checker)]
+    good = runner.command(argv, runner.candidate, "completion-good", 30)
+    assert good["exit_code"] == 0 and good["completion"]["record"]["outcome"] == "returned"
+    assert good["argv"] == [str(Path(sys.executable).resolve()), *argv[1:]]
+    assert good["completion_transport_argv"] != good["argv"]
+    checker.write_text("import os\nos._exit(0)\n")
+    with pytest.raises(GateFailure, match="completion_record_missing"):
+        runner.command(argv, runner.candidate, "completion-missing", 30)
+
+
+def test_review_v14_completion_helper_pin_requires_managed_runtime(tmp_path):
+    from ephy_worker.formal_runtime import runtime_artifact_paths
+
+    artifact = tmp_path / "provider.py"
+    artifact.write_bytes(b"# frozen provider\n")
+    lock = tmp_path / "resource.lock"
+    lock.write_bytes(b"0")
+    minimal = {"governance_root": str(REPOSITORY), "resource_lock": str(lock), "provider": str(artifact)}
+    assert runtime_artifact_paths(minimal) == [artifact]
+    assert runtime_artifact_paths({**minimal, "python": sys.executable}) == [artifact, Path(sys.executable)]
+    assert runtime_artifact_paths({**minimal, "managed_dir": str(tmp_path / "managed")}) == [artifact]
+
+    managed = {**minimal, "backend": "external_existing_llama", "provider_id": "dual-local",
+        "review_mode": "formal", "python": sys.executable, "managed_dir": str(tmp_path / "managed")}
+    helper = (REPOSITORY / "src/ephy_worker/check_completion.py").resolve()
+    paths = runtime_artifact_paths(managed)
+    pins = {str(path.resolve()): file_hash(path) for path in paths}
+    assert paths == [artifact, Path(sys.executable), helper]
+    assert pins[str(helper)] == file_hash(helper)
+    assert str(lock.resolve()) not in pins

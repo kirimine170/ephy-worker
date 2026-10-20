@@ -19,7 +19,7 @@ import subprocess
 import sys
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -162,6 +162,10 @@ def runtime_artifact_paths(runtime: dict) -> list[Path]:
     """Classify the one coordination field before constructing content pins."""
     paths = [Path(value) for key, value in runtime.items()
              if key != "resource_lock" and isinstance(value, str) and Path(value).is_file()]
+    if all(isinstance(runtime.get(key), str) for key in ("python", "managed_dir", "governance_root")):
+        completion = Path(runtime["governance_root"]) / "src/ephy_worker/check_completion.py"
+        if completion.is_file():
+            paths.append(completion.resolve())
     validate_resource_lock_pins(runtime.get("resource_lock"), paths)
     return paths
 
@@ -233,7 +237,7 @@ def validate_contract(contract: dict) -> None:
         "max_log_bytes",
         "runtime_hashes",
     }
-    if set(contract) - {"planner_only"} != required:
+    if set(contract) - {"planner_only", "execution_profile", "verifier_sandbox"} != required:
         raise GateFailure("Frozen formal contract fields missing or unknown")
     if "planner_only" in contract and type(contract["planner_only"]) is not bool:
         raise GateFailure("planner_only must be an explicit boolean")
@@ -241,9 +245,28 @@ def validate_contract(contract: dict) -> None:
         raise GateFailure("Planner-only contracts cannot authorize repairs")
     if not contract["allowed_files"] or len(set(contract["allowed_files"])) != len(contract["allowed_files"]):
         raise GateFailure("Empty/duplicate file scope")
+    executable_profile = contract.get("execution_profile")
+    if executable_profile is not None:
+        from .verifier_sandbox import PROFILE, validate_descriptor
+
+        if executable_profile != PROFILE or "verifier_sandbox" not in contract:
+            raise GateFailure("Executable proposals require an explicit pinned verifier sandbox")
+        validate_descriptor(contract["verifier_sandbox"])
+    elif "verifier_sandbox" in contract:
+        raise GateFailure("Sandbox descriptor requires an explicit executable profile")
     for name in contract["allowed_files"]:
         normalized(name)
-        if not name.endswith(".md") or not name.startswith(("docs/", ".agents/skills/")):
+        if executable_profile is not None:
+            if (
+                not name.startswith(("src/", "apps/", "packages/", "tests/", "docs/"))
+                or name.startswith(("src/ephy_worker/formal_", "src/ephy_worker/owner_repair", "src/ephy_worker/check_completion"))
+                or name in {
+                    "src/ephy_worker/verifier_sandbox.py", "src/ephy_worker/existing_llama_runtime.py",
+                    "src/ephy_worker/strata_runtime.py", "docs/system-development-governance.md",
+                }
+            ):
+                raise GateFailure("Executable file scope overlaps protected execution controls")
+        elif not name.endswith(".md") or not name.startswith(("docs/", ".agents/skills/")):
             raise GateFailure(
                 "Only data-only Markdown profile is supported; executable proposals need isolation"
             )
@@ -369,6 +392,16 @@ def observed_dependency_versions() -> dict[str, str]:
     return versions
 
 
+def verifier_command_seconds(contract: dict) -> int:
+    """Derive executable check time from the frozen native stage/job limits."""
+    if contract.get("execution_profile") != "native_windows_code_v1":
+        return 600
+    for field in ("stage_seconds", "timeout_seconds"):
+        if type(contract[field]) is not int or contract[field] <= 0:
+            raise GateFailure(f"Invalid positive integer: {field}")
+    return min(contract["stage_seconds"], contract["timeout_seconds"])
+
+
 def observed_verifier_identity(
     runtime: dict, contract: dict, *, observation: dict | None = None,
     dependency_versions: dict[str, str] | None = None,
@@ -384,6 +417,7 @@ def observed_verifier_identity(
         },
         checks_sha256=digest(encode(contract["checks"])),
         python_version_sha256=digest(sys.version.encode("utf-8")),
+        command_timeout_seconds=verifier_command_seconds(contract),
         files={},
     )
 
@@ -428,6 +462,12 @@ def observed_verifier_identity(
     if configured_python != python:
         raise GateFailure("Configured verifier Python differs from the running interpreter")
     modules = [Path(__file__), Path(__file__).with_name("formal_artifacts.py")]
+    isolation = None
+    if contract.get("execution_profile") is not None:
+        from .verifier_sandbox import identity as sandbox_identity
+
+        isolation = sandbox_identity(contract["verifier_sandbox"])
+        modules.append(Path(__file__).with_name("verifier_sandbox.py"))
     executables = [executable(str(python), "python"), executable("git", "git")]
     for index, check in enumerate(contract["checks"]):
         argument = check["argv"][0].format(python=str(python))
@@ -444,21 +484,19 @@ def observed_verifier_identity(
     observation["dependency_version_sha256"] = {
         name: digest(version.encode("utf-8")) for name, version in dependencies.items()
     }
+    runtime_material = {"files": pins, "python_version": sys.version, "dependencies": dependencies}
+    invocation_material = {
+        "checks": contract["checks"], "executables": executables,
+        "environment_sha256": observation["environment_sha256"],
+        "command_timeout_seconds": observation["command_timeout_seconds"],
+    }
+    if isolation is not None:
+        runtime_material["verifier_sandbox"] = isolation
+        invocation_material["verifier_sandbox"] = isolation
     identity = {
         "executor_id": "ephy_worker.formal_runtime.independent-verifier.v1",
-        "runtime_sha256": digest(encode({
-            "files": pins, "python_version": sys.version, "dependencies": dependencies,
-        })),
-        "invocation_config_sha256": digest(
-            encode(
-                {
-                    "checks": contract["checks"],
-                    "executables": executables,
-                    "environment_sha256": observation["environment_sha256"],
-                    "command_timeout_seconds": 600,
-                }
-            )
-        ),
+        "runtime_sha256": digest(encode(runtime_material)),
+        "invocation_config_sha256": digest(encode(invocation_material)),
     }
     observation.update(phase="pin_validation", observed_identity=identity)
     for path, sha in pins.items():
@@ -904,10 +942,66 @@ class FormalRunner:
             env.update(stage_environment)
         executable = executable_identity(argv[0])
         argv = [executable["path"], *argv[1:]]
+        launched_argv = argv
+        completion = None
+        if (self.contract.get("execution_profile") is not None
+                and executable["path"] == str(Path(self.runtime["python"]).resolve())):
+            from .check_completion import prepare_completion
+
+            helper = Path(__file__).with_name("check_completion.py").resolve()
+            trusted = {str(Path(path).resolve()): pin for path, pin in self.contract["runtime_hashes"].items()
+                if Path(path).name in {"registered_checks.py", "registered_checks_v3.py"}}
+            completion = prepare_completion(argv, checker=self.contract["checker"], helper=helper,
+                request_dir=Path(self.contract["checker"]).parent / "completion-requests", output_dir=temp,
+                label=label, cwd=cwd, trusted_scripts=trusted)
+            if completion is not None:
+                if self.contract["runtime_hashes"].get(str(helper)) != file_hash(helper):
+                    raise GateFailure("Completion helper is not frozen")
+                launched_argv = completion["argv"]
+        sandbox = None
+        acl_context = nullcontext()
+        writable_context = nullcontext()
+        metadata_context = nullcontext()
+        if getattr(self, "_isolated_verifier_command", False):
+            from .verifier_sandbox import identity as sandbox_identity
+            from .verifier_sandbox import (
+                metadata_acl,
+                profile_override,
+                readonly_acl,
+                sandbox_argv,
+                writable_acl,
+            )
+
+            descriptor = self.contract["verifier_sandbox"]
+            profile = profile_override(
+                descriptor, candidate=self.candidate, checker=Path(self.contract["checker"]), temporary=temp,
+            )
+            launched_argv = sandbox_argv(descriptor, cwd, profile, launched_argv)
+            sandbox = {
+                "identity": sandbox_identity(descriptor), "profile": profile,
+                "profile_sha256": digest(profile.encode()), "argv": launched_argv,
+                "launcher": executable_identity(launched_argv[0]),
+                "controls": self._sandbox_controls,
+            }
+            acl_context = readonly_acl(
+                descriptor, [self.candidate, Path(self.contract["checker"]).parent,
+                             *map(Path, descriptor["read_roots"])],
+                self.directory / (label + "-readonly-acl.json"),
+            )
+            writable_context = writable_acl(
+                descriptor, temp, self.directory / (label + "-writable-temp-acl.json"),
+            )
+            metadata_context = metadata_acl(
+                descriptor, [self.candidate, Path(self.contract["checker"]).parent, temp],
+                self.directory / (label + "-parent-metadata-acl.json"),
+            )
         started = now()
-        with out.open("xb") as stdout, err.open("xb") as stderr:
+        with (
+            metadata_context as metadata_record, acl_context as acl_record, writable_context as writable_record,
+            out.open("xb") as stdout, err.open("xb") as stderr,
+        ):
             process = subprocess.Popen(
-                argv,
+                launched_argv,
                 cwd=cwd,
                 env=env,
                 stdout=stdout,
@@ -942,6 +1036,19 @@ class FormalRunner:
             "temp_variables": {key: env[key] for key in ("TEMP", "TMP", "TMPDIR")},
             "executable": executable,
         }
+        if sandbox is not None:
+            sandbox["readonly_acl"] = acl_record
+            sandbox["writable_temp_acl"] = writable_record
+            sandbox["parent_metadata_acl"] = metadata_record
+            record["verifier_sandbox"] = sandbox
+        if completion is not None:
+            from .check_completion import verify_completion
+
+            record["completion_transport_argv"] = completion["argv"]
+            try:
+                record["completion"] = verify_completion(completion, process.returncode)
+            except ValueError as exc:
+                raise GateFailure(str(exc)) from None
         self.transcripts.append(
             {
                 **record,
@@ -998,6 +1105,22 @@ class FormalRunner:
     def run_checks(self, label: str, baseline: bool = False) -> dict:
         verifier = self.verifier_identity()
         dependencies = dict(self._verified_dependency_versions)
+        if self.contract.get("execution_profile") is not None:
+            if self.runtime.get("backend") != "external_existing_llama":
+                raise GateFailure("Executable verifier requires the explicit existing-llama backend")
+            from .verifier_sandbox import run_controls
+
+            probe_file = self.candidate / "pyproject.toml"
+            if not probe_file.is_file():
+                raise GateFailure("Executable candidate requires a fixed existing pyproject.toml control")
+            controls = run_controls(
+                self.contract["verifier_sandbox"], self.directory / (label + "-sandbox-controls"),
+                candidate=probe_file, checker=Path(self.contract["checker"]),
+            )
+            self._sandbox_controls = {
+                "path": str(self.directory / (label + "-sandbox-controls") / "capability.json"),
+                "sha256": digest(encode(controls)),
+            }
 
         def dependencies_intact() -> None:
             if observed_dependency_versions() != dependencies:
@@ -1009,7 +1132,9 @@ class FormalRunner:
         for check in self.contract["checks"]:
             dependencies_intact()
             temp = self.directory / (label + "-temp")
-            temp.mkdir(exist_ok=True)
+            if self.contract.get("execution_profile") is not None:
+                temp = self.directory / "temp" / (label + "-" + check["id"])
+            temp.mkdir(parents=True, exist_ok=True)
             substitutions = {
                 "python": self.runtime["python"],
                 "candidate": str(self.candidate),
@@ -1017,7 +1142,13 @@ class FormalRunner:
                 "temp": str(temp),
             }
             argv = [arg.format(**substitutions) for arg in check["argv"]]
-            result = self.command(argv, self.candidate, label + "-" + check["id"], 600)
+            self._isolated_verifier_command = self.contract.get("execution_profile") is not None
+            try:
+                result = self.command(
+                    argv, self.candidate, label + "-" + check["id"], verifier_command_seconds(self.contract),
+                )
+            finally:
+                self._isolated_verifier_command = False
             dependencies_intact()
             if (
                 result["argv"] != [executable_identity(argv[0])["path"], *argv[1:]]
@@ -1139,6 +1270,11 @@ class FormalRunner:
                 for key in ("output_token_budget", "max_requests", "max_response_tokens")
             },
         }
+        if self.contract.get("execution_profile") is not None:
+            from .verifier_sandbox import identity as sandbox_identity
+
+            stage_config["verifier_sandbox"] = sandbox_identity(self.contract["verifier_sandbox"])
+            stage_config["execution_profile"] = self.contract["execution_profile"]
         config_path = self.directory / (label + "-config.json")
         write_json(config_path, stage_config)
         task_path = self.directory / (label + "-prompt.txt")
@@ -1261,6 +1397,8 @@ class FormalRunner:
             str(Path(__file__).with_name(name))
             for name in ("__init__.py", "formal_runtime.py", "formal_artifacts.py", "formal_campaign.py", "strata_runtime.py")
         )
+        if self.contract.get("execution_profile") is not None:
+            required_runtime.add(str(Path(__file__).with_name("check_completion.py").resolve()))
         required_runtime.add(str(Path(self.runtime["stage_guard"]).with_name("formal-stage-stop.ts").resolve()))
         context_pins = injected_context_pins(self.runtime, self.job["controls"])
         context_pins[self.runtime["policy"]] = self.job["controls"]["system_development_policy"]
@@ -1333,6 +1471,11 @@ class FormalRunner:
             "temp_root": str(self.directory / "temp"),
             "contract_sha256": self.contract_sha,
         }
+        if self.contract.get("execution_profile") is not None:
+            env["network_policy"] = self.contract["verifier_sandbox"]["network_policy"]
+            env["loopback_isolation"] = "required" if env["network_policy"] == "windows_all_network_denied" else (
+                "not guaranteed; measured separately in parent and child controls"
+            )
         self.job["environment_sha256"] = digest(encode(env))
         self.environment = encode(env)
         self.state("preparing", "Checking frozen baseline before any model invocation")
@@ -1657,7 +1800,18 @@ def submit(spec: dict, root: Path) -> Path:
 
 def verify_proposal_for_integration(job_file: Path) -> Path:
     """Read-only adoption gate outside the model Job; never infer approval from status alone."""
-    runner = FormalRunner(job_file)
+    # A backend-specific verifier must re-observe its existing service and native
+    # sandbox rather than constructing the owned-model runner at adoption time.
+    job = read_json(job_file)
+    backend = job["runtime"].get("backend", "owned_llama")
+    if backend not in {"owned_llama", "external_strata", "external_existing_llama"}:
+        raise GateFailure("Unknown frozen model backend at integration")
+    if backend == "external_existing_llama":
+        from .strata_runtime import make_runner
+
+        runner = make_runner(job_file, initial_job=job)
+    else:
+        runner = FormalRunner(job_file, initial_job=job)
     if runner.runtime.get("review_mode", "formal") != "formal":
         raise GateFailure(
             "External-review proposals require separate current-head review; cannot integrate here"

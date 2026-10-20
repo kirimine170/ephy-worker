@@ -81,13 +81,14 @@ class TransferEvaluationTests(unittest.TestCase):
                 get_short_path = ctypes.WinDLL("kernel32", use_last_error=True).GetShortPathNameW
                 get_short_path.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
                 get_short_path.restype = ctypes.c_uint32
-                size = get_short_path(str(repository), None, 0)
-                if not size:
-                    raise ctypes.WinError(ctypes.get_last_error())
-                buffer = ctypes.create_unicode_buffer(size)
-                if not get_short_path(str(repository), buffer, size):
-                    raise ctypes.WinError(ctypes.get_last_error())
-                short_path = Path(buffer.value)
+                with contextlib.chdir(repository.parent):
+                    size = get_short_path(repository.name, None, 0)
+                    if not size:
+                        raise ctypes.WinError(ctypes.get_last_error())
+                    buffer = ctypes.create_unicode_buffer(size)
+                    if not get_short_path(repository.name, buffer, size):
+                        raise ctypes.WinError(ctypes.get_last_error())
+                    short_path = repository.parent / buffer.value
                 if short_path != repository.resolve(strict=True):
                     alias = short_path
             return alias, revision

@@ -9,6 +9,45 @@ export default function (pi: ExtensionAPI) {
   const config = JSON.parse(readFileSync(process.env.EPHY_FORMAL_STAGE_CONFIG!, "utf8"));
   const trace = process.env.EPHY_FORMAL_TRACE!;
   const root = realpathSync(config.root);
+  const pinned = (entry: any) => entry && typeof entry.path === "string"
+    && /^[a-f0-9]{64}$/.test(entry.sha256)
+    && createHash("sha256").update(readFileSync(entry.path)).digest("hex") === entry.sha256;
+  let executableIsolation = false;
+  if (config.execution_profile !== undefined || config.verifier_sandbox !== undefined) {
+    const sandbox = config.verifier_sandbox;
+    if (config.execution_profile !== "native_windows_code_v1" || sandbox?.profile !== config.execution_profile
+      || !/^[a-f0-9]{64}$/.test(sandbox?.descriptor_sha256)
+      || !/^[a-f0-9]{64}$/.test(sandbox?.module_sha256)
+      || !["windows_all_network_denied", "windows_external_network_denied"].includes(sandbox?.network_policy)
+      || !pinned(sandbox?.codex) || !pinned(sandbox?.capability)) {
+      throw new Error("Executable stages require controller-validated pinned native isolation");
+    }
+    const capability = JSON.parse(readFileSync(sandbox.capability.path, "utf8"));
+    if (capability.schema !== "ephy.native-verifier-capability.v1" || capability.exit_code !== 0
+      || JSON.stringify(capability.codex) !== JSON.stringify(sandbox.codex)
+      || capability.network_policy !== sandbox.network_policy
+      || !pinned(capability.stdout) || !pinned(capability.stderr)) {
+      throw new Error("Native isolation measurement differs from its frozen descriptor");
+    }
+    const observed = JSON.parse(readFileSync(capability.stdout.path, "utf8").trim().split(/\r?\n/).at(-1)!);
+    const controls = ["inside_write", "protected_read_denied", "protected_write_denied",
+      "candidate_write_denied", "checker_write_denied", "child_read_denied", "child_write_denied",
+      "child_candidate_write_denied", "child_checker_write_denied",
+      "candidate_read", "checker_read", "nested_temp_read_write", "child_candidate_read", "child_checker_read",
+      "child_nested_temp_read_write",
+      "parent_metadata", "parent_enumeration_denied", "sibling_read_denied", "sibling_write_denied",
+      "child_parent_metadata", "child_parent_enumeration_denied", "child_sibling_read_denied",
+      "child_sibling_write_denied",
+      "network_denied", "loopback_denied", "child_network_denied", "child_loopback_denied", "asyncio_completed"];
+    const required = sandbox.network_policy === "windows_all_network_denied" ? controls
+      : controls.filter(name => !["loopback_denied", "child_loopback_denied"].includes(name));
+    if (observed.nonce !== capability.nonce || Object.keys(observed.controls ?? {}).length !== controls.length
+      || controls.some(name => typeof observed.controls[name] !== "boolean")
+      || required.some(name => observed.controls[name] !== true)) {
+      throw new Error("Executable stage isolation controls did not all succeed");
+    }
+    executableIsolation = true;
+  }
   const reads = new Set(["read", "grep", "find", "ls"]);
   const writes = new Set(["edit", "write"]);
   const pendingReads = new Map<string, string>();
@@ -54,7 +93,9 @@ export default function (pi: ExtensionAPI) {
       const rel = relative(root, target).replaceAll("\\", "/");
       // Exact case-sensitive scope even on case-insensitive filesystems.
       if (!config.allowed_files.includes(rel)) return "Write outside frozen file scope";
-      if (!rel.endsWith(".md")) return "Executable candidates require an approved verifier sandbox";
+      if (!rel.endsWith(".md") && !executableIsolation) {
+        return "Executable candidates require an approved verifier sandbox";
+      }
     }
     return undefined;
   }
