@@ -546,6 +546,10 @@ class LocalDiscovery:
 
     def completion(self, prompt: str, runtime: dict) -> dict:
         from .existing_llama_runtime import verify_identity
+        response_format = {"type": "json_object"}
+        if "discovery_response_schema" in runtime:
+            response_format = {"type": "json_schema", "json_schema": {"name": "discovery_scope",
+                "strict": True, "schema": runtime["discovery_response_schema"]}}
         identity = read_json(Path(runtime["models_ini"]))
         verify_identity(identity)
         messages = [{"role": "system", "content":
@@ -568,7 +572,7 @@ class LocalDiscovery:
                 raise GateFailure("contract_incomplete:discovery_context_budget_exceeded")
             response = client.post(runtime["base_url"] + "/v1/chat/completions", json={
                 "model": identity["model_id"], "stream": False, "temperature": 0,
-                "max_tokens": 4096, "messages": messages, "response_format": {"type": "json_object"}})
+                "max_tokens": 4096, "messages": messages, "response_format": response_format})
         response.raise_for_status()
         if self.response_path is not None and len(response.content) <= 2097152:
             self.response_path.write_bytes(response.content)
@@ -582,7 +586,17 @@ class LocalDiscovery:
 
     def select_scope(self, job: dict, templates: dict, inventories: dict, directory: Path) -> dict:
         """Read bounded real code before selecting scope, with explicit read-more rounds．"""
-        runtime = next(iter(templates.values()))["runtime"]
+        output_schema = {"oneOf": [
+            {"type": "object", "required": ["repository", "allowed_files", "semantic_scope"],
+                "additionalProperties": False, "properties": {
+                    "repository": {"type": "string", "enum": list(inventories)},
+                    "allowed_files": {"type": "array", "minItems": 1, "maxItems": 12, "items": {"type": "string"}},
+                    "semantic_scope": {"type": "string", "minLength": 1}}},
+            {"type": "object", "required": ["read_more"], "additionalProperties": False, "properties": {
+                "read_more": {"type": "object", "minProperties": 1, "additionalProperties": False,
+                    "properties": {alias: {"type": "array", "minItems": 1, "maxItems": 4,
+                        "items": {"type": "string", "enum": names}} for alias, names in inventories.items() if names}}}}]}
+        runtime = {**next(iter(templates.values()))["runtime"], "discovery_response_schema": output_schema}
         query = job["text"].casefold()
         terms = set(re.findall(r"[a-z_][a-z0-9_-]{2,}", query))
         for word, extra in (("検索", "search web tool"), ("reasoning", "reasoning prompt llm harness"),
@@ -649,10 +663,26 @@ class LocalDiscovery:
 
         cursor = 0
         feedback = None
-        for attempt in range(1, 4):
+        previous_output = None
+        automatic_context_full = False
+        # Provisional recovery budget; actual successful/exhausted rounds are retained privately．
+        round_limit = 30
+        corrections = {
+            "discovery_scope_empty_or_invalid": "Return exactly repository, allowed_files and semantic_scope, or read_more alone. Do not mix these shapes.",
+            "discovery_scope_protected_or_missing_tests": "Select only permitted paths and include an existing tests/ file from existing_test_files; supply a nonempty semantic_scope.",
+            "discovery_scope_confirmation_required": "The selected code is now in code_context. Inspect it and confirm the complete selection with its existing tests file.",
+            "discovery_read_more_requested": "The requested excerpts are now in code_context. Inspect them and return a complete selection or request different needed files.",
+            "discovery_read_more_already_available": "Those requested excerpts are already present. Inspect code_context and select scope, or request different needed files.",
+            "discovery_context_request_too_large": "That entire batch was rejected without changing accepted context. Request fewer files; do not repeat the oversized batch.",
+            "discovery_read_more_invalid": "Return only read_more mapping registered aliases to at most four distinct existing inventory paths in total.",
+            "discovery_read_more_protected_or_unknown": "Choose only exact permitted existing paths in repositories; do not invent names or request protected files."}
+        existing_tests = {alias: [name for _, row_alias, name, _ in ranked if row_alias == alias and name.startswith("tests/")]
+            for alias in inventories}
+        for attempt in range(1, round_limit + 1):
             # Expand retrieval automatically after an empty/invalid answer, without inventing scope．
             added = 0
-            automatic_count = 0 if feedback in {"discovery_read_more_requested", "discovery_scope_confirmation_required",
+            automatic_count = 0 if automatic_context_full or feedback in {"discovery_read_more_requested",
+                "discovery_read_more_already_available", "discovery_scope_confirmation_required",
                 "discovery_context_request_too_large"} else (6 if attempt == 1 else 4)
             while cursor < len(ranked) and added < automatic_count:
                 match = ranked[cursor]
@@ -663,10 +693,14 @@ class LocalDiscovery:
                 try:
                     include_excerpts([match], limit=12000 if attempt == 1 else 24000, maximum=1500, automatic=True)
                 except GateFailure:
+                    automatic_context_full = True
                     break
                 added += 1
             prompt = {"request": job["text"], "previous_answer": job.get("previous"),
                 "repositories": inventories, "code_context": context, "previous_selection_error": feedback,
+                "previous_model_output": previous_output, "existing_test_files": existing_tests,
+                "correction": corrections.get(feedback, "Return a valid strict JSON object matching one exact output shape, without fences or commentary."),
+                "round": attempt, "provisional_round_limit": round_limit,
                 "response_schema": {"repository": "registered alias", "allowed_files": ["up to12 exact source/test/doc paths"],
                     "semantic_scope": "short public-safe repair and acceptance summary"},
                 "read_more_schema": {"read_more": {"registered alias": ["up to4 existing paths to inspect"]}},
@@ -677,6 +711,7 @@ class LocalDiscovery:
                     "If more code is needed, return only read_more instead of an empty object. Do not change governance, secrets, "
                     "repair controller, Discord authorization, release settings or unrelated code. Protected paths stay forbidden. "
                     "semantic_scope is a public-safe implementation summary, not a quotation of the private request/context."}
+            initial = None
             try:
                 initial = self.ask(json.dumps(prompt, ensure_ascii=False), runtime, directory, "scope-attempt-" + str(attempt))
                 if set(initial) == {"read_more"}:
@@ -694,6 +729,8 @@ class LocalDiscovery:
                             matches.append(match)
                     if len({(row[1], row[2]) for row in matches}) != len(matches):
                         raise GateFailure("discovery_read_more_invalid")
+                    if all((row[1], row[2]) in requested_context for row in matches):
+                        raise GateFailure("discovery_read_more_already_available")
                     include_excerpts(matches)
                     raise GateFailure("discovery_read_more_requested")
                 if (set(initial) != {"repository", "allowed_files", "semantic_scope"}
@@ -717,12 +754,24 @@ class LocalDiscovery:
                 if unseen:
                     include_excerpts(unseen)
                     raise GateFailure("discovery_scope_confirmation_required")
+                write_json(directory / ("scope-attempt-" + str(attempt) + ".validation.json"),
+                    {"outcome": "selected", "round": attempt, "provisional_round_limit": round_limit})
                 return initial
             except (GateFailure, TypeError, ValueError) as exc:
                 if isinstance(exc, GateFailure) and not str(exc).startswith("discovery_"):
                     raise
-                feedback = str(exc)
-                write_json(directory / ("scope-attempt-" + str(attempt) + ".validation.json"), {"error": feedback})
+                feedback = str(exc)[:8192]
+                raw_path = directory / ("scope-attempt-" + str(attempt) + ".raw.json")
+                text = json.dumps(initial, ensure_ascii=False) if initial is not None else (
+                    raw_path.read_text(encoding="utf-8") if raw_path.is_file() else "No model content available; see the private error record.")
+                encoded = text.encode("utf-8")
+                previous_output = {"text": encoded[:8192].decode("utf-8", errors="ignore"),
+                    "representation": "parsed_json" if initial is not None else "raw_http_response",
+                    "utf8_bytes": len(encoded), "truncated": len(encoded) > 8192}
+                write_json(directory / ("scope-attempt-" + str(attempt) + ".validation.json"),
+                    {"error": feedback, "round": attempt, "provisional_round_limit": round_limit,
+                        "previous_model_output": previous_output, "correction": corrections.get(feedback,
+                            "Return a valid strict JSON object matching one exact output shape, without fences or commentary.")})
         raise GateFailure("discovery_scope_exhausted")
 
     def prepare(self, job: dict, directory: Path) -> dict:

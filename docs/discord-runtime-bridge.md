@@ -89,6 +89,8 @@ controller設定の例です．pathとSHA-256は運用者が配置した実在�
 
 `formal_template`は運用者が固定した`{"runtime":{...},"contract":{...}}`です．runtimeには既存modelのidentity，managed Pi，provider，governance gate，worker agent，resource lockなど正式runnerの全設定を含めます．contractには予算，5本の固定argv検証，runtime pinsと明示的な実行profile／sandbox descriptorを含めます．discoveryはこのcommandを変更しません．scopeと受入checkerの提案を読み取り専用のlocal model呼出しで作り，known_good／unchanged／wrong_answer／test_weakening／scope_escapeの5つの実測controlを通してから契約をfreezeします．checkerはcandidateと別の読み取り専用領域に置き，実行は選択済みのnative sandboxだけを使います．sandboxの保証範囲と観測されたloopback制約は[実行profile文書](discord-owner-repair-execution.md)で確認します．
 
+scope選択は，既存local modelへ厳密なJSON Schemaで「repository／allowed_files／semantic_scope」または「read_moreだけ」の二つの形を指定します．不正な形，既存test不足，追加codeの確認待ちには，前回の実出力（feedbackは最大8192 UTF-8 byte），不足内容と既存test候補を返し，元の依頼を維持して再試行します．暫定上限は30回であり，実測で妥当性を確立した値ではありません．各回の出力，失敗理由，選択結果と回数はprivate stateへ保存します．受理済みの追加codeは保持し，byte予算が満杯なら自動追加を止めます．実際のcode確認，許可scope，既存test，sourceと権限の検査は回数を増やしても省略しません．上限到達は成功扱いにせず失敗を通知します．
+
 discoveryは既存file全体をcontrolの出力として再生成させず，scope内のpathごとに`[{"old":"完全一致する一意な部分文字列","new":"置換後"}]`または`[{"append":"追加test"}]`という小さな編集を受け取ります．controllerが元のsourceへ展開し，曖昧な一致，scope外，未知fieldを拒否します．既存のassertionを残した回帰testの追加を必須にします．選択したmodelの`apply-template`と`tokenize`で実際の入力token数を測り，4096 completion tokenを予約できない入力は生成前に停止します．切り詰めて続行しません．
 
 固定checkerのargvは`["{python}","-I","{checker}","{candidate}"]`とします．`-I`でcandidate由来の`ast.py`などによる標準libraryの乗っ取りを防ぎ，scope／assertion／authority guardを通過した後だけcandidateのimport pathを追加します．control実行も同じargvを使います．

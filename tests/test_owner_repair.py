@@ -1250,7 +1250,7 @@ def test_discovery_queue_exhaustion_retains_responses_and_public_explanation(tmp
     directory = tmp_path / "private"
     with pytest.raises(GateFailure, match="discovery_scope_exhausted"):
         discovery.select_scope({"text": "fixture private directive", "previous": "fixture previous"}, templates, inventories, directory)
-    assert len(list(directory.glob("*.response.json"))) == len(list(directory.glob("*.validation.json"))) == 3
+    assert len(list(directory.glob("*.response.json"))) == len(list(directory.glob("*.validation.json"))) == 30
     def fail(*_):
         raise GateFailure("discovery_scope_exhausted")
     config = SimpleNamespace(state_dir=tmp_path / "state", guild_id=11, channel_ids=(20,))
@@ -1359,7 +1359,7 @@ def test_context_review_oversized_read_more_is_atomic_and_preserves_accepted_con
             inventories["ephy-worker"].append(name)
             names.append(name)
         groups.append(names)
-    responses = iter([{"read_more": {"ephy-worker": groups[0]}}, {"read_more": {"ephy-worker": groups[1]}}, {}])
+    responses = iter([{"read_more": {"ephy-worker": groups[0]}}, {"read_more": {"ephy-worker": groups[1]}}, {}] + [{}] * 27)
     prompts = []
     def complete(prompt, _runtime):
         prompts.append(json.loads(prompt))
@@ -1474,3 +1474,90 @@ def test_preflight_review_direct_scope_rejects_linked_parent_before_read_or_infe
     with pytest.raises(GateFailure, match="Link/reparse point prohibited"):
         discovery.select_scope({"text": "Improve fixture feature", "previous": None},
             {"ephy-worker": {"runtime": {}}}, {"ephy-worker": ["src/ephy_worker/feature.py"]}, tmp_path / "private")
+
+
+def test_discovery_loop_recovers_after_three_with_shape_and_missing_test_feedback(tmp_path, monkeypatch):
+    discovery, templates, inventories, selected = _discovery_queue_scope_fixture(tmp_path)
+    missing_tests = {**selected, "allowed_files": [inventories["ephy-worker"][0]]}
+    mixed = {**selected, "read_more": {"ephy-worker": [inventories["ephy-worker"][0]]}}
+    responses = iter([{"files": selected["allowed_files"]}, missing_tests, mixed,
+        {"read_more": {"ephy-worker": [inventories["ephy-worker"][0]]}}, selected])
+    prompts = []
+    def complete(prompt, runtime):
+        prompts.append(json.loads(prompt))
+        assert "oneOf" in runtime["discovery_response_schema"]
+        return next(responses)
+    monkeypatch.setattr(discovery, "completion", complete)
+    job = {"text": "Improve fixture search behavior", "previous": "Fixture prior answer"}
+    directory = tmp_path / "private"
+    assert discovery.select_scope(job, templates, inventories, directory) == selected
+    assert len(prompts) == 5
+    assert all(prompt["request"] == job["text"] and prompt["previous_answer"] == job["previous"] for prompt in prompts)
+    assert json.loads(prompts[1]["previous_model_output"]["text"]) == {"files": selected["allowed_files"]}
+    assert "Do not mix" in prompts[1]["correction"]
+    assert prompts[2]["previous_selection_error"] == "discovery_scope_protected_or_missing_tests"
+    assert prompts[2]["existing_test_files"]["ephy-worker"] == ["tests/test_search.py"]
+    assert "existing tests/ file" in prompts[2]["correction"]
+    assert json.loads(prompts[2]["previous_model_output"]["text"]) == missing_tests
+    assert prompts[3]["previous_selection_error"] == "discovery_scope_empty_or_invalid"
+    outcome = json.loads((directory / "scope-attempt-5.validation.json").read_bytes())
+    assert outcome == {"outcome": "selected", "round": 5, "provisional_round_limit": 30}
+    assert len(list(directory.glob("*.response.json"))) == len(list(directory.glob("*.validation.json"))) == 5
+    assert "discovery_response_schema" not in templates["ephy-worker"]["runtime"]
+
+
+def test_discovery_loop_parse_feedback_retains_raw_and_bounds_utf8(tmp_path, monkeypatch):
+    discovery, templates, inventories, selected = _discovery_queue_scope_fixture(tmp_path)
+    prompts = []
+    content = "```json\n" + "日本語" * 5000 + "\n```"
+    def complete(prompt, _runtime):
+        prompts.append(json.loads(prompt))
+        if len(prompts) == 1:
+            discovery.response_path.write_text(json.dumps({"choices": [{"message": {"content": content}}]},
+                ensure_ascii=False), encoding="utf-8")
+            raise ValueError("fixture strict JSON parse failure")
+        return selected
+    monkeypatch.setattr(discovery, "completion", complete)
+    directory = tmp_path / "private"
+    assert discovery.select_scope({"text": "Improve search", "previous": None}, templates, inventories, directory) == selected
+    previous = prompts[1]["previous_model_output"]
+    assert previous["representation"] == "raw_http_response" and previous["truncated"] is True
+    assert "```json" in previous["text"] and 0 < len(previous["text"].encode("utf-8")) <= 8192
+    assert previous["utf8_bytes"] > 8192 and "without fences" in prompts[1]["correction"]
+    assert json.loads((directory / "scope-attempt-1.raw.json").read_bytes())["choices"][0]["message"]["content"] == content
+
+
+@pytest.mark.parametrize("read_more", [False, True])
+def test_discovery_loop_http_uses_exclusive_json_schema_for_both_shapes(tmp_path, monkeypatch, read_more):
+    from jsonschema import Draft7Validator
+
+    discovery, templates, inventories, selected = _discovery_queue_scope_fixture(tmp_path)
+    identity = tmp_path / "identity.json"
+    identity.write_text(json.dumps({"context": 32768, "model_id": "fixture-model"}), encoding="utf-8")
+    templates["ephy-worker"]["runtime"] = {"models_ini": str(identity), "base_url": "http://127.0.0.1:18080"}
+    monkeypatch.setitem(sys.modules, "ephy_worker.existing_llama_runtime", SimpleNamespace(verify_identity=lambda _: None))
+    formats = []
+    request_more = {"read_more": {"ephy-worker": [inventories["ephy-worker"][0]]}}
+    def handler(request):
+        body = json.loads(request.content)
+        if request.url.path == "/apply-template":
+            return httpx.Response(200, json={"prompt": "fixture formatted prompt"})
+        if request.url.path == "/tokenize":
+            return httpx.Response(200, json={"tokens": [1, 2, 3]})
+        assert request.url.path == "/v1/chat/completions"
+        formats.append(body["response_format"])
+        contract = body["response_format"]
+        assert contract["type"] == "json_schema"
+        assert contract["json_schema"]["name"] == "discovery_scope" and contract["json_schema"]["strict"] is True
+        validator = Draft7Validator(contract["json_schema"]["schema"])
+        assert validator.is_valid(selected) and validator.is_valid(request_more)
+        assert not validator.is_valid({**selected, **request_more})
+        assert not validator.is_valid({k: v for k, v in selected.items() if k != "semantic_scope"})
+        assert not validator.is_valid({"read_more": {"unregistered": ["src/feature.py"]}})
+        response = request_more if read_more and len(formats) == 1 else selected
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(response)}}]})
+    actual_client = httpx.Client
+    monkeypatch.setattr("ephy_worker.owner_repair_discovery.httpx.Client", lambda **kwargs:
+        actual_client(transport=httpx.MockTransport(handler), **kwargs))
+    assert discovery.select_scope({"text": "Improve search", "previous": None}, templates, inventories, tmp_path / "private") == selected
+    assert len(formats) == (2 if read_more else 1)
