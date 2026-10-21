@@ -1408,3 +1408,69 @@ def test_discovery_json_http_request_format_and_strict_raw_evidence(tmp_path, mo
     assert raw["choices"][0]["message"]["content"] == content
     assert calls[-1][1]["messages"] == calls[0][1]["messages"]
     assert calls[-1][1]["max_tokens"] == 4096 and calls[-1][1]["stream"] is False
+
+
+@pytest.mark.parametrize("fault,expected", [("origin", "discovery_origin_changed"),
+    ("dirty", "registered_source_not_clean"), ("snapshot", "fixture unsafe snapshot")])
+def test_preflight_review_all_registered_sources_checked_before_scope(tmp_path, monkeypatch, fault, expected):
+    from ephy_worker.formal_artifacts import GateFailure, file_hash, write_json
+
+    profiles = {}
+    for alias in ("ephy-worker", "ephy-runtime"):
+        source = tmp_path / alias
+        source.mkdir()
+        template = tmp_path / (alias + ".json")
+        write_json(template, {"runtime": {}})
+        profiles[alias] = SimpleNamespace(source=source, formal_template=template,
+            formal_template_sha256=file_hash(template), allowed_prefixes=("src/",),
+            origin="https://github.com/kirimine170/" + alias + ".git")
+    discovery = LocalDiscovery(SimpleNamespace(repositories=profiles))
+    checked = []
+    def git(root, *args):
+        alias = root.name
+        checked.append((alias, args[0]))
+        if args[0] == "remote":
+            return ("https://example.invalid/replacement.git" if alias == "ephy-runtime" and fault == "origin"
+                else profiles[alias].origin).encode()
+        if args[0] == "status":
+            return b" M src/feature.py" if alias == "ephy-runtime" and fault == "dirty" else b""
+        assert args == ("ls-files",)
+        return b"src/feature.py\n"
+    def safe_snapshot(root):
+        checked.append((root.name, "snapshot"))
+        if root.name == "ephy-runtime" and fault == "snapshot":
+            raise GateFailure("fixture unsafe snapshot")
+        return {}
+    def unexpected(*_):
+        pytest.fail("scope selection/inference ran before registered-source preflight")
+    monkeypatch.setattr(discovery, "_git", git)
+    monkeypatch.setattr("ephy_worker.owner_repair_discovery.snapshot", safe_snapshot)
+    monkeypatch.setattr(discovery, "select_scope", unexpected)
+    monkeypatch.setattr(discovery, "completion", unexpected)
+    with pytest.raises(GateFailure, match=expected):
+        discovery.prepare({"text": "Improve fixture feature", "previous": None}, tmp_path / "private")
+    assert ("ephy-worker", "snapshot") in checked and ("ephy-runtime", "remote") in checked
+
+
+def test_preflight_review_direct_scope_rejects_linked_parent_before_read_or_inference(tmp_path, monkeypatch):
+    from ephy_worker.formal_artifacts import GateFailure
+
+    source = tmp_path / "source"
+    (source / "src").mkdir(parents=True)
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    (replacement / "feature.py").write_text("def fixture_replacement():\n    return 42\n", encoding="utf-8")
+    link = source / "src/ephy_worker"
+    if os.name == "nt":
+        subprocess.run(["cmd.exe", "/c", "mklink", "/J", str(link), str(replacement)],
+            capture_output=True, check=True, timeout=10)
+    else:
+        link.symlink_to(replacement, target_is_directory=True)
+    profile = SimpleNamespace(source=source, allowed_prefixes=("src/",))
+    discovery = LocalDiscovery(SimpleNamespace(repositories={"ephy-worker": profile}))
+    def unexpected(*_):
+        pytest.fail("linked replacement reached inference")
+    monkeypatch.setattr(discovery, "completion", unexpected)
+    with pytest.raises(GateFailure, match="Link/reparse point prohibited"):
+        discovery.select_scope({"text": "Improve fixture feature", "previous": None},
+            {"ephy-worker": {"runtime": {}}}, {"ephy-worker": ["src/ephy_worker/feature.py"]}, tmp_path / "private")

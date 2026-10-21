@@ -11,7 +11,16 @@ from pathlib import Path
 
 import httpx
 
-from .formal_artifacts import CONTROL_PATHS, GateFailure, digest, encode, file_hash, read_json, write_json
+from .formal_artifacts import (
+    CONTROL_PATHS,
+    GateFailure,
+    digest,
+    encode,
+    file_hash,
+    read_json,
+    safe_path,
+    write_json,
+)
 from .formal_runtime import (
     command_environment,
     injected_context_pins,
@@ -584,8 +593,10 @@ class LocalDiscovery:
         for alias, names in inventories.items():
             for name in names:
                 profile = self.config.repositories[alias]
-                path = profile.source / name
-                if not allowed_name(name, profile) or not path.is_file() or path.is_symlink() or path.stat().st_size > 131072:
+                if not allowed_name(name, profile):
+                    continue
+                path = safe_path(profile.source, name, missing=True)
+                if not path.is_file() or path.is_symlink() or path.stat().st_size > 131072:
                     continue
                 text = path.read_text(encoding="utf-8")
                 score = sum(5 * (term in name.casefold()) + min(text.casefold().count(term), 4) for term in terms)
@@ -721,7 +732,13 @@ class LocalDiscovery:
                 raise GateFailure("formal_template_changed")
             templates[alias] = read_json(profile.formal_template)
         inventories = {}
+        preflight_snapshots = {}
         for alias, profile in self.config.repositories.items():
+            if self._git(profile.source, "remote", "get-url", "origin").decode().strip() != profile.origin:
+                raise GateFailure("discovery_origin_changed")
+            if self._git(profile.source, "status", "--porcelain", "--untracked-files=all").strip():
+                raise GateFailure("registered_source_not_clean")
+            preflight_snapshots[alias] = snapshot(profile.source)
             raw = self._git(profile.source, "ls-files").decode("utf-8").splitlines()
             inventories[alias] = [name for name in raw if allowed_name(name, profile)]
         initial = self.select_scope(job, templates, inventories, directory)
@@ -742,6 +759,8 @@ class LocalDiscovery:
             raise GateFailure("registered_source_not_clean")
         base = self._git(profile.source, "rev-parse", "HEAD").decode().strip()
         original_snapshot = snapshot(profile.source)
+        if original_snapshot != preflight_snapshots[alias]:
+            raise GateFailure("discovery_source_changed")
         preserve_collection_scope(names, original_snapshot)
         sources = {}
         for name in names:
