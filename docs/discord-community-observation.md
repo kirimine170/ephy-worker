@@ -17,3 +17,7 @@ Discord bridgeではprivate TOMLに`community_guild_ids = [123]`を追加したg
 設定したguildでは「昨日の議論をまとめて」「昨日みんなが話していた件の結論は？」など，サーバー名を省略した議論／話題／結論の依頼もprivateな観測へ渡します．公開資料，公式ドキュメント，ニュースなどの明示的な公開調査は，このサーバーを参照していない場合に従来のweb調査へ渡します．
 
 回答生成の総時間とpoll回数には上限を設けません．pending応答には，実作業の進捗番号`progress_seq`と`phase`（submitting／collecting／analyzing／rendering）が必要です．進捗番号が増えない状態が`read_idle_timeout_seconds`続いた場合だけ，進捗停止を明示して待機を終了します．poll応答が返ること自体は進捗に数えず，実際の収集やmodel生成が進んでいる間は，合計時間がidle時間を超えても回答を待ち続けます．
+
+idleの残り時間は，各HTTP応答のheader待機とJSON本文全体の読取りにも適用します．keepaliveのbyteだけが届き続けても待機を延長せず，停止時には応答を閉じ，待機中の次の依頼へ進みます．完了した応答の実進捗番号が増えた場合はidleを更新するため，正常に進んでいる生成の総時間を制限しません．
+
+primary guild／channelのowner依頼は，communityの語句に一致していても，必ず既存のdurable intakeへ保存して修正／会話の分類を先に行います．修正と分類した依頼は既存の修正queueへ，会話と分類したcommunity依頼はprivateな観測へ渡します．他の利用者や追加guild／channelに修正権限を与える変更はありません．

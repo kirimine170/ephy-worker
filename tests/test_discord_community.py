@@ -197,3 +197,137 @@ async def test_contextual_local_discussion_inbox_never_uses_public_search(tmp_pa
     assert sent[0] == RECEIPT and len(sent) == 2
     assert gateway.calls == [(query, {"request_id": "100", "guild_id": "11", "channel_id": "20",
         "operation": "discussion", "period_days": 7})]
+
+
+@pytest.mark.parametrize("repair", [True, False])
+async def test_primary_owner_is_captured_and_classified_before_community_route(tmp_path, monkeypatch, repair):
+    from ephy_worker.owner_repair import RepairStore
+    monkeypatch.setattr("ephy_worker.owner_repair.OWNER_USER_ID", 30)
+    query = "未解決の修正タスクを直して" if repair else "昨日の秘密の議論をまとめて"
+    config, calls, sent = settings(tmp_path), [], []
+    class Gateway:
+        async def classify_repair(self, question, previous):
+            with bridge.repairs.db() as db:
+                captured = db.execute("SELECT text,receipt FROM intakes").fetchall()
+            assert len(captured) == 1 and captured[0]["text"] == query and captured[0]["receipt"] == 1
+            calls.append(("classify", question))
+            return repair
+        async def observe(self, question, previous=None, **kwargs):
+            calls.append(("observe", question))
+            assert kwargs == {"request_id": "100", "guild_id": "11", "channel_id": "20",
+                "operation": "discussion", "period_days": 7}
+            return "わたしが確認した範囲の議論です．"
+        async def answer(self, *args):
+            raise AssertionError("private owner community conversation must not reach public search")
+    bridge = RuntimeDiscordBridge(config, Gateway(), BridgeLedger(config))
+    bridge.repairs = RepairStore(tmp_path / "repairs")
+    async def send(text):
+        sent.append(text)
+        return 1000 + len(sent)
+    event = DiscordEvent(100, 11, 20, 30, "<@10> " + query, mentioned=True)
+    await bridge.handle(event, send)
+    with bridge.repairs.db() as db:
+        assert db.execute("SELECT count(*) FROM intakes WHERE done=1").fetchone()[0] == 1
+        assert db.execute("SELECT count(*) FROM jobs").fetchone()[0] == int(repair)
+    if repair:
+        assert calls == [("classify", query)]
+        assert bridge.repairs.next()["text"] == query
+        assert "修正依頼として受け付けました" in sent[-1]
+    else:
+        assert calls == [("classify", query), ("observe", query)]
+        assert "議論です" in sent[-1] and bridge.repairs.next() is None
+    assert sent[0] == RECEIPT
+    await bridge.handle(event, send)
+    assert len(calls) == (1 if repair else 2)
+
+
+async def test_other_users_and_secondary_guild_cannot_enter_owner_repair(tmp_path, monkeypatch):
+    from ephy_worker.owner_repair import RepairStore
+    monkeypatch.setattr("ephy_worker.owner_repair.OWNER_USER_ID", 30)
+    config = settings(tmp_path, additional_channels=({"guild_id": 12, "channel_id": 21},)).model_copy(
+        update={"allowed_user_ids": (30, 31), "community_guild_ids": (11, 12)})
+    observed = []
+    class Gateway:
+        async def classify_repair(self, *args):
+            raise AssertionError("repair classification is restricted to the primary owner scope")
+        async def observe(self, question, previous=None, **kwargs):
+            observed.append(kwargs)
+            return "わたしが確認した未解決項目の記録です．"
+        async def answer(self, *args):
+            raise AssertionError("community request must stay private")
+    bridge = RuntimeDiscordBridge(config, Gateway(), BridgeLedger(config))
+    bridge.repairs = RepairStore(tmp_path / "repairs")
+    async def send(text):
+        return 1000
+    await bridge.handle(DiscordEvent(100, 11, 20, 31, "<@10> 未解決の修正タスクを直して", mentioned=True), send)
+    await bridge.handle(DiscordEvent(101, 12, 21, 30, "<@10> 未解決の修正タスクを直して", mentioned=True), send)
+    assert len(observed) == 2
+    with bridge.repairs.db() as db:
+        assert db.execute("SELECT count(*) FROM intakes").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("chunk", [b" ", b": keepalive\n\n", b'{"discord_observe_status":'])
+async def test_endless_response_body_stalls_closes_and_releases_next_inbox_request(tmp_path, chunk):
+    class Keepalive(httpx.AsyncByteStream):
+        def __init__(self):
+            self.started, self.closed, self.chunks = asyncio.Event(), False, 0
+        async def __aiter__(self):
+            self.started.set()
+            while True:
+                await asyncio.sleep(0.02)
+                self.chunks += 1
+                yield chunk
+        async def aclose(self):
+            self.closed = True
+    stream, calls = Keepalive(), []
+    async def fixture(request):
+        assert request.url.path == "/v1/discord/observe"
+        data = json.loads(request.content)
+        calls.append(data["request_id"])
+        if data["request_id"] == "100":
+            return httpx.Response(202, stream=stream)
+        return httpx.Response(200, json={"discord_observe_status": status(request_id="101", job_id="observation2"),
+            "choices": [{"message": {"content": "わたしは次の依頼の議論を確認しました．"}}]})
+    config = settings(tmp_path, read_idle_timeout_seconds=1)
+    gateway = RuntimeGateway(config, transport=httpx.MockTransport(fixture))
+    bridge, sent = RuntimeDiscordBridge(config, gateway, BridgeLedger(config)), []
+    async def send(text):
+        sent.append(text)
+        return 1000 + len(sent)
+    event = DiscordEvent(100, 11, 20, 30, "<@10> 昨日の議論をまとめて", mentioned=True)
+    first = asyncio.create_task(bridge.handle(event, send))
+    try:
+        await asyncio.wait_for(stream.started.wait(), timeout=1)
+        await bridge.handle(DiscordEvent(101, 11, 20, 30, "<@10> 最近の議論をまとめて", mentioned=True), send)
+        await asyncio.wait_for(first, timeout=3)
+        assert stream.closed and stream.chunks > 1
+        assert calls == ["100", "101"]
+        assert any("進捗を一定時間確認できなかった" in text for text in sent)
+        assert any("次の依頼の議論" in text for text in sent)
+        assert bridge.inflight == 0 and not bridge.inbox_lock.locked() and not bridge.ledger.inbox_pending()
+        await bridge.handle(event, send)
+        assert calls == ["100", "101"]
+    finally:
+        if not first.done():
+            first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
+        await gateway.aclose()
+
+
+async def test_header_wait_is_bounded_by_remaining_semantic_idle(tmp_path):
+    cancelled = asyncio.Event()
+    async def fixture(request):
+        try:
+            await asyncio.sleep(30)
+            return httpx.Response(202, json={"discord_observe_status": status(status="pending")})
+        finally:
+            cancelled.set()
+    gateway = RuntimeGateway(settings(tmp_path, read_idle_timeout_seconds=1), transport=httpx.MockTransport(fixture))
+    try:
+        with pytest.raises(BridgeError, match="runtime_observation_stalled"):
+            await asyncio.wait_for(gateway.observe("昨日の議論をまとめて", request_id="100", guild_id="11",
+                channel_id="20", operation="discussion", period_days=7), timeout=3)
+        assert cancelled.is_set()
+    finally:
+        await gateway.aclose()

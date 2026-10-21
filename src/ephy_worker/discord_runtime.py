@@ -427,6 +427,18 @@ class RuntimeGateway:
                 await self._cancel(plan_id)
             raise
 
+    async def _observe_response(self, payload: dict, remaining_idle: float) -> tuple[int, dict]:
+        try:
+            async with asyncio.timeout(remaining_idle):
+                timeout = httpx.Timeout(connect=10, read=self.settings.read_idle_timeout_seconds, write=30, pool=30)
+                async with self.client.stream("POST", self.settings.runtime_url + "/v1/discord/observe",
+                        json=payload, timeout=timeout) as response:
+                    if response.status_code not in {200, 202}:
+                        raise BridgeError("runtime_request_failed")
+                    return response.status_code, await self._json(response)
+        except TimeoutError:
+            raise BridgeError("runtime_observation_stalled") from None
+
     async def observe(self, query: str, previous_answer: str | None = None, *, request_id: str,
                       guild_id: str, channel_id: str, operation: str, period_days: int) -> str:
         if (int(guild_id) not in self.settings.community_guild_ids
@@ -444,53 +456,51 @@ class RuntimeGateway:
         last_progress = time.monotonic()
         while True:
             try:
-                timeout = httpx.Timeout(connect=10, read=self.settings.read_idle_timeout_seconds, write=30, pool=30)
-                async with self.client.stream("POST", self.settings.runtime_url + "/v1/discord/observe",
-                        json=payload, timeout=timeout) as response:
-                    if response.status_code not in {200, 202}:
-                        raise BridgeError("runtime_request_failed")
-                    data = await self._json(response)
-                    status = data.get("discord_observe_status")
-                    if (not isinstance(status, dict) or status.get("provider") != "worker"
-                            or status.get("contract") != "0.4" or status.get("request_id") != request_id):
-                        raise BridgeError("runtime_observation_identity_mismatch")
-                    for name in ("job_id", "input_hash"):
-                        value = status.get(name)
-                        if value is None and name not in bound and response.status_code == 202:
-                            continue
-                        if (not isinstance(value, str) or not _ID.fullmatch(value)
-                                or name == "input_hash" and not re.fullmatch(r"[0-9a-f]{64}", value)
-                                or name in bound and bound[name] != value):
-                            raise BridgeError("runtime_observation_identity_mismatch")
-                        bound[name] = value
-                    actual_worker = status.get("worker_id")
-                    if actual_worker is not None:
-                        if (not isinstance(actual_worker, str) or actual_worker == "auto"
-                                or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", actual_worker)
-                                or worker_id is not None and worker_id != actual_worker):
-                            raise BridgeError("runtime_observation_identity_mismatch")
-                        worker_id = actual_worker
-                    if response.status_code == 202:
-                        if status.get("status") != "pending":
-                            raise BridgeError("runtime_observation_identity_mismatch")
-                        sequence = status.get("progress_seq")
-                        if (type(sequence) is not int or sequence < 0 or sequence < progress_seq
-                                or status.get("phase") not in {"submitting", "collecting", "analyzing", "rendering"}):
-                            raise BridgeError("runtime_observation_progress_invalid")
-                        now = time.monotonic()
-                        if sequence > progress_seq:
-                            progress_seq, last_progress = sequence, now
-                        elif now - last_progress >= self.settings.read_idle_timeout_seconds:
-                            raise BridgeError("runtime_observation_stalled")
-                        await asyncio.sleep(self.settings.poll_interval_seconds)
+                remaining_idle = self.settings.read_idle_timeout_seconds - (time.monotonic() - last_progress)
+                if remaining_idle <= 0:
+                    raise BridgeError("runtime_observation_stalled")
+                response_status, data = await self._observe_response(payload, remaining_idle)
+                status = data.get("discord_observe_status")
+                if (not isinstance(status, dict) or status.get("provider") != "worker"
+                        or status.get("contract") != "0.4" or status.get("request_id") != request_id):
+                    raise BridgeError("runtime_observation_identity_mismatch")
+                for name in ("job_id", "input_hash"):
+                    value = status.get(name)
+                    if value is None and name not in bound and response_status == 202:
                         continue
-                    if (status.get("status") not in {"completed", "partial"} or worker_id is None
-                            or status.get("analysis_status") not in {"verified", "unverified"}):
-                        raise BridgeError("runtime_observation_not_completed")
-                    try:
-                        return safe_final(data["choices"][0]["message"]["content"], self.secrets)
-                    except (KeyError, IndexError, TypeError):
-                        raise BridgeError("runtime_answer_invalid") from None
+                    if (not isinstance(value, str) or not _ID.fullmatch(value)
+                            or name == "input_hash" and not re.fullmatch(r"[0-9a-f]{64}", value)
+                            or name in bound and bound[name] != value):
+                        raise BridgeError("runtime_observation_identity_mismatch")
+                    bound[name] = value
+                actual_worker = status.get("worker_id")
+                if actual_worker is not None:
+                    if (not isinstance(actual_worker, str) or actual_worker == "auto"
+                            or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", actual_worker)
+                            or worker_id is not None and worker_id != actual_worker):
+                        raise BridgeError("runtime_observation_identity_mismatch")
+                    worker_id = actual_worker
+                if response_status == 202:
+                    if status.get("status") != "pending":
+                        raise BridgeError("runtime_observation_identity_mismatch")
+                    sequence = status.get("progress_seq")
+                    if (type(sequence) is not int or sequence < 0 or sequence < progress_seq
+                            or status.get("phase") not in {"submitting", "collecting", "analyzing", "rendering"}):
+                        raise BridgeError("runtime_observation_progress_invalid")
+                    now = time.monotonic()
+                    if sequence > progress_seq:
+                        progress_seq, last_progress = sequence, now
+                    elif now - last_progress >= self.settings.read_idle_timeout_seconds:
+                        raise BridgeError("runtime_observation_stalled")
+                    await asyncio.sleep(self.settings.poll_interval_seconds)
+                    continue
+                if (status.get("status") not in {"completed", "partial"} or worker_id is None
+                        or status.get("analysis_status") not in {"verified", "unverified"}):
+                    raise BridgeError("runtime_observation_not_completed")
+                try:
+                    return safe_final(data["choices"][0]["message"]["content"], self.secrets)
+                except (KeyError, IndexError, TypeError):
+                    raise BridgeError("runtime_answer_invalid") from None
             except (httpx.HTTPError, ValueError, UnicodeError):
                 raise BridgeError("runtime_unavailable_or_invalid_response") from None
 
@@ -780,7 +790,7 @@ class RuntimeDiscordBridge:
             community = event.guild_id in self.settings.community_guild_ids and community_intent(question)
             self.ledger.check_admission(event.message_id)
             intake = None
-            if owner_route and not community:
+            if owner_route:
                 # Local durable capture precedes the first receipt/model/network await．
                 intake = self.repairs.capture_intake(guild_id=event.guild_id, channel_id=event.channel_id,
                     message_id=event.message_id, author_id=event.user_id, text=question, previous_answer=previous)
@@ -968,15 +978,23 @@ class RuntimeDiscordBridge:
                     await send("修正依頼として受け付けました．修正，テストと独立レビューを進め，"
                         "条件を満たしたら本番への反映と再起動まで行います．受付番号：" + job)
                 return
-            try:
-                validate_public_text(row["text"], max_chars=4000)
-            except QueryPrivacyError:
-                raise BridgeError("question_not_public") from None
+            from .discord_community import community_intent
+            intent = community_intent(row["text"]) if int(row["guild"]) in self.settings.community_guild_ids else None
+            if not intent:
+                try:
+                    validate_public_text(row["text"], max_chars=4000)
+                except QueryPrivacyError:
+                    raise BridgeError("question_not_public") from None
             if not self.ledger.claim(int(row["message"])):
                 self.repairs.update_intake(identifier, self.intake_consumer, done=True)
                 await send(_INTERRUPTED)
                 return
-            task = asyncio.create_task(self.gateway.answer(row["text"], row["previous"]))
+            if intent:
+                task = asyncio.create_task(self.gateway.observe(row["text"], row["previous"],
+                    request_id=row["message"], guild_id=row["guild"], channel_id=row["channel"],
+                    operation=intent.operation, period_days=intent.period_days))
+            else:
+                task = asyncio.create_task(self.gateway.answer(row["text"], row["previous"]))
             done, _ = await asyncio.wait({task}, timeout=self.progress_seconds)
             if not done:
                 await send(PROGRESS)
