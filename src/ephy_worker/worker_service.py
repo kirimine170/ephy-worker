@@ -421,7 +421,7 @@ class WorkerService:
         pack_ref = await self._upload_result_pack(job_id, lease_token, envelope)
         envelope.manifest = [*envelope.manifest, pack_ref]
         try:
-            await self.client.finalize_job(self.worker_id, job_id, lease_token, envelope.model_dump())
+            await self.client.finalize_job(self.worker_id, job_id, lease_token, envelope.model_dump(mode="json"))
         except ManagerAPIError as exc:
             if cancel_fallback and exc.code == "result_conflicts_with_cancel":
                 # request 側の cancel が lease 更新の観測より先に入った競合：
@@ -429,7 +429,7 @@ class WorkerService:
                 fallback = envelope.model_copy(
                     update={"status": "cancelled", "stop_reason": "cancelled_by_requester"}
                 )
-                await self.client.finalize_job(self.worker_id, job_id, lease_token, fallback.model_dump())
+                await self.client.finalize_job(self.worker_id, job_id, lease_token, fallback.model_dump(mode="json"))
             else:
                 raise
 
