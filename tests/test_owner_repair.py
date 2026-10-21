@@ -1820,8 +1820,12 @@ def _native_tests_run_emitted(tmp_path, original, appended, profile):
     checker = directory / "checker.py"
     checker.write_text("import ast\n" + inspect.getsource(authority_fingerprint) + "\n"
         + inspect.getsource(preserve_original_tests) + "\n" + _CHECKER, encoding="utf-8")
+    environment = dict(os.environ)
+    temporary = tmp_path / "trusted-emitted-temp"
+    temporary.mkdir()
+    environment.update({name: str(temporary) for name in ("TEMP", "TMP", "TMPDIR")})
     result = subprocess.run([sys.executable, "-I", "-X", "utf8", "-B", str(checker), str(candidate)],
-        capture_output=True, text=True, encoding="utf-8", timeout=30, check=False)
+        env=environment, capture_output=True, text=True, encoding="utf-8", timeout=30, check=False)
     return result, marker, test
 
 
@@ -2197,3 +2201,107 @@ def test_replan_v7_changed_or_missing_checker_resets_failed_repetition(tmp_path,
     assert all(not prompt["previous_attempt"]["checker_repetition"]["fresh_strategy_required"] for prompt in prompts[1:])
     assert all(prompt["request"] == args[0]["text"] and prompt["source"] == args[7] for prompt in prompts)
     assert len(calls) == (25 if changed == "different_checker" else 20)
+
+
+@pytest.mark.parametrize("invoke", ["getattr(pytest, 'skip')('fixture dynamic skip')",
+    "pytest.__dict__['skip']('fixture dictionary skip')"])
+def test_outcomes_v8_dynamic_skip_rejected_by_actual_native_test_result(tmp_path, monkeypatch, invoke):
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    original = "def test_original():\n    assert True\n"
+    appended = "\ndef test_dynamic_skip():\n    import pytest\n    " + invoke + "\n"
+    # Ordinary dynamic access still passes the static native-body guard．
+    preserve_original_tests(original, original + appended, (), profile)
+    result, marker, _ = _native_tests_run_emitted(tmp_path, original, appended, profile)
+    assert result.returncode != 0 and marker.exists()
+    assert "native_added_tests_not_passed" in result.stderr and "1 skipped" in result.stdout
+    summary = json.loads(next(line.split("=", 1)[1] for line in result.stdout.splitlines()
+        if line.startswith("native_added_test_outcomes=")))
+    assert summary["invalid"] == ["case_not_passed"]
+    assert next(iter(summary["reports"].values()))["setup"] == "passed"
+    assert next(iter(summary["reports"].values()))["call"] == "skipped"
+
+
+@pytest.mark.parametrize("fault", ["setup_skip", "teardown_fail", "runtime_xfail", "missing_fixture"])
+def test_outcomes_v8_requires_every_native_case_phase_to_pass(tmp_path, monkeypatch, fault):
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    original = "import pytest\n\ndef test_original():\n    assert True\n"
+    if fault == "setup_skip":
+        original += "\n@pytest.fixture\ndef existing_fixture():\n    pytest.skip('fixture unavailable')\n"
+    elif fault == "teardown_fail":
+        original += "\n@pytest.fixture\ndef existing_fixture():\n    yield 1\n    raise AssertionError('fixture teardown failed')\n"
+    parameter = "existing_fixture" if fault in {"setup_skip", "teardown_fail", "missing_fixture"} else ""
+    body = "    assert True\n" if fault != "runtime_xfail" else "    getattr(pytest, 'xfail')('fixture expected failure')\n"
+    appended = "\ndef test_phase(" + parameter + "):\n" + body
+    preserve_original_tests(original, original + appended, (), profile)
+    result, marker, _ = _native_tests_run_emitted(tmp_path, original, appended, profile)
+    assert result.returncode != 0 and marker.exists() and "native_added_tests_not_passed" in result.stderr
+    summary = json.loads(next(line.split("=", 1)[1] for line in result.stdout.splitlines()
+        if line.startswith("native_added_test_outcomes=")))
+    assert "case_not_passed" in summary["invalid"] and len(summary["collected"]) == 1
+    phases = next(iter(summary["reports"].values()))
+    assert phases.get("setup") == ("skipped" if fault == "setup_skip" else "failed" if fault == "missing_fixture" else "passed")
+    if fault == "teardown_fail":
+        assert phases["call"] == "passed" and phases["teardown"] == "failed"
+    if fault == "runtime_xfail":
+        assert phases["call"] == "skipped"
+
+
+def test_outcomes_v8_valid_dynamic_sync_async_fixture_cases_pass_without_original_suite(tmp_path, monkeypatch):
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    original = ("from pathlib import Path\nimport pytest\n\nclass Feature:\n"
+        "    def answer(self, value):\n        return value + 1\n"
+        "\n@pytest.fixture(params=[1, 2])\ndef existing_value(request):\n    return request.param\n"
+        "\ndef test_original():\n    raise AssertionError('original suite must not run here')\n")
+    appended = ("\ndef test_dynamic(tmp_path: Path, existing_value: int) -> None:\n"
+        "    path = tmp_path / 'answer.txt'\n    path.write_text(str(getattr(Feature(), 'answer')(existing_value)))\n"
+        "    assert int(path.read_text()) == existing_value + 1\n"
+        "\n@pytest.mark.asyncio\nasync def test_async(tmp_path: Path) -> None:\n"
+        "    import asyncio\n    await asyncio.sleep(0)\n    path = tmp_path / 'async.txt'\n"
+        "    path.write_text('done')\n    assert path.read_text() == 'done'\n")
+    preserve_original_tests(original, original + appended, (), profile)
+    result, marker, test = _native_tests_run_emitted(tmp_path, original, appended, profile)
+    assert result.returncode == 0 and marker.exists(), result.stdout + result.stderr
+    summary = json.loads(next(line.split("=", 1)[1] for line in result.stdout.splitlines()
+        if line.startswith("native_added_test_outcomes=")))
+    assert len(summary["collected"]) == 3 and summary["invalid"] == []
+    assert all(phases == {"setup": "passed", "call": "passed", "teardown": "passed"} for phases in summary["reports"].values())
+    assert all("test_original" not in name for name in summary["collected"])
+    assert test.read_text() == original + appended and not list(test.parent.rglob("__pycache__"))
+
+
+def test_outcomes_v8_no_added_tests_preserves_original_acceptance_baseline(tmp_path, monkeypatch):
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    original = "def test_original():\n    raise AssertionError('not an appended regression')\n"
+    result, marker, test = _native_tests_run_emitted(tmp_path, original, "", profile)
+    assert result.returncode == 0 and marker.exists() and "native_added_test_outcomes=" not in result.stdout
+    # No appended targets do not manufacture baseline rejection: the same semantic script still decides．
+    (tmp_path / "checker/acceptance.py").write_text("raise AssertionError('unchanged behavior')\n", encoding="utf-8")
+    failed = subprocess.run([sys.executable, "-I", "-X", "utf8", "-B", str(tmp_path / "checker/checker.py"), str(test.parent)],
+        capture_output=True, text=True, encoding="utf-8", timeout=30, check=False)
+    assert failed.returncode != 0 and "unchanged behavior" in failed.stderr
+    assert "native_added_test_outcomes=" not in failed.stdout
+
+
+def test_outcomes_v8_actual_completion_wrapper_supports_trusted_native_pytest(tmp_path, monkeypatch):
+    from ephy_worker.check_completion import prepare_completion, verify_completion
+    from ephy_worker.formal_runtime import command_environment
+
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    original = "import pytest\n\ndef test_original():\n    assert True\n"
+    appended = "\n@pytest.mark.asyncio\nasync def test_added(tmp_path):\n    import asyncio\n    await asyncio.sleep(0)\n    assert tmp_path.is_dir()\n"
+    first, _, test = _native_tests_run_emitted(tmp_path, original, appended, profile)
+    assert first.returncode == 0, first.stdout + first.stderr
+    checker = tmp_path / "checker/checker.py"
+    temporary = tmp_path / "trusted-completion-temp"
+    temporary.mkdir()
+    environment = command_environment(test.parent, temporary)
+    helper = Path(sys.modules["ephy_worker.check_completion"].__file__)
+    completion = prepare_completion([sys.executable, "-I", "-X", "utf8", str(checker), str(test.parent)],
+        checker=checker, helper=helper, request_dir=tmp_path / "completion-requests", output_dir=temporary,
+        label="native-added-test-outcomes", cwd=test.parent)
+    result = subprocess.run(completion["argv"], cwd=test.parent, env=environment, capture_output=True,
+        text=True, encoding="utf-8", timeout=30, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    record = verify_completion(completion, result.returncode)["record"]
+    assert record["outcome"] == "returned" and record["exit_code"] == 0
+    assert "native_added_test_outcomes=" in result.stdout and "1 passed" in result.stdout

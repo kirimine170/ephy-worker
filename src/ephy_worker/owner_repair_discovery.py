@@ -947,6 +947,8 @@ class LocalDiscovery:
             "Only bare existing pytest.mark.asyncio is allowed as an async test marker. No new top-level imports/statements, "
             "pytest fixtures/hooks/plugins, arbitrary decorators, defaults or executable annotations. Preserve the original raw/AST prefix. "
             "Write a meaningful feature regression using real classes/fixtures even when approved_subject_calls is empty. "
+            "The trusted checker executes only appended test_ targets with pytest after semantic acceptance; every collected "
+            "case must pass setup, call and teardown without skip/xfail/deselection. "
             if native_profile else "append new uniquely named test/helper functions without decorators, defaults, parameter/return "
                 "annotations or type parameters. No imports anywhere in appended functions. Their closed body DSL "
                 "allows literal/local-name assignments, assert, return, if, bounded arithmetic/containers, one bounded "
@@ -1174,9 +1176,58 @@ for name in guard['allowed']:
     assert not (collection or lowered.endswith('.py')) or guard['snapshot'].get(name) is not None, 'new_collection_module_not_allowed'
 for name, original in guard['authority'].items():
     assert authority_fingerprint((root/name).read_text(encoding='utf-8')) == original, 'protected_discord_authority_changed'
+native_targets={}
 for name, original in guard['tests'].items():
-    preserve_original_tests(original,(root/name).read_text(encoding='utf-8'),tuple(guard.get('subjects',{}).get(name,())),guard.get('native_test_profile'))
+    candidate_text=(root/name).read_text(encoding='utf-8')
+    preserve_original_tests(original,candidate_text,tuple(guard.get('subjects',{}).get(name,())),guard.get('native_test_profile'))
+    if guard.get('native_test_profile') is not None:
+        added=ast.parse(candidate_text).body[len(ast.parse(original).body):]
+        for node in added:
+            if isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef)) and node.name.startswith('test_'):
+                native_targets[(str((root/name).resolve()),node.name)]=str(root/name)+'::'+node.name
+if native_targets:
+    sys.dont_write_bytecode=True
+    import os, tempfile, pytest
+    pytest_main=pytest.main
+    temporary_directory=tempfile.TemporaryDirectory
+    temporary_root=Path(os.environ['TEMP']).resolve(strict=True)
+    assert temporary_root.is_dir() and not temporary_root.is_relative_to(root) and not temporary_root.is_relative_to(base), 'native_test_temp_invalid'
+    class NativeOutcomes:
+        def __init__(self):
+            self.collected=[]
+            self.seen_targets=set()
+            self.reports={}
+            self.invalid=[]
+        def pytest_collection_finish(self,session):
+            for item in session.items:
+                target=(str(item.path.resolve()),getattr(item,'originalname',item.name.split('[')[0]))
+                if target not in native_targets:
+                    self.invalid.append('unexpected_target')
+                self.seen_targets.add(target)
+                self.collected.append(item.nodeid)
+        def pytest_deselected(self,items):
+            if items:
+                self.invalid.append('deselected')
+        def pytest_collectreport(self,report):
+            if report.failed or report.skipped:
+                self.invalid.append('collection_not_passed')
+        def pytest_runtest_logreport(self,report):
+            phases=self.reports.setdefault(report.nodeid,{})
+            if report.when in phases or report.outcome!='passed' or hasattr(report,'wasxfail'):
+                self.invalid.append('case_not_passed')
+            phases[report.when]=report.outcome
+    native_outcomes=NativeOutcomes()
 sys.path.insert(0,str(root))
 sys.path.insert(0,str(root/'src'))
 runpy.run_path(str(base/'acceptance.py'),run_name='__main__')
+if native_targets:
+    with temporary_directory(prefix='ephy-added-tests-',dir=temporary_root) as writable:
+        exit_code=int(pytest_main(['-q','-p','no:capture','-p','no:cacheprovider','-o','addopts=','--rootdir',str(root),
+            '--confcutdir',str(root),'--basetemp',str(Path(writable)/'pytest'),*native_targets.values()],plugins=[native_outcomes]))
+    summary={'collected':native_outcomes.collected,'reports':native_outcomes.reports,'invalid':native_outcomes.invalid}
+    print('native_added_test_outcomes='+json.dumps(summary,sort_keys=True))
+    assert (exit_code==0 and not native_outcomes.invalid and native_outcomes.seen_targets==set(native_targets)
+        and len(native_outcomes.collected)==len(set(native_outcomes.collected))
+        and set(native_outcomes.reports)==set(native_outcomes.collected)
+        and all(phases=={'setup':'passed','call':'passed','teardown':'passed'} for phases in native_outcomes.reports.values())), 'native_added_tests_not_passed'
 '''
