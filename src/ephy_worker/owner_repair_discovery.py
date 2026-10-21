@@ -1132,6 +1132,7 @@ class LocalDiscovery:
                         stdout = str(result.get("stdout", "")).encode("utf-8")
                         diagnostics.append({"name": name, "exit_code": result["exit_code"],
                             "expected": 0 if name == "known_good" else 1,
+                            "stderr_prefix": stderr[:1024].decode("utf-8", errors="ignore") if len(stderr) > 1024 else "",
                             "stderr_tail": stderr[-1024:].decode("utf-8", errors="ignore"),
                             "stdout_prefix": stdout[:256].decode("utf-8", errors="ignore"),
                             "stderr_truncated": len(stderr) > 1024, "stdout_truncated": len(stdout) > 256})
