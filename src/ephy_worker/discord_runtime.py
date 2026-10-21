@@ -475,6 +475,28 @@ class BridgeLedger:
             db.execute("CREATE TABLE IF NOT EXISTS inbox (sequence INTEGER PRIMARY KEY AUTOINCREMENT, message TEXT UNIQUE, "
                 "guild TEXT, channel TEXT, user TEXT, question TEXT, previous TEXT, intake TEXT, "
                 "receipt INTEGER DEFAULT 0, done INTEGER DEFAULT 0, consumer TEXT)")
+            db.execute("UPDATE inbox SET question='',previous=NULL WHERE done=1")
+            self._prune_inbox(db)
+
+    @staticmethod
+    def _prune_inbox(db) -> None:
+        db.execute("DELETE FROM inbox WHERE done=1 AND sequence NOT IN "
+            "(SELECT sequence FROM inbox WHERE done=1 ORDER BY sequence DESC LIMIT 10000)")
+
+    @staticmethod
+    def _check_capacity(db) -> None:
+        if db.execute("SELECT count(*) FROM inbox WHERE done=0").fetchone()[0] >= 128:
+            raise BridgeError("discord_queue_full")
+        requests = db.execute("SELECT count(*) FROM requests").fetchone()[0]
+        reserved = db.execute("SELECT count(*) FROM inbox WHERE done=0 AND message NOT IN (SELECT id FROM requests)").fetchone()[0]
+        if requests + reserved >= 10000:
+            raise BridgeError("discord_ledger_full")
+
+    def check_admission(self, message: int) -> None:
+        with self._db() as db:
+            if not db.execute("SELECT 1 FROM inbox WHERE message=?", (str(message),)).fetchone() and not db.execute(
+                    "SELECT 1 FROM requests WHERE id=?", (str(message),)).fetchone():
+                self._check_capacity(db)
 
     def enqueue(self, event: DiscordEvent, question: str, previous: str | None, intake: str | None,
                 consumer: str | None = None) -> bool:
@@ -483,6 +505,7 @@ class BridgeLedger:
             if db.execute("SELECT 1 FROM inbox WHERE message=?", (str(event.message_id),)).fetchone() or db.execute(
                     "SELECT 1 FROM requests WHERE id=?", (str(event.message_id),)).fetchone():
                 return False
+            self._check_capacity(db)
             db.execute("INSERT INTO inbox(message,guild,channel,user,question,previous,intake,consumer) VALUES (?,?,?,?,?,?,?,?)",
                 (str(event.message_id), str(event.guild_id), str(event.channel_id), str(event.user_id), question, previous, intake, consumer))
             return True
@@ -517,7 +540,8 @@ class BridgeLedger:
             if receipt:
                 db.execute("UPDATE inbox SET receipt=1 WHERE message=?", (str(message),))
             if done:
-                db.execute("UPDATE inbox SET done=1 WHERE message=?", (str(message),))
+                db.execute("UPDATE inbox SET done=1,question='',previous=NULL WHERE message=?", (str(message),))
+                self._prune_inbox(db)
             if release:
                 db.execute("UPDATE inbox SET consumer=NULL WHERE message=?", (str(message),))
 
@@ -577,7 +601,11 @@ _FAILURES = {
     "question_not_public": "秘密情報や私的な情報を含まない公開の質問でお願いします．",
     "runtime_search_timeout": "調査が時間内に終わりませんでした．完了した結果としてはお伝えできません．",
     "repair_classification_failed": "修正依頼か会話かを判定できませんでした．修正や外部検索は実行していません．",
+    "discord_queue_full": "現在の待機キューがいっぱいです．この依頼は受け付けていませんので，しばらくしてからお願いします．",
+    "discord_ledger_full": "受付履歴の容量に達したため，新しい依頼は受け付けていません．管理者による確認が必要です．",
 }
+_INTERRUPTED = ("前の処理が途中で止まった可能性があり，結果を確認できませんでした．"
+    "重複実行を避けるため，自動ではやり直していません．必要なら新しいメッセージで依頼してください．")
 
 
 class RuntimeDiscordBridge:
@@ -664,6 +692,7 @@ class RuntimeDiscordBridge:
             if not event.mentioned and previous is None:
                 return
             question = re.sub(rf"<@!?{self.settings.application_id}>", "", event.content).strip()
+            self.ledger.check_admission(event.message_id)
             intake = None
             if owner_route:
                 # Local durable capture precedes the first receipt/model/network await．
@@ -745,7 +774,11 @@ class RuntimeDiscordBridge:
                             intake = db.execute("SELECT done FROM intakes WHERE id=?", (row["intake"],)).fetchone()
                         terminal = intake is not None and bool(intake[0])
                     else:
-                        self.ledger.claim(int(message))
+                        if not self.ledger.claim(int(message)):
+                            terminal = True
+                            self.ledger.inbox_update(message, done=True)
+                            await deliver(_INTERRUPTED)
+                            continue
                         task = asyncio.create_task(self.gateway.answer(row["question"], row["previous"]))
                         done, _ = await asyncio.wait({task}, timeout=self.progress_seconds)
                         if not done:
@@ -835,7 +868,10 @@ class RuntimeDiscordBridge:
                 validate_public_text(row["text"], max_chars=4000)
             except QueryPrivacyError:
                 raise BridgeError("question_not_public") from None
-            self.ledger.claim(int(row["message"]))
+            if not self.ledger.claim(int(row["message"])):
+                self.repairs.update_intake(identifier, self.intake_consumer, done=True)
+                await send(_INTERRUPTED)
+                return
             task = asyncio.create_task(self.gateway.answer(row["text"], row["previous"]))
             done, _ = await asyncio.wait({task}, timeout=self.progress_seconds)
             if not done:

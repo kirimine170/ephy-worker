@@ -1222,3 +1222,141 @@ async def test_discovery_queue_final_delivery_is_durably_terminal_before_send(tm
         return 1234
     await bridge.handle(event(), send)
     assert sent == [RECEIPT, "最終回答です．"] and not bridge.ledger.inbox_pending()
+
+
+@pytest.mark.asyncio
+async def test_queue_review_prior_claim_is_not_reexecuted_but_unstarted_tail_runs(tmp_path):
+    config = settings(tmp_path)
+    ledger = BridgeLedger(config)
+    assert ledger.enqueue(event(), "最初の質問", "過去の回答", None)
+    ledger.inbox_update("1", receipt=True)
+    assert ledger.claim(1)
+    assert ledger.enqueue(event(message_id=2), "次の質問", None, None)
+    class Gateway:
+        def __init__(self):
+            self.calls = []
+        async def answer(self, question, previous):
+            self.calls.append((question, previous))
+            return "次の回答です．"
+    gateway = Gateway()
+    restarted = RuntimeDiscordBridge(config, gateway, BridgeLedger(config))
+    sent = []
+    async def send(row, text):
+        sent.append((row["message"], text))
+    await restarted.recover_inbox(send)
+    await restarted.recover_inbox(send)
+    assert gateway.calls == [("次の質問", None)]
+    assert len([text for message, text in sent if message == "1"]) == 1
+    assert "結果を確認できません" in sent[0][1] and "自動ではやり直していません" in sent[0][1]
+    with sqlite3.connect(ledger.path) as db:
+        assert db.execute("SELECT question,previous,done FROM inbox ORDER BY sequence").fetchall() == [("", None, 1), ("", None, 1)]
+    assert not ledger.enqueue(event(), "duplicate", None, None)
+
+
+@pytest.mark.asyncio
+async def test_queue_review_owner_conversation_prior_claim_does_not_repeat_runtime(tmp_path):
+    from psutil import Process
+
+    from ephy_worker.owner_repair import OWNER_USER_ID, RepairStore
+    config = settings(tmp_path).model_copy(update={"allowed_user_ids": (OWNER_USER_ID,)})
+    ledger = BridgeLedger(config)
+    store = RepairStore(tmp_path / "repair")
+    identifier = store.capture_intake(guild_id=11, channel_id=20, message_id=1,
+        author_id=OWNER_USER_ID, text="公開の質問", previous_answer=None)
+    consumer = f"{os.getpid()}:{Process().create_time()}"
+    assert store.claim_intake(identifier, consumer) is not None
+    store.update_intake(identifier, consumer, route="conversation", receipt=True, release=True)
+    assert ledger.enqueue(event(user_id=OWNER_USER_ID), "公開の質問", None, identifier)
+    ledger.inbox_update("1", receipt=True)
+    assert ledger.claim(1)
+    class Gateway:
+        async def answer(self, *_):
+            pytest.fail("uncertain owner conversation restarted Runtime")
+        async def classify_repair(self, *_):
+            pytest.fail("persisted conversation was reclassified")
+    bridge = RuntimeDiscordBridge(config, Gateway(), ledger)
+    bridge.repairs = store
+    sent = []
+    async def send(_row, text):
+        sent.append(text)
+    await bridge.recover_intakes(send)
+    await bridge.recover_intakes(send)
+    assert len(sent) == 1 and "自動ではやり直していません" in sent[0]
+    with store.db() as db:
+        assert db.execute("SELECT done FROM intakes WHERE id=?", (identifier,)).fetchone()[0] == 1
+        assert db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0
+    assert not ledger.inbox_pending()
+
+
+def test_queue_review_terminal_payloads_are_cleared_and_legacy_ids_stay_deduplicated(tmp_path):
+    config = settings(tmp_path)
+    ledger = BridgeLedger(config)
+    assert ledger.enqueue(event(), "fixture retained question", "fixture retained previous", None)
+    ledger.inbox_update("1", done=True, release=True)
+    with sqlite3.connect(ledger.path) as db:
+        assert db.execute("SELECT message,question,previous,done FROM inbox").fetchone() == ("1", "", None, 1)
+        db.execute("UPDATE inbox SET question='legacy question',previous='legacy previous'")
+    reopened = BridgeLedger(config)
+    with sqlite3.connect(reopened.path) as db:
+        assert db.execute("SELECT message,question,previous,done FROM inbox").fetchone() == ("1", "", None, 1)
+    assert not reopened.enqueue(event(), "duplicate", None, None)
+
+
+def test_queue_review_pending_capacity_rejects_before_insert_without_purging_work(tmp_path):
+    ledger = BridgeLedger(settings(tmp_path))
+    for identifier in range(1, 129):
+        assert ledger.enqueue(event(message_id=identifier), str(identifier), None, None)
+    with pytest.raises(BridgeError, match="discord_queue_full"):
+        ledger.enqueue(event(message_id=129), "overflow", None, None)
+    with sqlite3.connect(ledger.path) as db:
+        assert db.execute("SELECT count(*) FROM inbox WHERE done=0").fetchone()[0] == 128
+        assert db.execute("SELECT question FROM inbox WHERE message='1'").fetchone() == ("1",)
+    ledger.inbox_update("1", done=True)
+    assert ledger.enqueue(event(message_id=129), "new work", None, None)
+
+
+def test_queue_review_admission_reserves_existing_ledger_capacity_for_pending(tmp_path):
+    ledger = BridgeLedger(settings(tmp_path))
+    with sqlite3.connect(ledger.path) as db:
+        db.executemany("INSERT INTO requests VALUES (?)", [(str(number),) for number in range(1, 10000)])
+    assert ledger.enqueue(event(message_id=10000), "last available request", None, None)
+    with pytest.raises(BridgeError, match="discord_ledger_full"):
+        ledger.enqueue(event(message_id=10001), "overflow", None, None)
+    with sqlite3.connect(ledger.path) as db:
+        assert db.execute("SELECT count(*) FROM inbox").fetchone()[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_queue_review_full_ledger_rejects_owner_before_intake_capture(tmp_path):
+    from ephy_worker.owner_repair import OWNER_USER_ID, RepairStore
+    config = settings(tmp_path).model_copy(update={"allowed_user_ids": (OWNER_USER_ID,)})
+    ledger = BridgeLedger(config)
+    with sqlite3.connect(ledger.path) as db:
+        db.executemany("INSERT INTO requests VALUES (?)", [(str(number),) for number in range(1, 10001)])
+    bridge = RuntimeDiscordBridge(config, SimpleNamespace(), ledger)
+    bridge.repairs = RepairStore(tmp_path / "repairs")
+    sent = []
+    async def send(text):
+        sent.append(text)
+    await bridge.handle(event(message_id=10001, user_id=OWNER_USER_ID, content="<@10> 表示を修正して"), send)
+    assert len(sent) == 1 and "容量" in sent[0] and RECEIPT not in sent[0]
+    with sqlite3.connect(ledger.path) as db:
+        assert db.execute("SELECT count(*) FROM inbox").fetchone()[0] == 0
+    with bridge.repairs.db() as db:
+        assert db.execute("SELECT count(*) FROM intakes").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0
+
+
+def test_queue_review_terminal_id_retention_is_bounded_without_deleting_pending(tmp_path):
+    config = settings(tmp_path)
+    ledger = BridgeLedger(config)
+    assert ledger.enqueue(event(message_id=20000), "pending question", "pending previous", None)
+    with sqlite3.connect(ledger.path) as db:
+        db.executemany("INSERT INTO inbox(message,guild,channel,user,question,previous,done) VALUES (?,?,?,?,?,?,1)",
+            [(str(number), "11", "20", "30", "old question", "old previous") for number in range(1, 10003)])
+    reopened = BridgeLedger(config)
+    with sqlite3.connect(reopened.path) as db:
+        assert db.execute("SELECT count(*) FROM inbox WHERE done=1").fetchone()[0] == 10000
+        assert db.execute("SELECT count(*) FROM inbox WHERE done=1 AND (question!='' OR previous IS NOT NULL)").fetchone()[0] == 0
+        assert db.execute("SELECT question,previous FROM inbox WHERE done=0").fetchall() == [("pending question", "pending previous")]
+    assert not reopened.enqueue(event(message_id=10002), "duplicate", None, None)
