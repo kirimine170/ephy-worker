@@ -1373,3 +1373,38 @@ def test_context_review_oversized_read_more_is_atomic_and_preserves_accepted_con
     assert all(name in prompts[2]["code_context"]["ephy-worker"] for name in groups[0])
     assert all(name not in prompts[2]["code_context"]["ephy-worker"] for name in groups[1])
     assert json.loads((directory / "scope-attempt-2.validation.json").read_text())["error"] == "discovery_context_request_too_large"
+
+
+@pytest.mark.parametrize("content,valid", [('{"selected":true}', True),
+    ('```json\n{"selected":true}\n```', False), ('{"selected":true,"selected":false}', False)])
+def test_discovery_json_http_request_format_and_strict_raw_evidence(tmp_path, monkeypatch, content, valid):
+    identity = tmp_path / "identity.json"
+    identity.write_text(json.dumps({"context": 32768, "model_id": "fixture-model"}), encoding="utf-8")
+    monkeypatch.setitem(sys.modules, "ephy_worker.existing_llama_runtime", SimpleNamespace(verify_identity=lambda _: None))
+    calls = []
+    def handler(request):
+        body = json.loads(request.content)
+        calls.append((request.url.path, body))
+        if request.url.path == "/apply-template":
+            return httpx.Response(200, json={"prompt": "fixture formatted prompt"})
+        if request.url.path == "/tokenize":
+            return httpx.Response(200, json={"tokens": [1, 2, 3]})
+        assert request.url.path == "/v1/chat/completions"
+        assert body["response_format"] == {"type": "json_object"}
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": content}}]})
+    actual_client = httpx.Client
+    monkeypatch.setattr("ephy_worker.owner_repair_discovery.httpx.Client", lambda **kwargs:
+        actual_client(transport=httpx.MockTransport(handler), **kwargs))
+    discovery = LocalDiscovery(SimpleNamespace())
+    runtime = {"models_ini": str(identity), "base_url": "http://127.0.0.1:18080"}
+    directory = tmp_path / "private"
+    if valid:
+        assert discovery.ask("fixture scope", runtime, directory, "scope") == {"selected": True}
+    else:
+        with pytest.raises(ValueError):
+            discovery.ask("fixture scope", runtime, directory, "scope")
+        assert (directory / "scope.error.json").is_file()
+    raw = json.loads((directory / "scope.raw.json").read_bytes())
+    assert raw["choices"][0]["message"]["content"] == content
+    assert calls[-1][1]["messages"] == calls[0][1]["messages"]
+    assert calls[-1][1]["max_tokens"] == 4096 and calls[-1][1]["stream"] is False

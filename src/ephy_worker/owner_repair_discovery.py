@@ -559,7 +559,7 @@ class LocalDiscovery:
                 raise GateFailure("contract_incomplete:discovery_context_budget_exceeded")
             response = client.post(runtime["base_url"] + "/v1/chat/completions", json={
                 "model": identity["model_id"], "stream": False, "temperature": 0,
-                "max_tokens": 4096, "messages": messages})
+                "max_tokens": 4096, "messages": messages, "response_format": {"type": "json_object"}})
         response.raise_for_status()
         if self.response_path is not None and len(response.content) <= 2097152:
             self.response_path.write_bytes(response.content)
