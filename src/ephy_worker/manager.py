@@ -30,6 +30,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import Counter
 from pathlib import Path
 
 from aiohttp import web
@@ -784,6 +785,10 @@ class Manager:
             raise ManagerError("observation_scope_mismatch", 409)
         if any(c.guild_id != input.guild_id for c in payload.snapshot.channels):
             raise ManagerError("observation_scope_mismatch", 409)
+        message_counts = Counter(message.channel_id for message in payload.messages)
+        if (any(count > input.max_messages_per_channel for count in message_counts.values())
+                or any(channel.message_count > input.max_messages_per_channel for channel in coverage.channels)):
+            raise ManagerError("observation_budget_exceeded", 409)
         limits = Limits.model_validate(json.loads(row["budget"]))
         if result.usage.fetch_requests > limits.fetch_requests or result.usage.document_bytes > 8 * 1024**2:
             raise ManagerError("observation_budget_exceeded", 409)
@@ -1106,13 +1111,19 @@ class ManagerApp:
         view = await asyncio.to_thread(self.manager.job_view, request.match_info["job_id"])
         if view["state"] not in TERMINAL_STATES:
             raise ManagerError("not_terminal", 409)
+        try:
+            result = await asyncio.to_thread(self.manager.job_result, request.match_info["job_id"])
+        except ManagerError as exc:
+            if exc.code != "result_unavailable":
+                raise
+            result = None
         return web.json_response(
             {
                 "job_id": view["job_id"],
                 "state": view["state"],
                 "stop_reason": view["stop_reason"],
                 "usage": view["usage"],
-                "result": view["result"],
+                "result": result,
             }
         )
 

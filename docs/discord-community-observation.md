@@ -6,6 +6,8 @@ collector設定は[設定例](../configs/collector-discord.example.yaml)を参�
 
 入力は`guild_id`，`channel_ids`，元のDiscord依頼snowflakeから固定したUTCの`observed_before`，`lookback_days: 30`，`max_messages_per_channel`です．依頼本文や過去回答はcollectorへ渡しません．channelごとの既定上限は1000件，全体は2000件，結果は8MiBまでです．本文は4000文字を超えると明示的にtruncatedとなります．API要求数，受信byte数，job時間にも既存budgetを適用します．429は待機上限内で1回だけ再試行します．
 
+Managerはfinalize時にchannelごとのmessage evidence件数とcoverageの報告件数を入力上限と照合し，超過は`observation_budget_exceeded`として結果を拒否します．上限ちょうどの結果は全evidenceを保持し，超過分の切捨てで成功扱いにはしません．保持期間を過ぎた結果のHTTP取得は`410 observation_retention_expired`となります．
+
 結果はsnapshot，7／30日活動集計，参照可能なmessage evidence，coverage，構造化failureです．投稿数とunique author数は取得した投稿から集計します．運営者は設定したIDだけで判定し，非reply投稿をconversation start，reply referenceのある投稿をreplyとして数えます．実際の会話session，返信の解決，関係性を証明する値ではありません．個人の専門性推測や関係graphは実装していません．個人profileの将来実装には本人の明示opt-inが必要です．
 
 Botの自己member record，role，channel overwriteから履歴権限を確認します．確認できない状態の空履歴は「投稿0件で完全取得」としません．Message Content Intentがない場合，空本文と本当に空の投稿は区別できないため`empty_or_unavailable`と記録します．本文取得を無効にした場合は`not_requested`です．取得上限，権限不足，本文不足，thread除外，観測期間を回答根拠へ渡します．部分取得は`partial`で返し，取得できた事実と不確実性を併記します．
