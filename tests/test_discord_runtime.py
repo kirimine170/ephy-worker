@@ -1529,3 +1529,200 @@ async def test_queue_poll_terminal_duplicate_releases_sender_but_pending_duplica
     assert gateway.calls == ["公開の質問", "次の公開の質問"]
     assert sent == [RECEIPT, "回答です．", RECEIPT, "回答です．"]
     assert bridge.inbox_senders == {} and not ledger.inbox_pending()
+
+
+@pytest.mark.parametrize('pair', [
+    {'guild_id': True, 'channel_id': 21}, {'guild_id': 12, 'channel_id': '21'},
+    {'guild_id': 12, 'channel_id': 0}, {'channel_id': 21},
+    {'guild_id': 12, 'channel_id': 21, 'user_id': 30},
+])
+def test_additional_channels_require_strict_exact_pairs(tmp_path, pair):
+    with pytest.raises(ValidationError):
+        settings(tmp_path, additional_channels=(pair,))
+
+
+def test_additional_channels_are_optional_and_nested_settings_are_frozen(tmp_path):
+    assert settings(tmp_path).additional_channels == ()
+    config = settings(tmp_path, additional_channels=({'guild_id': 12, 'channel_id': 21},))
+    with pytest.raises(ValidationError):
+        config.additional_channels = ()
+    with pytest.raises(ValidationError):
+        config.additional_channels[0].channel_id = 22
+
+
+@pytest.mark.parametrize(('updates', 'accepted'), [
+    ({}, True), ({'guild_id': 12, 'channel_id': 21}, True), ({'channel_id': 22}, True),
+    ({'guild_id': 12, 'channel_id': 20}, False), ({'channel_id': 21}, False),
+    ({'guild_id': 12, 'channel_id': 22}, False), ({'guild_id': 13, 'channel_id': 21}, False),
+    ({'guild_id': None, 'channel_id': 21}, False),
+    ({'guild_id': 12, 'channel_id': 21, 'user_id': 99}, False),
+    ({'guild_id': 12, 'channel_id': 21, 'author_bot': True}, False),
+    ({'guild_id': 12, 'channel_id': 21, 'mentioned': False}, False),
+])
+@pytest.mark.asyncio
+async def test_additional_channels_admit_only_exact_pairs_and_existing_users(tmp_path, updates, accepted):
+    config = settings(tmp_path, additional_channels=(
+        {'guild_id': 12, 'channel_id': 21}, {'guild_id': 11, 'channel_id': 22}))
+    fixture = RuntimeFixture()
+    gateway = RuntimeGateway(config, transport=httpx.MockTransport(fixture))
+    ledger = BridgeLedger(config)
+    bridge = RuntimeDiscordBridge(config, gateway, ledger)
+    sent = []
+    async def send(text):
+        sent.append(text)
+        return 100 + len(sent)
+    try:
+        await bridge.handle(event(**updates), send)
+        assert sent == ([RECEIPT, 'わたしは公開資料を確認しました．'] if accepted else [])
+        assert [path for path, _, _ in fixture.calls] == (
+            ['/v1/web-search/plan', '/v1/chat/completions'] if accepted else [])
+        assert ledger.seen(1) is accepted and not ledger.inbox_pending()
+    finally:
+        await gateway.aclose()
+
+
+@pytest.mark.parametrize('still_allowed', [True, False])
+@pytest.mark.asyncio
+async def test_additional_channel_inbox_recovers_and_rechecks_current_allowlist(tmp_path, still_allowed):
+    config = settings(tmp_path, additional_channels=({'guild_id': 12, 'channel_id': 21},))
+    ledger = BridgeLedger(config)
+    rows = [event(guild_id=12, channel_id=21), event(message_id=2, guild_id=12, channel_id=20),
+        event(message_id=3, guild_id=13, channel_id=21),
+        event(message_id=4, guild_id=12, channel_id=21, user_id=99), event(message_id=5)]
+    for item in rows:
+        assert ledger.enqueue(item, '公開の質問' + str(item.message_id), None, None)
+    restarted_config = config if still_allowed else config.model_copy(update={'additional_channels': ()})
+    calls, sent = [], []
+    class Gateway:
+        async def answer(self, question, previous):
+            calls.append((question, previous))
+            return '回答：' + question
+    restarted = RuntimeDiscordBridge(restarted_config, Gateway(), BridgeLedger(restarted_config))
+    async def send(row, text):
+        answer_id = 100 + len(sent)
+        sent.append((row['message'], row['guild'], row['channel'], text, answer_id))
+        return answer_id
+    await restarted.recover_inbox(send)
+    await restarted.recover_inbox(send)
+    expected = ['1', '5'] if still_allowed else ['5']
+    assert calls == [('公開の質問' + message, None) for message in expected]
+    assert [message for message, _, _, text, _ in sent if text.startswith('回答：')] == expected
+    assert [message for message, _, _, text, _ in sent if text == RECEIPT] == expected
+    assert not ledger.inbox_pending()
+    if still_allowed:
+        final = next(item for item in sent if item[0] == '1' and item[3].startswith('回答：'))
+        reply = event(message_id=6, guild_id=12, channel_id=21, mentioned=False, reply_to=final[4])
+        assert ledger.previous(reply) == '回答：公開の質問1'
+        assert ledger.previous(replace(reply, guild_id=11)) is None
+        assert ledger.previous(replace(reply, user_id=31)) is None
+
+
+@pytest.mark.asyncio
+async def test_additional_channel_owner_uses_conversation_and_primary_keeps_intake(tmp_path, monkeypatch):
+    from ephy_worker.owner_repair import RepairStore
+    monkeypatch.setattr('ephy_worker.owner_repair.OWNER_USER_ID', 30)
+    config = settings(tmp_path, additional_channels=({'guild_id': 12, 'channel_id': 21},))
+    calls, classified, sent = [], [], []
+    class Gateway:
+        async def answer(self, question, previous):
+            calls.append((question, previous))
+            return '回答です．'
+        async def classify_repair(self, question, _previous):
+            classified.append(question)
+            return False
+    ledger = BridgeLedger(config)
+    bridge = RuntimeDiscordBridge(config, Gateway(), ledger)
+    bridge.repairs = RepairStore(tmp_path / 'repairs')
+    async def send(text):
+        sent.append(text)
+        return 100 + len(sent)
+    await bridge.handle(event(guild_id=12, channel_id=21), send)
+    assert calls == [('公開の質問', None)] and classified == []
+    with bridge.repairs.db() as db:
+        assert db.execute('SELECT count(*) FROM intakes').fetchone()[0] == 0
+        assert db.execute('SELECT count(*) FROM jobs').fetchone()[0] == 0
+    await bridge.handle(event(message_id=2, content='<@10> primaryの質問'), send)
+    assert classified == ['primaryの質問'] and calls[-1] == ('primaryの質問', None)
+    with bridge.repairs.db() as db:
+        assert db.execute('SELECT count(*) FROM intakes').fetchone()[0] == 1
+    # A persisted repair intake cannot gain the additional conversation scope．
+    identifier = bridge.repairs.capture_intake(guild_id=12, channel_id=21, message_id=3,
+        author_id=30, text='公開の質問', previous_answer=None)
+    assert ledger.enqueue(event(message_id=3, guild_id=12, channel_id=21), '公開の質問', None, identifier)
+    async def recovered(_row, text):
+        return await send(text)
+    await bridge.recover_intakes(recovered)
+    assert classified == ['primaryの質問'] and len(calls) == 2
+    assert not ledger.inbox_pending() and bridge.repairs.next() is None
+
+
+@pytest.mark.parametrize('actual_guild', [12, 11, 13])
+@pytest.mark.asyncio
+async def test_additional_channel_sdk_recovery_checks_actual_channel_guild(tmp_path, monkeypatch, actual_guild):
+    from ephy_worker import discord_runtime
+    config = settings(tmp_path, additional_channels=({'guild_id': 12, 'channel_id': 21},))
+    ledger = BridgeLedger(config)
+    assert ledger.enqueue(event(guild_id=12, channel_id=21), '復旧する公開の質問', None, None)
+    sent, calls, looked_up = [], [], []
+    completed = asyncio.Event()
+    real_sleep = asyncio.sleep
+    async def one_pass(seconds):
+        if seconds == 2:
+            completed.set()
+            await real_sleep(0)
+        else:
+            await real_sleep(seconds)
+    monkeypatch.setattr(discord_runtime.asyncio, 'sleep', one_pass)
+    class Gateway:
+        def __init__(self, *args, **kwargs): pass
+        async def answer(self, question, previous):
+            calls.append((question, previous))
+            return '復旧後の回答です．'
+        async def aclose(self): pass
+    class Channel:
+        id, guild = 21, SimpleNamespace(id=actual_guild)
+        async def send(self, text, **options):
+            assert options == {'allowed_mentions': None, 'suppress_embeds': True}
+            sent.append(text)
+            return SimpleNamespace(id=100 + len(sent))
+    class Client:
+        def __init__(self, **kwargs):
+            self.application_id, self.user = kwargs['application_id'], SimpleNamespace(id=10)
+            self.closed = False
+        def event(self, callback):
+            setattr(self, callback.__name__, callback)
+            return callback
+        def is_closed(self):
+            return self.closed
+        def get_channel(self, identifier):
+            looked_up.append(identifier)
+        async def fetch_channel(self, identifier):
+            assert identifier == 21
+            return Channel()
+        async def start(self, *_args, **_kwargs):
+            await self.on_ready()
+            await asyncio.wait_for(completed.wait(), 3)
+        async def close(self):
+            self.closed = True
+    sdk = SimpleNamespace(Client=Client, Intents=SimpleNamespace(none=lambda: SimpleNamespace()),
+        AllowedMentions=SimpleNamespace(none=lambda: None), LoginFailure=type('LoginFailure', (Exception,), {}))
+    monkeypatch.setitem(sys.modules, 'discord', sdk)
+    monkeypatch.setattr(discord_runtime, 'RuntimeGateway', Gateway)
+    monkeypatch.setenv('EPHY_DISCORD_BOT_TOKEN', 'fixture-discord-token-private')
+    assert await asyncio.wait_for(run_discord(config), 4) == 0
+    assert looked_up and all(identifier == 21 for identifier in looked_up)
+    assert sent == ([RECEIPT, '復旧後の回答です．'] if actual_guild == 12 else [])
+    assert calls == ([('復旧する公開の質問', None)] if actual_guild == 12 else [])
+    assert ledger.inbox_pending() is (actual_guild != 12)
+
+
+def test_additional_channels_cli_counts_effective_pairs_without_connecting(tmp_path, monkeypatch, capsys):
+    config = tmp_path / 'additional.toml'
+    config.write_text('application_id=10\nguild_id=11\nallowed_channel_ids=[20]\nallowed_user_ids=[30]\n'
+        + 'state_dir=' + json.dumps(str(tmp_path / 'private')) + '\n'
+        + '[[additional_channels]]\nguild_id=12\nchannel_id=21\n'
+        + '[[additional_channels]]\nguild_id=11\nchannel_id=20\n', encoding='utf-8')
+    monkeypatch.delenv('EPHY_DISCORD_BOT_TOKEN', raising=False)
+    assert main(['discord-runtime', 'check', '--config', str(config)]) == 0
+    assert json.loads(capsys.readouterr().out)['channels'] == 2
+    assert not (tmp_path / 'private').exists()

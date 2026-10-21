@@ -14,6 +14,16 @@ ephy-worker discord-runtime run --config /absolute/private/discord-runtime.toml 
 
 Runtime URLはliteralのloopback IPだけを許可します．環境proxyとredirectは利用しません．Manager URL，収集Worker ID，providerとcredentialはRuntime側の設定です．Discord本文からそれらを指定・変更できません．Runtime側はWorker providerの設定とManager／収集Workerを別途起動してください．既存のManager／collector設定例とRuntimeのbridge文書を利用します．
 
+別のguildやchannelで通常会話を許可する場合は，設定末尾へ組を明示します．次のIDは説明用です．省略時は従来の`guild_id`と`allowed_channel_ids`だけを使います．
+
+```toml
+[[additional_channels]]
+guild_id = 12
+channel_id = 21
+```
+
+追加先も`allowed_user_ids`などの受信条件を満たす必要があり，guildとchannelの完全一致で判定します．追加先の会話は永続キューからの復旧にも対応します．このMVPでは追加先は通常会話専用で，所有者の修正依頼の分類・受付・結果配送は従来のprimary guild／channel範囲だけです．channel IDをuser許可リストへ追加してもchannelの許可にはなりません．`check`のchannel数は両設定を合わせた重複のない組数です．
+
 通常のbot mentionにはMessage Content Intentは不要です．mentionを含まないBotへの直接返信を読む場合は，`read_message_content=true`とし，Discord Developer PortalでもMessage Content Intentを有効にします．この権限がない場合はmentionで質問してください．Bot／webhook／system／everyone mention，許可外のguild／channel／userは処理しません．
 
 ## 会話と許可の境界

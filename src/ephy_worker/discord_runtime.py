@@ -49,12 +49,19 @@ class BridgeError(RuntimeError):
         super().__init__(code)
 
 
+class DiscordChannel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    guild_id: Snowflake
+    channel_id: Snowflake
+
+
 class DiscordRuntimeSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     application_id: Snowflake
     guild_id: Snowflake
     allowed_channel_ids: tuple[Snowflake, ...] = Field(min_length=1, max_length=100)
     allowed_user_ids: tuple[Snowflake, ...] = Field(min_length=1, max_length=100)
+    additional_channels: tuple[DiscordChannel, ...] = Field(default=(), max_length=100)
     runtime_url: str = "http://127.0.0.1:8000"
     token_env: str = "EPHY_DISCORD_BOT_TOKEN"
     read_message_content: StrictBool = False
@@ -113,6 +120,11 @@ class DiscordRuntimeSettings(BaseModel):
             if path.is_symlink() or path.is_junction():
                 raise ValueError("state_dir_must_not_be_linked")
         return output_root(value)
+
+    def allows_channel(self, guild_id: int | None, channel_id: int) -> bool:
+        return (guild_id == self.guild_id and channel_id in self.allowed_channel_ids
+            or any(channel.guild_id == guild_id and channel.channel_id == channel_id
+                for channel in self.additional_channels))
 
     def token(self) -> str:
         value = os.environ.get(self.token_env, "")
@@ -683,13 +695,14 @@ class RuntimeDiscordBridge:
 
     async def handle(self, event: DiscordEvent, send) -> None:
         if (event.author_bot or event.webhook or event.system or event.mention_everyone
-                or event.guild_id != self.settings.guild_id
-                or event.channel_id not in self.settings.allowed_channel_ids
+                or not self.settings.allows_channel(event.guild_id, event.channel_id)
                 or event.user_id not in self.settings.allowed_user_ids):
             return
         try:
             from .owner_repair import OWNER_USER_ID
-            owner_route = self.repairs is not None and event.user_id == OWNER_USER_ID
+            owner_route = (self.repairs is not None and event.user_id == OWNER_USER_ID
+                and event.guild_id == self.settings.guild_id
+                and event.channel_id in self.settings.allowed_channel_ids)
             previous = self.ledger.previous(event)
             if not event.mentioned and previous is None:
                 return
@@ -753,8 +766,7 @@ class RuntimeDiscordBridge:
                 if deliver is None:
                     self.ledger.inbox_update(message, release=True)
                     return
-                if (int(row["guild"]) != self.settings.guild_id
-                        or int(row["channel"]) not in self.settings.allowed_channel_ids
+                if (not self.settings.allows_channel(int(row["guild"]), int(row["channel"]))
                         or int(row["user"]) not in self.settings.allowed_user_ids):
                     self.ledger.inbox_update(message, done=True, release=True)
                     continue
@@ -770,7 +782,9 @@ class RuntimeDiscordBridge:
                         self.ledger.inbox_update(message, receipt=True)
                     if row["intake"] is not None:
                         from .owner_repair import OWNER_USER_ID
-                        if self.repairs is None or int(row["user"]) != OWNER_USER_ID:
+                        if (self.repairs is None or int(row["user"]) != OWNER_USER_ID
+                                or int(row["guild"]) != self.settings.guild_id
+                                or int(row["channel"]) not in self.settings.allowed_channel_ids):
                             raise BridgeError("owner_repair_scope_mismatch")
                         with self.repairs.db() as db:
                             db.execute("UPDATE intakes SET receipt=1 WHERE id=?", (row["intake"],))
@@ -952,7 +966,8 @@ async def run_discord(settings: DiscordRuntimeSettings) -> int:
                 channel = client.get_channel(int(row["channel"]))
                 if channel is None:
                     channel = await client.fetch_channel(int(row["channel"]))
-                if channel.guild.id != settings.guild_id:
+                if (channel.guild.id != int(row["guild"])
+                        or not settings.allows_channel(channel.guild.id, int(row["channel"]))):
                     raise BridgeError("repair_delivery_scope_mismatch")
                 result = await channel.send(text, allowed_mentions=discord.AllowedMentions.none(), suppress_embeds=True)
                 return result.id
@@ -1047,7 +1062,9 @@ async def command(args) -> int:
     settings = load_settings(args.config)
     if args.discord_runtime_command == "check":
         print(json.dumps({"ok": True, "transport": "runtime", "loopback": True,
-            "channels": len(settings.allowed_channel_ids), "users": len(settings.allowed_user_ids)}, ensure_ascii=False))
+            "channels": len({(settings.guild_id, channel) for channel in settings.allowed_channel_ids}
+                | {(channel.guild_id, channel.channel_id) for channel in settings.additional_channels}),
+            "users": len(settings.allowed_user_ids)}, ensure_ascii=False))
         return 0
     if not args.connect:
         raise BridgeError("discord_runtime_run_requires_connect")
