@@ -1288,6 +1288,29 @@ async def test_queue_review_owner_conversation_prior_claim_does_not_repeat_runti
     assert not ledger.inbox_pending()
 
 
+@pytest.mark.parametrize("failure", [RuntimeError, BridgeError, asyncio.CancelledError])
+@pytest.mark.asyncio
+async def test_queue_preclaim_existing_claim_remains_terminal_when_interruption_notice_fails(tmp_path, failure):
+    config = settings(tmp_path)
+    ledger = BridgeLedger(config)
+    assert ledger.enqueue(event(), "記録済みの質問", "参照回答", None)
+    ledger.inbox_update("1", receipt=True)
+    assert ledger.claim(1)
+    class Gateway:
+        async def answer(self, *_):
+            pytest.fail("recorded request must not restart Runtime")
+    bridge = RuntimeDiscordBridge(config, Gateway(), ledger)
+    async def broken_send(_row, _text):
+        raise failure("fixture interrupted notice delivery failure")
+    with pytest.raises(failure):
+        await bridge.recover_inbox(broken_send)
+    with sqlite3.connect(ledger.path) as db:
+        assert db.execute("SELECT question,previous,done FROM inbox").fetchone() == ("", None, 1)
+    async def unexpected_send(*_):
+        pytest.fail("uncertain already-recorded request replayed")
+    await RuntimeDiscordBridge(config, Gateway(), BridgeLedger(config)).recover_inbox(unexpected_send)
+
+
 def test_queue_review_terminal_payloads_are_cleared_and_legacy_ids_stay_deduplicated(tmp_path):
     config = settings(tmp_path)
     ledger = BridgeLedger(config)
@@ -1360,3 +1383,49 @@ def test_queue_review_terminal_id_retention_is_bounded_without_deleting_pending(
         assert db.execute("SELECT count(*) FROM inbox WHERE done=1 AND (question!='' OR previous IS NOT NULL)").fetchone()[0] == 0
         assert db.execute("SELECT question,previous FROM inbox WHERE done=0").fetchall() == [("pending question", "pending previous")]
     assert not reopened.enqueue(event(message_id=10002), "duplicate", None, None)
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, BridgeError, asyncio.CancelledError])
+@pytest.mark.asyncio
+async def test_queue_preclaim_receipt_failure_retains_payload_and_fifo_for_recovery(tmp_path, failure):
+    config = settings(tmp_path)
+    ledger = BridgeLedger(config)
+    assert ledger.enqueue(event(), "最初の質問", "最初の参照回答", None)
+    assert ledger.enqueue(event(message_id=2), "次の質問", "次の参照回答", None)
+    class Gateway:
+        def __init__(self):
+            self.calls = []
+        async def answer(self, question, previous):
+            self.calls.append((question, previous))
+            return "回答：" + question
+    gateway = Gateway()
+    bridge = RuntimeDiscordBridge(config, gateway, ledger)
+    failed_once = False
+    attempted = []
+    async def interrupted_send(row, text):
+        nonlocal failed_once
+        attempted.append((row["message"], text))
+        if not failed_once and text == RECEIPT:
+            failed_once = True
+            raise failure("fixture receipt failed before claim")
+    if failure is asyncio.CancelledError:
+        with pytest.raises(asyncio.CancelledError):
+            await bridge.recover_inbox(interrupted_send)
+    else:
+        await bridge.recover_inbox(interrupted_send)
+    assert gateway.calls == [] and all(message == "1" for message, _ in attempted)
+    with sqlite3.connect(ledger.path) as db:
+        assert db.execute("SELECT question,previous,done,receipt,consumer FROM inbox ORDER BY sequence").fetchall() == [
+            ("最初の質問", "最初の参照回答", 0, 0, None), ("次の質問", "次の参照回答", 0, 0, None)]
+        assert db.execute("SELECT count(*) FROM requests").fetchone()[0] == 0
+    assert bridge.inflight == 0 and ledger.inbox_pending()
+    restarted = RuntimeDiscordBridge(config, gateway, BridgeLedger(config))
+    delivered = []
+    async def send(row, text):
+        delivered.append((row["message"], text))
+    await restarted.recover_inbox(send)
+    await restarted.recover_inbox(send)
+    assert gateway.calls == [("最初の質問", "最初の参照回答"), ("次の質問", "次の参照回答")]
+    assert [message for message, text in delivered if text.startswith("回答：")] == ["1", "2"]
+    assert [message for message, text in delivered if text == RECEIPT] == ["1", "2"]
+    assert not ledger.inbox_pending()

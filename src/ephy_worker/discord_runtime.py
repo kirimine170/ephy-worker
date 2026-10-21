@@ -759,6 +759,7 @@ class RuntimeDiscordBridge:
                 self.activity()
                 task = None
                 terminal = False
+                execution_recorded = False
                 try:
                     if not row["receipt"]:
                         await deliver(RECEIPT)
@@ -774,7 +775,9 @@ class RuntimeDiscordBridge:
                             intake = db.execute("SELECT done FROM intakes WHERE id=?", (row["intake"],)).fetchone()
                         terminal = intake is not None and bool(intake[0])
                     else:
-                        if not self.ledger.claim(int(message)):
+                        claimed = self.ledger.claim(int(message))
+                        execution_recorded = True
+                        if not claimed:
                             terminal = True
                             self.ledger.inbox_update(message, done=True)
                             await deliver(_INTERRUPTED)
@@ -794,10 +797,10 @@ class RuntimeDiscordBridge:
                             if type(answer_id) is int and answer_id > 0:
                                 self.ledger.remember(answer_id, event, part)
                 except asyncio.CancelledError:
-                    terminal = row["intake"] is None
+                    terminal = row["intake"] is None and execution_recorded
                     raise
                 except BridgeError as exc:
-                    terminal = exc.code != "repair_classification_failed"
+                    terminal = execution_recorded if row["intake"] is None else exc.code != "repair_classification_failed"
                     await deliver(_FAILURES.get(exc.code, "処理に失敗しました．結果を確認できていません．"))
                 except Exception as exc:  # noqa: BLE001 — private exception text never reaches Discord．
                     if row["intake"] is not None and self.repairs is not None:
@@ -805,7 +808,7 @@ class RuntimeDiscordBridge:
                             intake = db.execute("SELECT done FROM intakes WHERE id=?", (row["intake"],)).fetchone()
                         terminal = intake is not None and bool(intake[0])
                     else:
-                        terminal = True
+                        terminal = execution_recorded
                     logging.getLogger(__name__).error("discord_inbox_failed:%s", type(exc).__name__)
                     await deliver("処理に失敗しました．結果を確認できていません．")
                 finally:
