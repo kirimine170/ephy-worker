@@ -331,6 +331,24 @@ def preserve_original_tests(original: str, candidate: str, subjects: tuple[str, 
         if isinstance(node, ast.Attribute):
             return marker(node.value) + "." + node.attr
         return ""
+    if native:
+        deferred_annotations = any(isinstance(node, ast.ImportFrom) and node.module == "__future__"
+            and any(alias.name == "annotations" for alias in node.names) for node in before.body)
+        boundary = -1
+        for index, node in enumerate(before.body):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                arguments = [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
+                arguments += [argument for argument in (node.args.vararg, node.args.kwarg) if argument is not None]
+                annotations = [node.returns, *(argument.annotation for argument in arguments)]
+                defaults = [*node.args.defaults, *(value for value in node.args.kw_defaults if value is not None)]
+                if (not node.type_params and all(isinstance(value, ast.Constant) for value in defaults)
+                        and (not node.decorator_list or isinstance(node, ast.AsyncFunctionDef)
+                            and len(node.decorator_list) == 1 and marker(node.decorator_list[0]) in async_markers)
+                        and (deferred_annotations or all(inert_annotation(value) for value in annotations))):
+                    continue
+            boundary = matched[index]
+        if any(index <= boundary for index, node in enumerate(after.body) if node in added):
+            raise ValueError("original_test_module_changed")
     for node in added:
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             raise ValueError("only_new_test_or_helper_functions_may_append")  # noqa: TRY004 — invalid source AST value．

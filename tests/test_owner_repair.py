@@ -2519,3 +2519,90 @@ def test_prologue_v11_after_prologue_insertion_preserves_docstring_and_executes(
     assert summary["invalid"] == []
     assert next(iter(summary["reports"].values())) == {"setup": "passed", "call": "passed", "teardown": "passed"}
     assert test.read_text() == candidate
+
+
+def test_boundary_v12_binding_before_original_assignment_rejected_direct_and_emitted(tmp_path, monkeypatch):
+    import runpy
+
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    original = ("import pytest\n\nBYPASS = 'helper_disable' in globals()\n\n"
+        "def test_original():\n    if BYPASS:\n        return\n    assert False, 'original assertion'\n")
+    inserted = "def helper_disable():\n    return True\n\n"
+    candidate = original.replace("BYPASS =", inserted + "BYPASS =")
+    baseline_path, changed_path = tmp_path / "baseline.py", tmp_path / "changed.py"
+    baseline_path.write_text(original, encoding="utf-8")
+    changed_path.write_text(candidate, encoding="utf-8")
+    baseline, changed = runpy.run_path(str(baseline_path)), runpy.run_path(str(changed_path))
+    assert baseline["BYPASS"] is False and changed["BYPASS"] is True
+    with pytest.raises(AssertionError, match="original assertion"):
+        baseline["test_original"]()
+    assert changed["test_original"]() is None
+    with pytest.raises(ValueError, match="original_test_module_changed"):
+        preserve_original_tests(original, candidate, (), profile)
+    result, _, _ = _insertion_v9_run_emitted(tmp_path, original, candidate, profile)
+    assert result.returncode != 0 and "original_test_module_changed" in result.stderr
+
+
+@pytest.mark.parametrize("header", ["default", "kwdefault", "decorator", "annotation", "type_parameters"])
+def test_boundary_v12_binding_before_original_header_rejected_direct_and_emitted(tmp_path, monkeypatch, header):
+    import runpy
+
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    prefix = ("import pytest\n\ndef helper_wrap(function):\n"
+        "    function.observed = 'helper_disable' in globals()\n    return function\n\n")
+    definitions = {
+        "default": "def helper_observe(value=('helper_disable' in globals())):\n    return value\n",
+        "kwdefault": "def helper_observe(*, value=('helper_disable' in globals())):\n    return value\n",
+        "decorator": "@helper_wrap\ndef helper_observe():\n    return None\n",
+        "annotation": "def helper_observe(value: ('helper_disable' in globals())):\n    return value\n",
+        "type_parameters": "def helper_observe[T]():\n    return None\n",
+    }
+    definition = definitions[header]
+    original = prefix + definition + "\ndef test_original():\n    assert True\n"
+    candidate = original.replace(definition, "def helper_disable():\n    return True\n\n" + definition)
+    if header != "type_parameters":
+        baseline_path, changed_path = tmp_path / "baseline.py", tmp_path / "changed.py"
+        baseline_path.write_text(original, encoding="utf-8")
+        changed_path.write_text(candidate, encoding="utf-8")
+        baseline, changed = runpy.run_path(str(baseline_path)), runpy.run_path(str(changed_path))
+        if header in {"default", "kwdefault"}:
+            assert baseline["helper_observe"]() is False and changed["helper_observe"]() is True
+        elif header == "decorator":
+            assert baseline["helper_observe"].observed is False and changed["helper_observe"].observed is True
+        else:
+            assert baseline["helper_observe"].__annotations__["value"] is False
+            assert changed["helper_observe"].__annotations__["value"] is True
+    with pytest.raises(ValueError, match="original_test_module_changed"):
+        preserve_original_tests(original, candidate, (), profile)
+    result, _, _ = _insertion_v9_run_emitted(tmp_path, original, candidate, profile)
+    assert result.returncode != 0 and "original_test_module_changed" in result.stderr
+
+
+def test_boundary_v12_after_assignment_middle_insertion_executes_with_original_value(tmp_path, monkeypatch):
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    original = ("import pytest\n\nBYPASS = 'helper_disable' in globals()\n\n"
+        "def test_original():\n    assert BYPASS is False\n")
+    inserted = ("def helper_disable():\n    return True\n\n"
+        "def test_added_boundary():\n    assert helper_disable() is True\n    assert BYPASS is False\n\n")
+    candidate = original.replace("def test_original():", inserted + "def test_original():")
+    preserve_original_tests(original, candidate, (), profile)
+    result, _, test = _insertion_v9_run_emitted(tmp_path, original, candidate, profile)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "native_added_test_outcomes=" in result.stdout and "1 passed" in result.stdout
+    assert test.read_text() == candidate
+
+
+def test_boundary_v12_deferred_annotation_and_literal_default_allow_middle_insertion(tmp_path, monkeypatch):
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    original = ("from __future__ import annotations\nimport pytest\n\ndef helper_anchor():\n    return None\n\n"
+        "def helper_observe(value: ('helper_disable' in globals()), *, fixed=3):\n    return value + fixed\n\n"
+        "def test_original():\n    assert helper_observe(1) == 4\n")
+    inserted = ("def helper_disable():\n    return True\n\n"
+        "def test_added_deferred():\n    assert helper_disable() is True\n    assert helper_observe(1) == 4\n"
+        "    assert isinstance(helper_observe.__annotations__['value'], str)\n\n")
+    candidate = original.replace("def helper_observe(", inserted + "def helper_observe(")
+    preserve_original_tests(original, candidate, (), profile)
+    result, _, test = _insertion_v9_run_emitted(tmp_path, original, candidate, profile)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "native_added_test_outcomes=" in result.stdout and "1 passed" in result.stdout
+    assert test.read_text() == candidate
