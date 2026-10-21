@@ -514,9 +514,11 @@ class BridgeLedger:
         with self._db() as db:
             return db.execute("SELECT 1 FROM inbox WHERE message=?", (str(message),)).fetchone() is not None
 
-    def inbox_pending(self) -> bool:
+    def inbox_pending(self, message: int | None = None) -> bool:
         with self._db() as db:
-            return db.execute("SELECT 1 FROM inbox WHERE done=0").fetchone() is not None
+            if message is None:
+                return db.execute("SELECT 1 FROM inbox WHERE done=0").fetchone() is not None
+            return db.execute("SELECT 1 FROM inbox WHERE done=0 AND message=?", (str(message),)).fetchone() is not None
 
     def claim_next(self, consumer: str) -> dict | None:
         with self._db() as db:
@@ -703,10 +705,12 @@ class RuntimeDiscordBridge:
                     validate_public_text(question, max_chars=4000)
                 except QueryPrivacyError:
                     raise BridgeError("question_not_public") from None
-            self.inbox_senders[str(event.message_id)] = send
             if not self.ledger.enqueue(event, question, previous, intake, self.inbox_consumer):
-                await self.recover_inbox()
+                if self.ledger.inbox_pending(event.message_id):
+                    self.inbox_senders[str(event.message_id)] = send
+                    await self.recover_inbox()
                 return
+            self.inbox_senders[str(event.message_id)] = send
             if self.drain_token() is not None:
                 self.ledger.inbox_update(str(event.message_id), release=True)
                 self.activity()
@@ -952,10 +956,15 @@ async def run_discord(settings: DiscordRuntimeSettings) -> int:
                     raise BridgeError("repair_delivery_scope_mismatch")
                 result = await channel.send(text, allowed_mentions=discord.AllowedMentions.none(), suppress_embeds=True)
                 return result.id
-            if bridge.repairs is not None:
-                await bridge.recover_intakes(send)
-            else:
-                await bridge.recover_inbox(send)
+            try:
+                if bridge.repairs is not None:
+                    await bridge.recover_intakes(send)
+                else:
+                    await bridge.recover_inbox(send)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — transport failure must not end periodic recovery．
+                logging.getLogger(__name__).error("discord_recovery_pass_failed:%s", type(exc).__name__)
             await asyncio.sleep(2)
 
     async def drain_outbox():

@@ -1429,3 +1429,103 @@ async def test_queue_preclaim_receipt_failure_retains_payload_and_fifo_for_recov
     assert [message for message, text in delivered if text.startswith("回答：")] == ["1", "2"]
     assert [message for message, text in delivered if text == RECEIPT] == ["1", "2"]
     assert not ledger.inbox_pending()
+
+
+@pytest.mark.asyncio
+async def test_queue_poll_sdk_retries_failed_delivery_pass_without_reconnect(tmp_path, monkeypatch, caplog):
+    from ephy_worker import discord_runtime
+    config = settings(tmp_path)
+    ledger = BridgeLedger(config)
+    assert ledger.enqueue(event(), "待機中の質問", "参照回答", None)
+    sent, calls, clients = [], [], []
+    completed = asyncio.Event()
+    real_sleep = asyncio.sleep
+    async def short_poll(seconds):
+        await real_sleep(0.001 if seconds == 2 else seconds)
+    monkeypatch.setattr(discord_runtime.asyncio, "sleep", short_poll)
+    class Gateway:
+        def __init__(self, *args, **kwargs): pass
+        async def answer(self, question, previous):
+            calls.append((question, previous))
+            return "復旧後の回答です．"
+        async def aclose(self): pass
+    class Channel:
+        guild = SimpleNamespace(id=11)
+        async def send(self, text, **options):
+            sent.append(text)
+            assert options["suppress_embeds"] is True
+            if len(sent) <= 2:
+                raise RuntimeError("fixture-private-transport-error")
+            if text == "復旧後の回答です．":
+                completed.set()
+            return SimpleNamespace(id=100 + len(sent))
+    channel = Channel()
+    class Client:
+        def __init__(self, **kwargs):
+            self.application_id, self.user = kwargs["application_id"], SimpleNamespace(id=10)
+            self.closed, self.ready_calls = False, 0
+            clients.append(self)
+        def event(self, callback):
+            setattr(self, callback.__name__, callback)
+            return callback
+        def is_closed(self):
+            return self.closed
+        def get_channel(self, identifier):
+            assert identifier == 20
+            return channel
+        async def start(self, *_args, **_kwargs):
+            self.ready_calls += 1
+            await self.on_ready()
+            await asyncio.wait_for(completed.wait(), 3)
+        async def close(self):
+            self.closed = True
+    sdk = SimpleNamespace(Client=Client, Intents=SimpleNamespace(none=lambda: SimpleNamespace()),
+        AllowedMentions=SimpleNamespace(none=lambda: None), LoginFailure=type("LoginFailure", (Exception,), {}))
+    monkeypatch.setitem(sys.modules, "discord", sdk)
+    monkeypatch.setattr(discord_runtime, "RuntimeGateway", Gateway)
+    monkeypatch.setenv("EPHY_DISCORD_BOT_TOKEN", "fixture-discord-token-private")
+    assert await asyncio.wait_for(run_discord(config), 4) == 0
+    assert clients[0].ready_calls == 1 and clients[0].closed
+    assert calls == [("待機中の質問", "参照回答")]
+    assert sent[0] == sent[2] == RECEIPT and sent[-1] == "復旧後の回答です．"
+    assert "discord_recovery_pass_failed:RuntimeError" in caplog.text
+    assert "fixture-private-transport-error" not in caplog.text
+    assert not ledger.inbox_pending()
+
+
+@pytest.mark.asyncio
+async def test_queue_poll_terminal_duplicate_releases_sender_but_pending_duplicate_recovers(tmp_path):
+    import gc
+    import weakref
+    config = settings(tmp_path)
+    class Gateway:
+        def __init__(self):
+            self.calls = []
+        async def answer(self, question, _previous):
+            self.calls.append(question)
+            return "回答です．"
+    gateway = Gateway()
+    ledger = BridgeLedger(config)
+    bridge = RuntimeDiscordBridge(config, gateway, ledger)
+    sent = []
+    async def send(text):
+        sent.append(text)
+    await bridge.handle(event(), send)
+    assert bridge.inbox_senders == {}
+    class Message:
+        pass
+    message = Message()
+    reference = weakref.ref(message)
+    async def duplicate_sender(_text, captured=message):
+        pytest.fail("terminal duplicate should not send or retain its message")
+    await bridge.handle(event(), duplicate_sender)
+    assert bridge.inbox_senders == {}
+    del duplicate_sender, message
+    gc.collect()
+    assert reference() is None
+    pending = event(message_id=2, content="<@10> 次の公開の質問")
+    assert ledger.enqueue(pending, "次の公開の質問", None, None)
+    await bridge.handle(pending, send)
+    assert gateway.calls == ["公開の質問", "次の公開の質問"]
+    assert sent == [RECEIPT, "回答です．", RECEIPT, "回答です．"]
+    assert bridge.inbox_senders == {} and not ledger.inbox_pending()
