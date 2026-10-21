@@ -2305,3 +2305,124 @@ def test_outcomes_v8_actual_completion_wrapper_supports_trusted_native_pytest(tm
     record = verify_completion(completion, result.returncode)["record"]
     assert record["outcome"] == "returned" and record["exit_code"] == 0
     assert "native_added_test_outcomes=" in result.stdout and "1 passed" in result.stdout
+
+
+
+def _insertion_v9_run_emitted(tmp_path, original, candidate, profile):
+    baseline, marker, test = _native_tests_run_emitted(tmp_path, original, "", profile)
+    assert baseline.returncode == 0, baseline.stdout + baseline.stderr
+    test.write_bytes(candidate.encode("utf-8"))
+    environment = dict(os.environ)
+    environment.update({name: str(tmp_path / "trusted-emitted-temp") for name in ("TEMP", "TMP", "TMPDIR")})
+    result = subprocess.run([sys.executable, "-I", "-X", "utf8", "-B", str(tmp_path / "checker/checker.py"), str(test.parent)],
+        env=environment, capture_output=True, text=True, encoding="utf-8", timeout=30, check=False)
+    return result, marker, test
+
+
+def test_insertion_v9_native_middle_functions_really_execute_with_originals_intact(tmp_path, monkeypatch):
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    original = ("from pathlib import Path\nimport pytest\n\nclass Feature:\n"
+        "    def answer(self, value):\n        return value + 1\n"
+        "\n@pytest.fixture\ndef existing_value():\n    return 2\n"
+        "\n# original comment remains exact\ndef test_first():\n    raise AssertionError('original must not run')\n"
+        "\ndef test_last():\n    raise AssertionError('original must not run')\n")
+    inserted = ("def helper_middle(value):\n    return getattr(Feature(), 'answer')(value)\n\n"
+        "def test_middle(tmp_path: Path, existing_value: int) -> None:\n"
+        "    path = tmp_path / 'answer.txt'\n    path.write_text(str(helper_middle(existing_value)))\n"
+        "    assert path.read_text() == '3'\n\n"
+        "@pytest.mark.asyncio\nasync def test_middle_async(tmp_path: Path) -> None:\n"
+        "    import asyncio\n    await asyncio.sleep(0)\n    assert tmp_path.is_dir()\n\n")
+    candidate = original.replace("def test_last():", inserted + "def test_last():")
+    preserve_original_tests(original, candidate, (), profile)
+    result, marker, test = _insertion_v9_run_emitted(tmp_path, original, candidate, profile)
+    assert result.returncode == 0 and marker.exists(), result.stdout + result.stderr
+    summary = json.loads(next(line.split("=", 1)[1] for line in result.stdout.splitlines()
+        if line.startswith("native_added_test_outcomes=")))
+    assert len(summary["collected"]) == 2 and summary["invalid"] == []
+    assert {name.split("::")[-1] for name in summary["collected"]} == {"test_middle", "test_middle_async"}
+    assert all(phases == {"setup": "passed", "call": "passed", "teardown": "passed"} for phases in summary["reports"].values())
+    assert test.read_bytes() == candidate.encode("utf-8")
+
+
+@pytest.mark.parametrize("invoke", ["getattr(pytest, 'skip')('fixture skipped insertion')",
+    "pytest.__dict__['skip']('fixture skipped insertion')"])
+def test_insertion_v9_middle_dynamic_skip_is_an_executed_failed_outcome(tmp_path, monkeypatch, invoke):
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    original = "import pytest\n\ndef test_first():\n    assert True\n\ndef test_last():\n    assert True\n"
+    candidate = original.replace("def test_last():", "def test_inserted():\n    " + invoke + "\n\ndef test_last():")
+    preserve_original_tests(original, candidate, (), profile)
+    result, marker, _ = _insertion_v9_run_emitted(tmp_path, original, candidate, profile)
+    assert result.returncode != 0 and marker.exists() and "native_added_tests_not_passed" in result.stderr
+    summary = json.loads(next(line.split("=", 1)[1] for line in result.stdout.splitlines()
+        if line.startswith("native_added_test_outcomes=")))
+    assert len(summary["collected"]) == 1 and summary["collected"][0].endswith("::test_inserted")
+    assert next(iter(summary["reports"].values()))["call"] == "skipped"
+
+
+@pytest.mark.parametrize("change", ["assertion", "comment_deletion", "reorder", "top_level_statement"])
+def test_insertion_v9_native_original_mutations_and_nonfunctions_still_rejected(tmp_path, monkeypatch, change):
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    first = "def test_first():\n    assert True\n"
+    last = "def test_last():\n    assert 1 == 1\n"
+    original = "# original comment\n" + first + "\n" + last
+    candidates = {"assertion": original.replace("assert True", "assert False"),
+        "comment_deletion": original.replace("# original comment\n", ""),
+        "reorder": "# original comment\n" + last + "\n" + first,
+        "top_level_statement": original.replace("def test_last():", "activated = object()\n\ndef test_last():")}
+    candidate = candidates[change]
+    code = "only_new_test_or_helper_functions_may_append" if change == "top_level_statement" else "original_test_module_changed"
+    with pytest.raises(ValueError, match=code):
+        preserve_original_tests(original, candidate, (), profile)
+    result, _, _ = _insertion_v9_run_emitted(tmp_path, original, candidate, profile)
+    assert result.returncode != 0 and code in result.stderr
+
+
+def test_insertion_v9_default_closed_dsl_remains_append_only(tmp_path, monkeypatch):
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    original = "def test_first():\n    assert True\n\ndef test_last():\n    assert True\n"
+    added = "def test_added():\n    assert 1 == 1\n\n"
+    middle = original.replace("def test_last():", added + "def test_last():")
+    preserve_original_tests(original, middle, (), profile)
+    with pytest.raises(ValueError, match="original_test_module_changed"):
+        preserve_original_tests(original, middle)
+    preserve_original_tests(original, original + "\n" + added)
+
+
+def test_insertion_v9_initial_and_retry_import_hints_are_grounded_in_original_source(tmp_path, monkeypatch):
+    import hashlib
+
+    from ephy_worker.formal_artifacts import GateFailure
+
+    discovery, args, proposal = _controls_loop_fixture(tmp_path, monkeypatch)
+    template, _ = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    test_name = "tests/test_feature.py"
+    args[7][test_name] = "from packages.karte_core.context import KarteContextClient\n" + args[7][test_name]
+    module_name = "packages/karte_core/context.py"
+    args[7][module_name] = "class KarteContextClient:\n    pass\n"
+    args[4]["allowed_files"].append(module_name)
+    for name in (test_name, module_name):
+        path = args[2].source / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(args[7][name].encode("utf-8"))
+        args[6][name] = {"sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    prompts = []
+    def complete(prompt, _runtime):
+        prompts.append(json.loads(prompt))
+        return {"bad": "fixture response shape"} if len(prompts) == 1 else json.loads(json.dumps(proposal))
+    monkeypatch.setattr(discovery, "completion", complete)
+    def measured(*_):
+        raise GateFailure("fixture_import_guidance_observed")
+    monkeypatch.setattr(discovery, "measure_controls", measured)
+    with pytest.raises(GateFailure, match="fixture_import_guidance_observed"):
+        discovery.prepare_controls(*args[:3], template, *args[4:])
+    assert len(prompts) == 2
+    for prompt in prompts:
+        assert prompt["request"] == args[0]["text"] and prompt["source"] == args[7]
+        hints = prompt["original_test_import_guidance"]
+        assert hints["selected_source_paths"] == list(args[7])
+        assert "from packages.karte_core.context import KarteContextClient" in hints["original_test_imports"][test_name]
+        assert all("from karte_core" not in statement for statement in hints["original_test_imports"][test_name])
+    for instruction in (prompts[0]["instruction"], prompts[1]["previous_attempt"]["correction"]):
+        assert "Insert new test/helper definitions between original top-level nodes or append them at EOF" in instruction
+        assert "original_test_import_guidance" in instruction and "not success proof" in instruction
+        assert "do not assume a shorter package root or add import fallbacks" in instruction
