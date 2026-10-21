@@ -1287,3 +1287,89 @@ async def test_discovery_queue_owner_retryable_exception_keeps_fifo_head(tmp_pat
     with bridge.repairs.db() as db:
         assert db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 1
     assert sent.count(RECEIPT) == 1
+
+
+def test_context_review_unseen_selection_requires_code_and_next_round_confirmation(tmp_path, monkeypatch):
+    discovery, templates, inventories, _ = _discovery_queue_scope_fixture(tmp_path)
+    source = discovery.config.repositories["ephy-worker"].source
+    for index in range(6):
+        name = f"src/ephy_worker/search_ranked_{index}.py"
+        (source / name).write_text("# search\n" * 1000, encoding="utf-8")
+        inventories["ephy-worker"].append(name)
+    unseen = "src/ephy_worker/z_feature.py"
+    (source / unseen).write_text("def unseen_answer():\n    return 42\n", encoding="utf-8")
+    inventories["ephy-worker"].append(unseen)
+    selected = {"repository": "ephy-worker", "allowed_files": [unseen, "tests/test_search.py"],
+        "semantic_scope": "Improve answer behavior"}
+    prompts = []
+    def complete(prompt, _runtime):
+        prompts.append(json.loads(prompt))
+        return selected
+    monkeypatch.setattr(discovery, "completion", complete)
+    assert discovery.select_scope({"text": "search", "previous": None}, templates, inventories, tmp_path / "private") == selected
+    assert len(prompts) == 2 and unseen not in prompts[0]["code_context"]["ephy-worker"]
+    assert "def unseen_answer()" in prompts[1]["code_context"]["ephy-worker"][unseen]["text"]
+    assert "tests/test_search.py" in prompts[1]["code_context"]["ephy-worker"]
+    assert prompts[1]["previous_selection_error"] == "discovery_scope_confirmation_required"
+    assert len(json.dumps(prompts[0]["code_context"], ensure_ascii=False).encode("utf-8")) <= 12000
+
+
+def test_context_review_four_multibyte_read_more_excerpts_survive_next_prompts(tmp_path, monkeypatch):
+    discovery, templates, inventories, selected = _discovery_queue_scope_fixture(tmp_path)
+    source = discovery.config.repositories["ephy-worker"].source
+    requested = []
+    for index in range(4):
+        name = f"src/ephy_worker/read_extra_{index}.py"
+        (source / name).write_text("# 日本語\n" + "日" * 8000, encoding="utf-8")
+        inventories["ephy-worker"].append(name)
+        requested.append(name)
+    for index in range(4):
+        name = f"src/ephy_worker/z_later_{index}.py"
+        (source / name).write_text("# additional context\n" * 1000, encoding="utf-8")
+        inventories["ephy-worker"].append(name)
+    responses = iter([{"read_more": {"ephy-worker": requested}}, {}, selected])
+    prompts = []
+    def complete(prompt, _runtime):
+        prompts.append(json.loads(prompt))
+        return next(responses)
+    monkeypatch.setattr(discovery, "completion", complete)
+    assert discovery.select_scope({"text": "search", "previous": None}, templates, inventories, tmp_path / "private") == selected
+    for name in requested:
+        second = prompts[1]["code_context"]["ephy-worker"][name]
+        assert second == prompts[2]["code_context"]["ephy-worker"][name]
+        assert second["truncated"] is True and second["utf8_bytes"] == len(second["text"].encode("utf-8"))
+        assert second["text"] and "日本語" in second["text"]
+    assert all(len(json.dumps(prompt["code_context"], ensure_ascii=False).encode("utf-8")) <= 24000 for prompt in prompts)
+
+
+def test_context_review_oversized_read_more_is_atomic_and_preserves_accepted_context(tmp_path, monkeypatch):
+    from ephy_worker.formal_artifacts import GateFailure
+    discovery, templates, inventories, _ = _discovery_queue_scope_fixture(tmp_path)
+    source = discovery.config.repositories["ephy-worker"].source
+    for index in range(6):
+        name = f"src/ephy_worker/search_ranked_{index}.py"
+        (source / name).write_text("# search\n" * 1000, encoding="utf-8")
+        inventories["ephy-worker"].append(name)
+    groups = []
+    for group in ("first", "second"):
+        names = []
+        for index in range(4):
+            name = f"src/ephy_worker/z_{group}_{index}.py"
+            (source / name).write_text("# 日本語\n" + "日" * 8000, encoding="utf-8")
+            inventories["ephy-worker"].append(name)
+            names.append(name)
+        groups.append(names)
+    responses = iter([{"read_more": {"ephy-worker": groups[0]}}, {"read_more": {"ephy-worker": groups[1]}}, {}])
+    prompts = []
+    def complete(prompt, _runtime):
+        prompts.append(json.loads(prompt))
+        return next(responses)
+    monkeypatch.setattr(discovery, "completion", complete)
+    directory = tmp_path / "private"
+    with pytest.raises(GateFailure, match="discovery_scope_exhausted"):
+        discovery.select_scope({"text": "search", "previous": None}, templates, inventories, directory)
+    assert prompts[2]["previous_selection_error"] == "discovery_context_request_too_large"
+    assert prompts[1]["code_context"] == prompts[2]["code_context"]
+    assert all(name in prompts[2]["code_context"]["ephy-worker"] for name in groups[0])
+    assert all(name not in prompts[2]["code_context"]["ephy-worker"] for name in groups[1])
+    assert json.loads((directory / "scope-attempt-2.validation.json").read_text())["error"] == "discovery_context_request_too_large"

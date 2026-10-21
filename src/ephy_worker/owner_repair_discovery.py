@@ -592,31 +592,77 @@ class LocalDiscovery:
                 ranked.append((score, alias, name, text))
         ranked.sort(key=lambda row: (-row[0], row[1], row[2]))
         context = {}
+        requested_context = set()
+
+        def include_excerpts(matches, *, limit=24000, maximum=4000, automatic=False):
+            # Allocate the whole batch before committing; accepted requested code is immutable．
+            proposed = {alias: dict(files) for alias, files in context.items()}
+            pending = []
+            for _, alias, name, text in matches:
+                if (alias, name) in requested_context:
+                    continue
+                start = 0
+                window_truncated = False
+                if automatic:
+                    original = text
+                    lines = text.splitlines()
+                    hits = [index for index, line in enumerate(lines) if any(term in line.casefold() for term in terms)]
+                    start = max(0, hits[0] - 8) if hits else 0
+                    text = "\n".join(lines[start:start + 100])
+                    window_truncated = text != original
+                entry = {"start_line": start + 1, "text": "", "truncated": True, "utf8_bytes": 0}
+                proposed.setdefault(alias, {})[name] = entry
+                pending.append((entry, text, window_truncated))
+            if not pending:
+                return
+            available = limit - len(json.dumps(proposed, ensure_ascii=False).encode("utf-8")) - 8 * len(pending)
+            share = min(maximum, available // len(pending))
+            if any(share < min(256, len(json.dumps(text, ensure_ascii=False).encode("utf-8")) - 2) for _, text, _ in pending):
+                raise GateFailure("discovery_context_request_too_large")
+            for entry, text, window_truncated in pending:
+                low, high = 0, len(text)
+                while low < high:
+                    middle = (low + high + 1) // 2
+                    if len(json.dumps(text[:middle], ensure_ascii=False).encode("utf-8")) - 2 <= share:
+                        low = middle
+                    else:
+                        high = middle - 1
+                excerpt = text[:low]
+                entry.update(text=excerpt, truncated=window_truncated or low < len(text), utf8_bytes=len(excerpt.encode("utf-8")))
+            if len(json.dumps(proposed, ensure_ascii=False).encode("utf-8")) > limit:
+                raise GateFailure("discovery_context_request_too_large")
+            context.clear()
+            context.update(proposed)
+            if not automatic:
+                requested_context.update((alias, name) for _, alias, name, _ in matches)
+
         cursor = 0
         feedback = None
         for attempt in range(1, 4):
             # Expand retrieval automatically after an empty/invalid answer, without inventing scope．
             added = 0
-            while cursor < len(ranked) and added < (0 if feedback == "discovery_read_more_requested" else 4):
-                _, alias, name, text = ranked[cursor]
+            automatic_count = 0 if feedback in {"discovery_read_more_requested", "discovery_scope_confirmation_required",
+                "discovery_context_request_too_large"} else (6 if attempt == 1 else 4)
+            while cursor < len(ranked) and added < automatic_count:
+                match = ranked[cursor]
+                _, alias, name, _ = match
                 cursor += 1
                 if name in context.get(alias, {}):
                     continue
-                lines = text.splitlines()
-                hits = [index for index, line in enumerate(lines) if any(term in line.casefold() for term in terms)]
-                start = max(0, hits[0] - 8) if hits else 0
-                excerpt = "\n".join(lines[start:start + 100])[:5000]
-                context.setdefault(alias, {})[name] = {"start_line": start + 1, "text": excerpt}
+                try:
+                    include_excerpts([match], limit=12000 if attempt == 1 else 24000, maximum=1500, automatic=True)
+                except GateFailure:
+                    break
                 added += 1
-            while len(json.dumps(context, ensure_ascii=False).encode("utf-8")) > 24000:
-                oldest = next(alias for alias, files in context.items() if files)
-                context[oldest].pop(next(iter(context[oldest])))
             prompt = {"request": job["text"], "previous_answer": job.get("previous"),
                 "repositories": inventories, "code_context": context, "previous_selection_error": feedback,
                 "response_schema": {"repository": "registered alias", "allowed_files": ["up to12 exact source/test/doc paths"],
                     "semantic_scope": "short public-safe repair and acceptance summary"},
                 "read_more_schema": {"read_more": {"registered alias": ["up to4 existing paths to inspect"]}},
                 "instruction": "Inspect the supplied real code and select a bounded implementation repair with an existing tests file. "
+                    "Only confirm selected existing files after inspecting their supplied code_context. Unseen selections will "
+                    "receive code and need confirmation in the next round. Excerpts are explicitly bounded/truncated; accepted "
+                    "read_more excerpts remain available. If a batch exceeds remaining context space, request fewer files. "
                     "If more code is needed, return only read_more instead of an empty object. Do not change governance, secrets, "
                     "repair controller, Discord authorization, release settings or unrelated code. Protected paths stay forbidden. "
                     "semantic_scope is a public-safe implementation summary, not a quotation of the private request/context."}
@@ -626,6 +672,7 @@ class LocalDiscovery:
                     requested = initial["read_more"]
                     if not isinstance(requested, dict) or not requested or sum(len(names) for names in requested.values() if isinstance(names, list)) > 4:
                         raise GateFailure("discovery_read_more_invalid")
+                    matches = []
                     for alias, names in requested.items():
                         if alias not in inventories or not isinstance(names, list) or not names:
                             raise GateFailure("discovery_read_more_invalid")
@@ -633,8 +680,10 @@ class LocalDiscovery:
                             match = next((row for row in ranked if row[1] == alias and row[2] == name), None)
                             if match is None:
                                 raise GateFailure("discovery_read_more_protected_or_unknown")
-                            context.setdefault(alias, {}).pop(name, None)
-                            context[alias][name] = {"start_line": 1, "text": match[3][:8000]}
+                            matches.append(match)
+                    if len({(row[1], row[2]) for row in matches}) != len(matches):
+                        raise GateFailure("discovery_read_more_invalid")
+                    include_excerpts(matches)
                     raise GateFailure("discovery_read_more_requested")
                 if (set(initial) != {"repository", "allowed_files", "semantic_scope"}
                         or initial["repository"] not in self.config.repositories):
@@ -647,6 +696,16 @@ class LocalDiscovery:
                         or not any(name.startswith("tests/") and (profile.source / name).is_file() for name in names)
                         or not isinstance(initial["semantic_scope"], str) or not initial["semantic_scope"].strip()):
                     raise GateFailure("discovery_scope_protected_or_missing_tests")
+                unseen = []
+                for name in names:
+                    if (profile.source / name).exists() and name not in context.get(initial["repository"], {}):
+                        match = next((row for row in ranked if row[1] == initial["repository"] and row[2] == name), None)
+                        if match is None:
+                            raise GateFailure("discovery_selected_source_unreadable")
+                        unseen.append(match)
+                if unseen:
+                    include_excerpts(unseen)
+                    raise GateFailure("discovery_scope_confirmation_required")
                 return initial
             except (GateFailure, TypeError, ValueError) as exc:
                 if isinstance(exc, GateFailure) and not str(exc).startswith("discovery_"):
