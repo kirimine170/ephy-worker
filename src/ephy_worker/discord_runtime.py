@@ -62,6 +62,7 @@ class DiscordRuntimeSettings(BaseModel):
     allowed_channel_ids: tuple[Snowflake, ...] = Field(min_length=1, max_length=100)
     allowed_user_ids: tuple[Snowflake, ...] = Field(min_length=1, max_length=100)
     additional_channels: tuple[DiscordChannel, ...] = Field(default=(), max_length=100)
+    community_guild_ids: tuple[Snowflake, ...] = Field(default=(), max_length=30)
     runtime_url: str = "http://127.0.0.1:8000"
     token_env: str = "EPHY_DISCORD_BOT_TOKEN"
     read_message_content: StrictBool = False
@@ -81,7 +82,7 @@ class DiscordRuntimeSettings(BaseModel):
             raise ValueError("owner_repair_config_must_be_absolute_unlinked")
         return value
 
-    @field_validator("allowed_channel_ids", "allowed_user_ids")
+    @field_validator("allowed_channel_ids", "allowed_user_ids", "community_guild_ids")
     @classmethod
     def unique_ids(cls, value):
         if len(value) != len(set(value)):
@@ -426,6 +427,62 @@ class RuntimeGateway:
                 await self._cancel(plan_id)
             raise
 
+    async def observe(self, query: str, previous_answer: str | None = None, *, request_id: str,
+                      guild_id: str, channel_id: str, operation: str, period_days: int) -> str:
+        if (int(guild_id) not in self.settings.community_guild_ids
+                or not self.settings.allows_channel(int(guild_id), int(channel_id))
+                or not query.strip() or len(query) > 4000
+                or any(secret and secret in query for secret in self.secrets)
+                or any(ord(c) < 32 and c not in "\n\t" for c in query)):
+            raise BridgeError("community_request_invalid")
+        payload = {"request_id": request_id, "guild_id": guild_id, "channel_id": channel_id,
+            "operation": operation, "period_days": period_days, "query": query,
+            "previous_answer": bounded_text(safe_final(previous_answer, self.secrets), 1200) if previous_answer else None}
+        bound = {}
+        worker_id = None
+        while True:
+            try:
+                timeout = httpx.Timeout(connect=10, read=self.settings.read_idle_timeout_seconds, write=30, pool=30)
+                async with self.client.stream("POST", self.settings.runtime_url + "/v1/discord/observe",
+                        json=payload, timeout=timeout) as response:
+                    if response.status_code not in {200, 202}:
+                        raise BridgeError("runtime_request_failed")
+                    data = await self._json(response)
+                    status = data.get("discord_observe_status")
+                    if (not isinstance(status, dict) or status.get("provider") != "worker"
+                            or status.get("contract") != "0.4" or status.get("request_id") != request_id):
+                        raise BridgeError("runtime_observation_identity_mismatch")
+                    for name in ("job_id", "input_hash"):
+                        value = status.get(name)
+                        if value is None and name not in bound and response.status_code == 202:
+                            continue
+                        if (not isinstance(value, str) or not _ID.fullmatch(value)
+                                or name == "input_hash" and not re.fullmatch(r"[0-9a-f]{64}", value)
+                                or name in bound and bound[name] != value):
+                            raise BridgeError("runtime_observation_identity_mismatch")
+                        bound[name] = value
+                    actual_worker = status.get("worker_id")
+                    if actual_worker is not None:
+                        if (not isinstance(actual_worker, str) or actual_worker == "auto"
+                                or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", actual_worker)
+                                or worker_id is not None and worker_id != actual_worker):
+                            raise BridgeError("runtime_observation_identity_mismatch")
+                        worker_id = actual_worker
+                    if response.status_code == 202:
+                        if status.get("status") != "pending":
+                            raise BridgeError("runtime_observation_identity_mismatch")
+                        await asyncio.sleep(self.settings.poll_interval_seconds)
+                        continue
+                    if (status.get("status") not in {"completed", "partial"} or worker_id is None
+                            or status.get("analysis_status") not in {"verified", "unverified"}):
+                        raise BridgeError("runtime_observation_not_completed")
+                    try:
+                        return safe_final(data["choices"][0]["message"]["content"], self.secrets)
+                    except (KeyError, IndexError, TypeError):
+                        raise BridgeError("runtime_answer_invalid") from None
+            except (httpx.HTTPError, ValueError, UnicodeError):
+                raise BridgeError("runtime_unavailable_or_invalid_response") from None
+
     async def classify_repair(self, query: str, previous_answer: str | None = None) -> bool:
         from .owner_repair import parse_repair_intent
         if (not query or len(query) > 4000 or any(secret and secret in query for secret in self.secrets)
@@ -707,13 +764,15 @@ class RuntimeDiscordBridge:
             if not event.mentioned and previous is None:
                 return
             question = re.sub(rf"<@!?{self.settings.application_id}>", "", event.content).strip()
+            from .discord_community import community_intent
+            community = event.guild_id in self.settings.community_guild_ids and community_intent(question)
             self.ledger.check_admission(event.message_id)
             intake = None
-            if owner_route:
+            if owner_route and not community:
                 # Local durable capture precedes the first receipt/model/network await．
                 intake = self.repairs.capture_intake(guild_id=event.guild_id, channel_id=event.channel_id,
                     message_id=event.message_id, author_id=event.user_id, text=question, previous_answer=previous)
-            if not owner_route:
+            if not owner_route and not community:
                 try:
                     validate_public_text(question, max_chars=4000)
                 except QueryPrivacyError:
@@ -800,7 +859,19 @@ class RuntimeDiscordBridge:
                             self.ledger.inbox_update(message, done=True)
                             await deliver(_INTERRUPTED)
                             continue
-                        task = asyncio.create_task(self.gateway.answer(row["question"], row["previous"]))
+                        from .discord_community import community_intent
+                        intent = community_intent(row["question"]) if int(row["guild"]) in self.settings.community_guild_ids else None
+                        if intent:
+                            task = asyncio.create_task(self.gateway.observe(row["question"], row["previous"],
+                                request_id=message, guild_id=row["guild"], channel_id=row["channel"],
+                                operation=intent.operation, period_days=intent.period_days))
+                        else:
+                            # A recovered request must pass the current public/observation boundary again．
+                            try:
+                                validate_public_text(row["question"], max_chars=4000)
+                            except QueryPrivacyError:
+                                raise BridgeError("question_not_public") from None
+                            task = asyncio.create_task(self.gateway.answer(row["question"], row["previous"]))
                         done, _ = await asyncio.wait({task}, timeout=self.progress_seconds)
                         if not done:
                             await deliver(PROGRESS)

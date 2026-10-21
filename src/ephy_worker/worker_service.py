@@ -33,6 +33,7 @@ from .contracts import (
     ExtractPayload,
     Failure,
     JobUsage,
+    ObserveJobInput,
     QueryResult,
     ResultEnvelope,
     SearchDiagnostic,
@@ -60,6 +61,8 @@ class WorkerService:
         worker_id: str,
         *,
         search_config,
+        observer_config=None,
+        observer=None,
         search=None,
         fetcher: PublicFetcher | None = None,
         heartbeat_interval: float = 20.0,
@@ -69,6 +72,8 @@ class WorkerService:
         self.client = client
         self.worker_id = worker_id
         self.search_config = search_config
+        self.observer_config = observer_config
+        self._observer = observer
         self._search = search
         self._fetcher = fetcher
         self.heartbeat_interval = heartbeat_interval
@@ -95,7 +100,7 @@ class WorkerService:
             contract=CONTRACT_VERSION,
             worker_id=self.worker_id,
             implementation_version=IMPLEMENTATION_VERSION,
-            capabilities=[COLLECT_CAPABILITY],
+            capabilities=[COLLECT_CAPABILITY, *(self.observer_config.capabilities() if self.observer_config else [])],
             os=platform.system() or sys.platform,
             architecture=platform.machine() or "unknown",
             concurrency=1,
@@ -152,6 +157,8 @@ class WorkerService:
                 continue
 
     async def _close_resources(self) -> None:
+        if self._observer is not None:
+            await self._observer.aclose()
         if self._search is not None:
             with suppress(Exception):  # provider cleanup is best-effort during shutdown．
                 await self._search.aclose()
@@ -212,6 +219,8 @@ class WorkerService:
         )
         started = time.monotonic()
         try:
+            if job["mode"] == "observe":
+                return await self._execute_observation(job, attempt_id, lease_token, cancel_event, lost_event, started)
             limits = Limits.model_validate(job["budget"])
             budget = Budget(limits)
             stage = await self._run_stage(job, budget, cancel_event, lost_event)
@@ -274,6 +283,46 @@ class WorkerService:
             except asyncio.CancelledError:
                 pass
             self._current_job = None
+
+    async def _execute_observation(self, job, attempt_id, lease_token, cancel_event, lost_event, started):
+        from .discord_observer import DiscordObserver, activity, empty_payload
+        input = ObserveJobInput.model_validate(job["input"])
+        budget = Budget(Limits.model_validate(job["budget"]))
+        partial = empty_payload(input, content_requested=bool(self.observer_config and self.observer_config.read_message_content))
+        owned = self._observer is None
+        observer = self._observer
+        try:
+            if observer is None and self.observer_config is not None:
+                observer = DiscordObserver(self.observer_config)
+            if observer is None:
+                from .contracts import ObservationFailure
+                partial.failures.append(ObservationFailure(stage="worker", code="observer_not_configured"))
+                payload = partial
+            else:
+                payload = await self._run_cancellable(observer.observe(input, budget, result=partial),
+                    partial, cancel_event, lost_event)
+            payload.activity = activity(payload.messages, input)
+            if cancel_event.is_set():
+                status, reason = "cancelled", "cancelled_by_requester"
+                payload.coverage.status = "partial"
+            elif lost_event.is_set():
+                status, reason = "failed", "worker_lease_lost"
+                payload.coverage.status = "partial"
+            elif payload.coverage.status == "complete":
+                status, reason = "succeeded", None
+            elif payload.snapshot.guild or payload.messages:
+                status, reason = "partial", "observation_incomplete"
+            else:
+                status, reason = "failed", "observation_unavailable"
+            envelope = ResultEnvelope(contract=CONTRACT_VERSION, job_id=job["job_id"], attempt_id=attempt_id,
+                status=status, stop_reason=reason, usage=JobUsage(fetch_requests=budget.counts["fetch_requests"],
+                    document_bytes=budget.counts["document_bytes"]),
+                elapsed_seconds=round(time.monotonic() - started, 3), payload=payload)
+            await self._finalize(job["job_id"], lease_token, envelope, cancel_fallback=True)
+            return 0
+        finally:
+            if owned and observer is not None:
+                await observer.aclose()
 
     async def _run_stage(self, job: dict, budget: Budget, cancel_event: asyncio.Event, lost_event: asyncio.Event):
         cancel_check = lambda: cancel_event.is_set() or lost_event.is_set()

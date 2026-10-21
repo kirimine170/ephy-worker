@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 import yaml
 from pydantic import Field, SecretStr, ValidationError, model_validator
 
+from .contracts import SnowflakeString, observation_capability
 from .schema import Limits, StrictModel
 
 
@@ -240,6 +241,33 @@ class RemoteConfig(StrictModel):
         return SecretStr(value)
 
 
+class DiscordObserverConfig(StrictModel):
+    token_env: str = Field(default="EPHY_DISCORD_BOT_TOKEN", pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
+    guild_channels: dict[SnowflakeString, list[SnowflakeString]]
+    read_message_content: bool = False
+    operator_user_ids: list[SnowflakeString] = Field(default_factory=list, max_length=100)
+    retention_days: Literal[30] = 30
+
+    @model_validator(mode="after")
+    def explicit_scope(self):
+        count = sum(len(channels) for channels in self.guild_channels.values())
+        if not self.guild_channels or not 1 <= count <= 30:
+            raise ValueError("observer requires one to thirty explicitly allowed channels")
+        if any(not channels or len(set(channels)) != len(channels) for channels in self.guild_channels.values()):
+            raise ValueError("observer channels must be nonempty and unique")
+        return self
+
+    def capabilities(self) -> list[str]:
+        return ["discord.observe", *(observation_capability(g, c)
+            for g, channels in self.guild_channels.items() for c in channels)]
+
+    def token(self) -> SecretStr:
+        value = _resolve(None, self.token_env, "Discord observer token")
+        if not 20 <= len(value) <= 256 or not re.fullmatch(r"[A-Za-z0-9_.-]+", value):
+            raise ConfigurationError("Discord observer token missing or invalid")
+        return SecretStr(value)
+
+
 class WorkerServiceConfig(StrictModel):
     """collector Worker 側設定（別の PC で起動する）．model は使わない．"""
 
@@ -247,6 +275,7 @@ class WorkerServiceConfig(StrictModel):
     worker_id: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{2,79}$")
     credential_env: str = Field("EPHY_WORKER_CREDENTIAL", pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
     search: SearchConfig
+    discord_observer: DiscordObserverConfig | None = None
     heartbeat_interval_seconds: float = Field(20, gt=0, le=300)
     poll_interval_seconds: float = Field(2, gt=0, le=60)
     allow_remote_api: bool = False
@@ -281,6 +310,8 @@ class ManagerSettings(StrictModel):
     @model_validator(mode="after")
     def consistent(self):
         for worker_id, env in self.worker_credentials_env.items():
+            if worker_id == "auto":
+                raise ValueError("auto is a reserved scheduling target")
             if not re.fullmatch(r"^[a-z0-9][a-z0-9._-]{2,79}$", worker_id):
                 raise ValueError(f"invalid worker_id: {worker_id}")
             if not re.fullmatch(r"^[A-Za-z_][A-Za-z0-9_]*$", env):

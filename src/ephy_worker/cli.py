@@ -141,6 +141,7 @@ async def _run_worker(config) -> int:
         ManagerClient(endpoint, credential),
         settings.worker_id,
         search_config=settings.search,
+        observer_config=settings.discord_observer,
         heartbeat_interval=settings.heartbeat_interval_seconds,
         poll_interval=settings.poll_interval_seconds,
     )

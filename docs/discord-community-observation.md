@@ -1,0 +1,15 @@
+# Discordコミュニティの観測
+
+Managerの既存queueへ`kind: discord.observe`，`input.mode: observe`を追加しました．既存`web.collect`の契約0.4と明示worker指定を維持します．`target_worker_id: auto`では，claim transaction内でheartbeatが新しく，契約，capability，空きconcurrencyが一致するworkerを選びます．active／concurrencyが低い順，同率では最後の割当が古い順，worker ID順です．稼働中leaseの喪失は既存の`lost`となり，自動再実行しません．CPU／GPU負荷は測定していません．
+
+collector設定は[設定例](../configs/collector-discord.example.yaml)を参照してください．Discord tokenは環境変数から接続時だけ解決します．guildと本文取得channelを列挙し，workerは`discord.observe`と各`discord.observe.channel.<guild>.<channel>` capabilityを登録します．本文のallowlistはmetadata取得対象のguildと区別します．snapshotはそのguildの取得可能なchannel／role構成を含みます．メンバー一覧，DM，thread列挙，添付ファイル取得は行いません．Discordへの通信は固定HTTPS APIのGETだけです．
+
+入力は`guild_id`，`channel_ids`，元のDiscord依頼snowflakeから固定したUTCの`observed_before`，`lookback_days: 30`，`max_messages_per_channel`です．依頼本文や過去回答はcollectorへ渡しません．channelごとの既定上限は1000件，全体は2000件，結果は8MiBまでです．本文は4000文字を超えると明示的にtruncatedとなります．API要求数，受信byte数，job時間にも既存budgetを適用します．429は待機上限内で1回だけ再試行します．
+
+結果はsnapshot，7／30日活動集計，参照可能なmessage evidence，coverage，構造化failureです．投稿数とunique author数は取得した投稿から集計します．運営者は設定したIDだけで判定し，非reply投稿をconversation start，reply referenceのある投稿をreplyとして数えます．実際の会話session，返信の解決，関係性を証明する値ではありません．個人の専門性推測や関係graphは実装していません．個人profileの将来実装には本人の明示opt-inが必要です．
+
+Botの自己member record，role，channel overwriteから履歴権限を確認します．確認できない状態の空履歴は「投稿0件で完全取得」としません．Message Content Intentがない場合，空本文と本当に空の投稿は区別できないため`empty_or_unavailable`と記録します．本文取得を無効にした場合は`not_requested`です．取得上限，権限不足，本文不足，thread除外，観測期間を回答根拠へ渡します．部分取得は`partial`で返し，取得できた事実と不確実性を併記します．
+
+raw evidenceと集計はManagerのSQLiteへjob／attempt単位で保存します．同じfinalizeの再送は重複しません．収集から30日で本文を含むSQLite resultとresult-pack artifactを削除し，取得時は`observation_retention_expired`を返します．SQLite secure-deleteとWAL checkpointを使用します．本機能は30日を超える個人識別可能な観測履歴を保持しません．運用側のbackupにも同じ保持期間を適用してください．
+
+Discord bridgeではprivate TOMLに`community_guild_ids = [123]`を追加したguildだけで自然文をcommunity経路へ振り分けます．既存channel／user allowlist，受付，durable inbox，120秒の進捗通知，分割回答，返信履歴を使用し，`POST /v1/discord/observe`へ渡します．例は「このサーバーの構成を教えて」「最近の議論をまとめて」「未解決の課題は？」「HackSickの今週の活動を教えて」です．運営操作，投稿，role変更，event変更は観測経路にありません．通常の公開web調査と，既存のprimary channel限定owner repairは従来どおりです．Runtimeはlocal modelで議論／課題の根拠を整理し，不明な担当者／期限を補いません．

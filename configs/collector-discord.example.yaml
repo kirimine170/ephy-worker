@@ -1,0 +1,14 @@
+# IDs below are illustrative．Set private production IDs outside the repository．
+worker_service:
+  manager_url: http://127.0.0.1:8321
+  worker_id: collector-community
+  credential_env: EPHY_WORKER_CREDENTIAL
+  search:
+    base_url: http://127.0.0.1:8080
+  discord_observer:
+    token_env: EPHY_DISCORD_BOT_TOKEN
+    guild_channels:
+      "123": ["456", "457"]
+    read_message_content: false
+    operator_user_ids: []
+    retention_days: 30
