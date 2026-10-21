@@ -382,3 +382,110 @@ def test_finalize_rejects_30_day_activity_disguised_as_7_day_summary(manager):
     _input, view, claim, result = aggregate_observation_result(manager)
     result.payload.activity[0] = result.payload.activity[1].model_copy(deep=True, update={"period_days": 7})
     assert_observation_mismatch_not_retained(manager, view, claim, result, "observation_activity_mismatch")
+
+
+@pytest.mark.parametrize("cancel_conflict", [False, True])
+async def test_worker_observation_real_http_preserves_datetime_evidence_and_cancel_fallback(tmp_path, monkeypatch, cancel_conflict):
+    import hashlib
+    from datetime import timedelta
+
+    from test_manager_http import _start_manager
+
+    from ephy_worker.manager_client import ManagerAPIError, ManagerClient
+
+    monkeypatch.setenv("EPHY_DISCORD_BOT_TOKEN", "fixture-token-1234567890")
+    app, runner, endpoint = await _start_manager(tmp_path, monkeypatch)
+    requester, client = ManagerClient(endpoint, "requester-secret"), ManagerClient(endpoint, "worker-secret")
+    fixture = DiscordFixture()
+    observer = DiscordObserver(observer_config(), transport=httpx.MockTransport(fixture))
+    service = WorkerService(client, "worker-http", search_config=SearchConfig(base_url="http://127.0.0.1:8080"),
+        observer_config=observer_config(), observer=observer)
+    finalize_calls, conflicts = [], []
+    original_finalize = client.finalize_job
+    async def finalize_after_requester_race(worker_id, job_id, lease_token, result):
+        finalize_calls.append(result)
+        if cancel_conflict and len(finalize_calls) == 1:
+            cancelled = await requester.cancel_job(job_id)
+            assert cancelled["state"] == "cancel_requested"
+        try:
+            return await original_finalize(worker_id, job_id, lease_token, result)
+        except ManagerAPIError as exc:
+            conflicts.append((exc.status, exc.code))
+            raise
+    monkeypatch.setattr(client, "finalize_job", finalize_after_requester_race)
+    try:
+        await service.register()
+        submitted = await requester.submit_job(observation_submit("http-observer-worker").model_dump(mode="json"))
+        claimed = await client.claim_job("worker-http")
+        assert claimed["job"]["job_id"] == submitted["job_id"]
+        assert await service._execute_job(claimed) == 0
+        response = await requester.job_result(submitted["job_id"])
+        envelope = ResultEnvelope.model_validate(response["result"])
+        assert response["state"] == ("cancelled" if cancel_conflict else "completed")
+        assert envelope.status == ("cancelled" if cancel_conflict else "succeeded")
+        assert envelope.stop_reason == ("cancelled_by_requester" if cancel_conflict else None)
+        assert envelope.job_id == submitted["job_id"] and envelope.attempt_id == claimed["attempt"]["attempt_id"]
+        assert envelope.payload.coverage.window_end == observation_input().observed_before
+        assert envelope.payload.coverage.window_start == observation_input().observed_before - timedelta(days=30)
+        message = envelope.payload.messages[0]
+        assert message.created_at == observation_input().observed_before - timedelta(days=1)
+        assert message.content == "今週の計画を相談しました．"
+        assert envelope.payload.coverage.channels[0].oldest_observed_at == message.created_at
+        assert envelope.payload.coverage.observed_at.tzinfo is not None
+        assert envelope.payload.coverage.channels[0].message_count == 1
+        assert [summary.message_count for summary in envelope.payload.activity] == [1, 1]
+        assert len(finalize_calls) == (2 if cancel_conflict else 1)
+        assert conflicts == ([(409, "result_conflicts_with_cancel")] if cancel_conflict else [])
+        for call in finalize_calls:
+            assert isinstance(call["payload"]["coverage"]["observed_at"], str)
+            assert isinstance(call["payload"]["messages"][0]["created_at"], str)
+            assert call["payload"] == response["result"]["payload"]
+        ref = envelope.manifest[0]
+        body, media_type, size = await requester.download_artifact(envelope.job_id, ref.artifact_id)
+        assert "application/json" in media_type and size == len(body) == ref.bytes
+        assert hashlib.sha256(body).hexdigest() == ref.sha256
+        pack = ResultEnvelope.model_validate(json.loads(body))
+        assert pack.job_id == envelope.job_id and pack.attempt_id == envelope.attempt_id
+        assert pack.status == "succeeded" and pack.payload == envelope.payload
+        assert app.manager._conn.execute("SELECT COUNT(*) FROM discord_observations").fetchone()[0] == 1
+        assert fixture.pages == 2
+    finally:
+        await observer.aclose()
+        await requester.aclose()
+        await client.aclose()
+        await runner.cleanup()
+
+
+@pytest.mark.parametrize("mode", ["search", "extract"])
+async def test_worker_web_modes_keep_real_http_finalize_compatibility(tmp_path, monkeypatch, mode):
+    from test_manager_http import _start_manager
+    from test_worker_service import FixtureFetcher, FixtureSearch, make_extract_submit, make_search_submit
+
+    from ephy_worker.manager_client import ManagerClient
+
+    _app, runner, endpoint = await _start_manager(tmp_path, monkeypatch)
+    requester, client = ManagerClient(endpoint, "requester-secret"), ManagerClient(endpoint, "worker-secret")
+    service = WorkerService(client, "worker-http", search_config=SearchConfig(base_url="http://127.0.0.1:8080"),
+        search=FixtureSearch(), fetcher=FixtureFetcher())
+    try:
+        await service.register()
+        request = (make_search_submit if mode == "search" else make_extract_submit)(
+            "real-http-" + mode, worker_id="worker-http")
+        submitted = await requester.submit_job(request.model_dump(mode="json"))
+        claimed = await client.claim_job("worker-http")
+        assert await service._execute_job(claimed) == 0
+        response = await requester.job_result(submitted["job_id"])
+        assert response["state"] == "completed"
+        result = ResultEnvelope.model_validate(response["result"])
+        assert result.job_id == submitted["job_id"] and result.attempt_id == claimed["attempt"]["attempt_id"]
+        assert result.status == "succeeded" and result.payload.mode == mode
+        if mode == "search":
+            assert result.payload.candidates and len(result.payload.queries) == 2
+        else:
+            assert len(result.payload.sources) == 2 and all(source.passages for source in result.payload.sources)
+        body, _media_type, _size = await requester.download_artifact(result.job_id, result.manifest[0].artifact_id)
+        assert ResultEnvelope.model_validate(json.loads(body)).payload == result.payload
+    finally:
+        await requester.aclose()
+        await client.aclose()
+        await runner.cleanup()
