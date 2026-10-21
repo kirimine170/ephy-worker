@@ -2426,3 +2426,57 @@ def test_insertion_v9_initial_and_retry_import_hints_are_grounded_in_original_so
         assert "Insert new test/helper definitions between original top-level nodes or append them at EOF" in instruction
         assert "original_test_import_guidance" in instruction and "not success proof" in instruction
         assert "do not assume a shorter package root or add import fallbacks" in instruction
+
+
+@pytest.mark.parametrize("where", ["inside_test", "between_nodes", "trailing_indented"])
+def test_spans_v10_original_comments_cannot_move_into_an_added_helper(tmp_path, monkeypatch, where):
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    if where == "inside_test":
+        original = "def test_original():\n    # original directive\n    assert True\n"
+        candidate = ("def test_original():\n    assert True\n\n    # original directive\n"
+            "def helper_copied_assertion():\n    assert True\n")
+    elif where == "between_nodes":
+        original = "def test_first():\n    assert True\n\n# original gap directive\n\ndef test_last():\n    assert True\n"
+        candidate = ("def test_first():\n    assert True\n\ndef helper_copied_gap():\n# original gap directive\n"
+            "    assert True\n\ndef test_last():\n    assert True\n")
+    else:
+        original = "def test_first():\n    assert True\n    # original trailing directive\n\ndef test_last():\n    assert True\n"
+        candidate = ("def test_first():\n    assert True\n\ndef helper_copied_tail():\n    assert True\n"
+            "    # original trailing directive\n\ndef test_last():\n    assert True\n")
+    # These inputs reproduce the old whole-file-line + AST-subsequence false positive．
+    cursor = 0
+    lines = original.splitlines(keepends=True)
+    for line in candidate.splitlines(keepends=True):
+        if cursor < len(lines) and line == lines[cursor]:
+            cursor += 1
+    assert cursor == len(lines)
+    old_nodes = [ast.dump(node) for node in ast.parse(original).body]
+    observed_nodes = [ast.dump(node) for node in ast.parse(candidate).body]
+    assert all(value in observed_nodes for value in old_nodes)
+    with pytest.raises(ValueError, match="original_test_module_changed"):
+        preserve_original_tests(original, candidate, (), profile)
+    result, _, _ = _insertion_v9_run_emitted(tmp_path, original, candidate, profile)
+    assert result.returncode != 0 and "original_test_module_changed" in result.stderr
+
+
+def test_spans_v10_fifty_two_line_middle_insertion_keeps_commented_decorated_regions(tmp_path, monkeypatch):
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    original = ("# original module header\nfrom pathlib import Path\nimport pytest\n\n"
+        "@pytest.fixture\ndef stable():\n    # original fixture directive\n    return 1  # original inline comment\n"
+        "    # original trailing fixture comment\n\n# original fixture gap\n"
+        "def test_first():\n    # original test directive\n    assert True\n\n# original final gap\n"
+        "@pytest.mark.asyncio\nasync def test_last():\n    assert True\n")
+    inserted = ("def test_inserted(tmp_path: Path, stable: int) -> None:\n"
+        + "".join("    # added fixture check " + str(index) + "\n" for index in range(47))
+        + "    path = tmp_path / 'stable.txt'\n    path.write_text(str(stable))\n    assert path.read_text() == '1'\n\n")
+    assert len(inserted.splitlines()) == 52
+    candidate = original.replace("@pytest.mark.asyncio\nasync def test_last():", inserted + "@pytest.mark.asyncio\nasync def test_last():")
+    preserve_original_tests(original, candidate, (), profile)
+    result, _, test = _insertion_v9_run_emitted(tmp_path, original, candidate, profile)
+    assert result.returncode == 0, result.stdout + result.stderr
+    summary = json.loads(next(line.split("=", 1)[1] for line in result.stdout.splitlines()
+        if line.startswith("native_added_test_outcomes=")))
+    assert len(summary["collected"]) == 1 and summary["collected"][0].endswith("::test_inserted")
+    assert summary["invalid"] == []
+    assert next(iter(summary["reports"].values())) == {"setup": "passed", "call": "passed", "teardown": "passed"}
+    assert test.read_text() == candidate

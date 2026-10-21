@@ -237,22 +237,54 @@ def preserve_original_tests(original: str, candidate: str, subjects: tuple[str, 
     before, after = ast.parse(original), ast.parse(candidate)
     old_nodes = [ast.dump(node, include_attributes=False) for node in before.body]
     if native:
-        original_lines = original.splitlines(keepends=True)
+        original_lines, candidate_lines = original.splitlines(keepends=True), candidate.splitlines(keepends=True)
         cursor = 0
-        for line in candidate.splitlines(keepends=True):
-            if cursor < len(original_lines) and line == original_lines[cursor]:
-                cursor += 1
-        if cursor != len(original_lines):
-            raise ValueError("original_test_module_changed")
-        cursor = 0
-        added = []
-        for node in after.body:
+        added, matched = [], []
+        for index, node in enumerate(after.body):
             if cursor < len(old_nodes) and ast.dump(node, include_attributes=False) == old_nodes[cursor]:
+                matched.append(index)
                 cursor += 1
             else:
                 added.append(node)
         if cursor != len(old_nodes):
             raise ValueError("original_test_module_changed")
+        def source_regions(tree, lines):
+            starts = [min([node.lineno, *(item.lineno for item in getattr(node, "decorator_list", ()))]) - 1
+                for node in tree.body]
+            regions = []
+            for index, node in enumerate(tree.body):
+                end = node.end_lineno
+                limit = starts[index + 1] if index + 1 < len(starts) else len(lines)
+                # A trailing indented comment belongs to this construct, not a later helper．
+                for line_index in range(end, limit):
+                    line = lines[line_index]
+                    if not line.strip():
+                        continue
+                    if line[:1].isspace() and line.lstrip().startswith("#"):
+                        end = line_index + 1
+                    else:
+                        break
+                regions.append((starts[index], end))
+            return regions
+        old_regions = source_regions(before, original_lines)
+        new_regions = source_regions(after, candidate_lines)
+        inserted_regions = [region for index, region in enumerate(new_regions) if index not in set(matched)]
+        old_end = new_end = 0
+        for old_index, new_index in [*enumerate(matched), (len(old_regions), len(new_regions))]:
+            old_start, old_stop = old_regions[old_index] if old_index < len(old_regions) else (len(original_lines), len(original_lines))
+            new_start, new_stop = new_regions[new_index] if new_index < len(new_regions) else (len(candidate_lines), len(candidate_lines))
+            if original_lines[old_start:old_stop] != candidate_lines[new_start:new_stop]:
+                raise ValueError("original_test_module_changed")
+            gap = [line for index, line in enumerate(candidate_lines[new_end:new_start], start=new_end)
+                if not any(start <= index < end for start, end in inserted_regions)]
+            cursor = 0
+            old_gap = original_lines[old_end:old_start]
+            for line in gap:
+                if cursor < len(old_gap) and line == old_gap[cursor]:
+                    cursor += 1
+            if cursor != len(old_gap):
+                raise ValueError("original_test_module_changed")
+            old_end, new_end = old_stop, new_stop
     else:
         prefix = [ast.dump(node, include_attributes=False) for node in after.body[:len(before.body)]]
         if prefix != old_nodes:
