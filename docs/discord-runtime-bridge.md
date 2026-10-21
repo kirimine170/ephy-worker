@@ -97,6 +97,8 @@ checker／controlの提案も暫定30回まで修正を試みます．各回を`
 
 運用者が明示した`native_windows_code_v1`では，既存のdescriptor検証とcodex／python／ACL helper／capabilityの4つのpin一致を確認してから，そのdescriptorとcapabilityのhashを読み取り専用checker guardへ固定します．この場合だけ，追加testの通常のsync／async本文，既存fixture引数，本文内import，class・method・filesystem呼出しを許可します．Path／Noneなどの不活性な注釈と，既存pytestの裸のasyncio markerを扱えます．元のtest本文・raw prefix／AST，scope，新規module／plugin制限は維持し，追加top-level実行文・import・fixture／hook定義，任意decorator・default・実行する注釈は拒否します．それ以外のprofileは従来の閉じたDSLのままです．model／candidateはこの許可を選べず，実行は同じnative隔離を必須とし，host実行へ切り替えません．この本文検査を汎用Python sandboxとは見なしません．
 
+checkerへ渡す`argv[1]`は読み取り専用のcandidate source／import rootであり，checker自身のdirectoryも読み取り専用です．protocolやtestの書き込みデータは，既存の`TEMP`／`TMP`／`TMPDIR`に従う`tempfile.TemporaryDirectory()`へ置くよう，初回と修正feedbackの両方で指定します．candidate直下の`.mdsys`は書き込み先にしません．実際のcandidate APIを呼んだ結果を同じassertionで比較し，known_goodは実装修正と回帰testを含むよう指示します．自己生成したJSONだけを検査しても機能の証明にはならず，この指示だけで意味的な妥当性を機械的に証明したとは扱いません．追加testのskip／xfail禁止は，直接属性に加え，pytestの別名import・importorskip・unittestのSkipTestなどの明示的な表記も拒否します．通常のnative test本文と既定DSLは維持し，汎用Python安全性の保証には読み替えません．
+
 固定checkerのargvは`["{python}","-I","{checker}","{candidate}"]`とします．`-I`でcandidate由来の`ast.py`などによる標準libraryの乗っ取りを防ぎ，scope／assertion／authority guardを通過した後だけcandidateのimport pathを追加します．control実行も同じargvを使います．
 
 依存関係の異なるrepositoryには，各templateの`runtime.python`へ対応する検証用Pythonを固定します．契約のverifier identity freeze，formal runner，採用直前のproposal再検証は，その実際のPythonを使った別processで実行します．現在のcontrollerのPythonを別の検証環境だと申告しません．childのimport pathは固定Worker governance rootの`src`だけとし，native Gitのpathを固定してcredential環境を除去します．Runtimeのcontrolと受入checkerには対象candidate rootもimport pathとして渡します．

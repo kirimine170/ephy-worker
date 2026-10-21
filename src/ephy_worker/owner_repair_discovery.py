@@ -259,6 +259,11 @@ def preserve_original_tests(original: str, candidate: str, subjects: tuple[str, 
     old_test_names = {node.name for node in ast.walk(before)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_")}
     original_bindings = set(bindings)
+    nonexecution = {"skip", "skipif", "xfail", "importorskip", "SkipTest", "skipIf", "skipUnless", "expectedFailure", "Skipped", "XFailed"}
+    nonexecution_modules = {"pytest", "unittest", "unittest.case", "_pytest.outcomes"}
+    imported_nonexecution = {alias.asname or alias.name for item in before.body
+        if isinstance(item, ast.ImportFrom) and not item.level and item.module in nonexecution_modules
+        for alias in item.names if alias.name in nonexecution}
     inert_annotations = {"str", "int", "float", "bool", "bytes"} - original_bindings
     async_markers = set()
     if native:
@@ -298,7 +303,10 @@ def preserve_original_tests(original: str, candidate: str, subjects: tuple[str, 
         if any(isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name in old_test_names
                 for child in ast.walk(node)):
             raise ValueError("existing_test_name_duplicated")
-        if any(isinstance(child, ast.Attribute) and child.attr in {"skip", "skipif", "xfail"}
+        if any(isinstance(child, ast.Attribute) and child.attr in nonexecution
+                or isinstance(child, ast.ImportFrom) and not child.level and child.module in nonexecution_modules
+                    and any(alias.name in nonexecution for alias in child.names)
+                or isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load) and child.id in imported_nonexecution
                 for child in ast.walk(node)):
             raise ValueError("new_test_skip_or_xfail")
     added = after.body[len(before.body):]
@@ -939,6 +947,13 @@ class LocalDiscovery:
                 "No dynamic/callback/parameter calls, exceptions, loops, nested definitions, async calls/await, hooks, "
                 "global mutation or filesystem/network/process/pytest capabilities. Test fixture parameters are allowed "
                 "only for original zero-argument @pytest.fixture functions returning an inert literal. ")
+        checker_instructions = ("argv[1] is the read-only candidate source/import root, not a writable data root. "
+            "The checker directory is also read-only. Put ALL protocol/test writable data in tempfile.TemporaryDirectory() "
+            "under the existing TEMP/TMP/TMPDIR environment, never candidate/.mdsys or the checker directory. "
+            "Import and invoke actual selected candidate APIs and assert measured behavior; asserting only self-created JSON "
+            "or your own fixture does not test the candidate. known_good must repair actual selected implementation behavior "
+            "and append a meaningful regression, not only modify tests. Use the same standalone assertions to distinguish "
+            "repaired, unchanged and wrong behavior. Do not skip, xfail, importorskip or raise unittest.SkipTest. ")
         guard = {"allowed": names, "snapshot": original_snapshot, "native_test_profile": native_profile,
             "authority": {name: authority_fingerprint(text) for name, text in sources.items()
                 if name == "src/ephy_worker/discord_runtime.py" and text is not None},
@@ -968,8 +983,8 @@ class LocalDiscovery:
                         "Controls are temporary verifier specimens, not the formal implementation. "
                         "The acceptance checker is a standalone script: execute assertions at top level or explicitly call main(). "
                         "Do not only define pytest test functions: they are never collected here. Do not use pytest fixture arguments "
-                        "such as tmp_path in the checker; create needed temporary data under the supplied temporary directory. "
-                        "Acceptance checker must return normally or raise AssertionError; do not launch child processes, "
+                        "such as tmp_path in the checker. "
+                        + checker_instructions + "Acceptance checker must return normally or raise AssertionError; do not launch child processes, "
                         "nested pytest, native loading or SystemExit. Pytest runs as a separate trusted registered check. "
                         "Preserve every existing test module's original AST prefix exactly, including imports, decorators, fixtures and assertions. Only "
                         + test_instructions +
@@ -1037,7 +1052,7 @@ class LocalDiscovery:
                     "text": previous[:8192].decode("utf-8", errors="ignore"), "utf8_bytes": len(previous),
                     "truncated": len(previous) > 8192}, "actual_control_diagnostics": diagnostics,
                     "correction": "Correct the actual proposal/verification errors without changing the request or weakening guards. "
-                        + test_instructions + "The standalone checker must actually execute "
+                        + test_instructions + checker_instructions + "The standalone checker must actually execute "
                         "assertions and reject unchanged/wrong behavior; defining a pytest fixture test alone does nothing. "
                         "Return all three keys with compact edits based independently on the original source."}
                 write_json(attempt_directory / "retry-feedback.json", feedback)

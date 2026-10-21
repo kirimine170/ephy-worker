@@ -1920,3 +1920,72 @@ def test_native_tests_prepare_binds_guard_and_uses_matching_native_feedback(tmp_
     assert "ordinary sync/async" in prompts[0]["instruction"]
     assert "real classes/fixtures even when approved_subject_calls is empty" in prompts[1]["previous_attempt"]["correction"]
     assert "Appended tests must have no annotations" not in prompts[1]["previous_attempt"]["correction"]
+
+
+@pytest.mark.parametrize("body", [
+    "from pytest import skip as omitted\n    omitted('fixture skip')",
+    "from pytest import xfail as expected\n    expected('fixture xfail')",
+    "from pytest import importorskip as optional\n    optional('fixture_unavailable_module')",
+    "import pytest as pt\n    pt.importorskip('fixture_unavailable_module')",
+    "import unittest as ut\n    raise ut.SkipTest('fixture skip')",
+    "from unittest import SkipTest as Omitted\n    raise Omitted('fixture skip')",
+    "from unittest.case import SkipTest as Omitted\n    raise Omitted('fixture skip')",
+    "from _pytest.outcomes import Skipped as Omitted\n    raise Omitted('fixture skip')",
+    "import unittest as ut\n    ut.skipIf(True, 'fixture skip')",
+    "from unittest import expectedFailure as ignored\n    ignored(lambda: None)"])
+def test_feedback_native_rejects_skip_import_aliases_and_direct_equivalents(tmp_path, monkeypatch, body):
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    original = "import pytest\n\ndef test_original():\n    assert True\n"
+    appended = "\ndef test_nonexecution():\n    " + body + "\n"
+    with pytest.raises(ValueError, match="new_test_skip_or_xfail"):
+        preserve_original_tests(original, original + appended, (), profile)
+    result, marker, _ = _native_tests_run_emitted(tmp_path, original, appended, profile)
+    assert result.returncode != 0 and "new_test_skip_or_xfail" in result.stderr
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("binding,call", [("from pytest import skip as omitted", "omitted('fixture skip')"),
+    ("from unittest import SkipTest as Omitted", "raise Omitted('fixture skip')")])
+def test_feedback_native_rejects_existing_skip_alias_in_added_body(tmp_path, monkeypatch, binding, call):
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    original = binding + "\n\ndef test_original():\n    assert True\n"
+    appended = "\ndef test_nonexecution():\n    " + call + "\n"
+    with pytest.raises(ValueError, match="new_test_skip_or_xfail"):
+        preserve_original_tests(original, original + appended, (), profile)
+    result, marker, _ = _native_tests_run_emitted(tmp_path, original, appended, profile)
+    assert result.returncode != 0 and "new_test_skip_or_xfail" in result.stderr and not marker.exists()
+
+
+def test_feedback_native_keeps_normal_imports_class_fixture_and_exception_assertions(tmp_path, monkeypatch):
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    original = "import pytest\n\ndef test_original():\n    assert True\n"
+    appended = ("\ndef test_normal(tmp_path):\n    from pathlib import Path\n    from unittest import TestCase\n"
+        "    import pytest as pt\n    path = Path(tmp_path) / 'answer.txt'\n    path.write_text('42')\n"
+        "    TestCase().assertEqual(path.read_text(), '42')\n    with pt.raises(ValueError):\n        int('fixture invalid integer')\n")
+    preserve_original_tests(original, original + appended, (), profile)
+    result, marker, _ = _native_tests_run_emitted(tmp_path, original, appended, profile)
+    assert result.returncode == 0 and marker.exists(), result.stderr
+
+
+def test_feedback_initial_and_retry_explain_actual_temp_and_candidate_api_contract(tmp_path, monkeypatch):
+    from ephy_worker.formal_artifacts import GateFailure
+
+    discovery, args, proposal = _controls_loop_fixture(tmp_path, monkeypatch)
+    prompts = []
+    def complete(prompt, _runtime):
+        prompts.append(json.loads(prompt))
+        return {"bad": "fixture shape"} if len(prompts) == 1 else json.loads(json.dumps(proposal))
+    def measured(*_):
+        raise GateFailure("fixture_feedback_contract_observed")
+    monkeypatch.setattr(discovery, "completion", complete)
+    monkeypatch.setattr(discovery, "measure_controls", measured)
+    with pytest.raises(GateFailure, match="fixture_feedback_contract_observed"):
+        discovery.prepare_controls(*args)
+    assert len(prompts) == 2
+    for text in (prompts[0]["instruction"], prompts[1]["previous_attempt"]["correction"]):
+        for required in ("argv[1] is the read-only candidate", "checker directory is also read-only",
+                "tempfile.TemporaryDirectory()", "TEMP/TMP/TMPDIR", "actual selected candidate APIs",
+                "self-created JSON", "known_good must repair actual selected implementation behavior",
+                "not only modify tests", "same standalone assertions"):
+            assert required in text
+    assert all(prompt["request"] == args[0]["text"] and prompt["source"] == args[7] for prompt in prompts)
