@@ -51,6 +51,7 @@ from .contracts import (
     job_input_hash,
     required_job_capabilities,
 )
+from .discord_observer import activity
 from .schema import Limits
 from .store import output_root
 
@@ -789,6 +790,19 @@ class Manager:
         if (any(count > input.max_messages_per_channel for count in message_counts.values())
                 or any(channel.message_count > input.max_messages_per_channel for channel in coverage.channels)):
             raise ManagerError("observation_budget_exceeded", 409)
+        if any(channel.message_count != message_counts[channel.channel_id] for channel in coverage.channels):
+            raise ManagerError("observation_coverage_mismatch", 409)
+
+        def summary(value):
+            data = value.model_dump(mode="json")
+            data["channels"] = sorted(data["channels"], key=lambda channel: channel["channel_id"])
+            data["daily"] = sorted(data["daily"], key=lambda day: day["date"])
+            return data
+
+        reported = sorted((summary(value) for value in payload.activity), key=lambda value: value["period_days"])
+        expected = [summary(value) for value in activity(payload.messages, input)]
+        if reported != expected:
+            raise ManagerError("observation_activity_mismatch", 409)
         limits = Limits.model_validate(json.loads(row["budget"]))
         if result.usage.fetch_requests > limits.fetch_requests or result.usage.document_bytes > 8 * 1024**2:
             raise ManagerError("observation_budget_exceeded", 409)

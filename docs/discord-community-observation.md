@@ -8,6 +8,8 @@ collector設定は[設定例](../configs/collector-discord.example.yaml)を参�
 
 Managerはfinalize時にchannelごとのmessage evidence件数とcoverageの報告件数を入力上限と照合し，超過は`observation_budget_exceeded`として結果を拒否します．上限ちょうどの結果は全evidenceを保持し，超過分の切捨てで成功扱いにはしません．保持期間を過ぎた結果のHTTP取得は`410 observation_retention_expired`となります．
 
+coverageのchannel別件数は実際のevidence件数と一致する必要があります．7／30日の活動集計も，投稿，利用者，bot／運営／replyなどの内訳，channel別／日別件数をevidenceから照合します．重複，不足，未知の集計行や値の不一致はfinalizeで拒否し，結果を補正して保存しません．同じ集計行の順序だけが違う場合は受け入れます．
+
 結果はsnapshot，7／30日活動集計，参照可能なmessage evidence，coverage，構造化failureです．投稿数とunique author数は取得した投稿から集計します．運営者は設定したIDだけで判定し，非reply投稿をconversation start，reply referenceのある投稿をreplyとして数えます．実際の会話session，返信の解決，関係性を証明する値ではありません．個人の専門性推測や関係graphは実装していません．個人profileの将来実装には本人の明示opt-inが必要です．
 
 Botの自己member record，role，channel overwriteから履歴権限を確認します．確認できない状態の空履歴は「投稿0件で完全取得」としません．Message Content Intentがない場合，空本文と本当に空の投稿は区別できないため`empty_or_unavailable`と記録します．本文取得を無効にした場合は`not_requested`です．取得上限，権限不足，本文不足，thread除外，観測期間を回答根拠へ渡します．部分取得は`partial`で返し，取得できた事実と不確実性を併記します．
@@ -17,6 +19,8 @@ raw evidenceと集計はManagerのSQLiteへjob／attempt単位で保存します
 Discord bridgeではprivate TOMLに`community_guild_ids = [123]`を追加したguildだけで自然文をcommunity経路へ振り分けます．既存channel／user allowlist，受付，durable inbox，120秒の進捗通知，分割回答，返信履歴を使用し，`POST /v1/discord/observe`へ渡します．例は「このサーバーの構成を教えて」「最近の議論をまとめて」「未解決の課題は？」「HackSickの今週の活動を教えて」です．運営操作，投稿，role変更，event変更は観測経路にありません．通常の公開web調査と，既存のprimary channel限定owner repairは従来どおりです．Runtimeはlocal modelで議論／課題の根拠を整理し，不明な担当者／期限を補いません．
 
 設定したguildでは「昨日の議論をまとめて」「昨日みんなが話していた件の結論は？」など，サーバー名を省略した議論／話題／結論の依頼もprivateな観測へ渡します．公開資料，公式ドキュメント，ニュースなどの明示的な公開調査は，このサーバーを参照していない場合に従来のweb調査へ渡します．
+
+「みんなの投稿をまとめて」「メンバーの発言を教えて」なども，分類に使うactivity／discussion／snapshot／unresolvedの同じ語句でprivateな観測へ振り分けます．一般的な「教えて」「まとめて」だけの依頼には引き続きcommunity参照が必要です．
 
 回答生成の総時間とpoll回数には上限を設けません．pending応答には，実作業の進捗番号`progress_seq`と`phase`（submitting／collecting／analyzing／rendering）が必要です．進捗番号が増えない状態が`read_idle_timeout_seconds`続いた場合だけ，進捗停止を明示して待機を終了します．poll応答が返ること自体は進捗に数えず，実際の収集やmodel生成が進んでいる間は，合計時間がidle時間を超えても回答を待ち続けます．
 

@@ -505,3 +505,54 @@ def test_legacy_storage_migrates_to_null_provenance_without_changing_data(tmp_pa
     with store.db() as db:
         row = db.execute("SELECT * FROM intakes WHERE id='legacy'").fetchone()
         assert row["text"] == "既存の依頼" and row["previous"] == "既存の過去回答" and row["community_context"] is None
+
+
+@pytest.mark.parametrize("query,operation", [
+    ("未解決の件は？", "unresolved"), ("課題を教えて", "unresolved"), ("宿題をまとめて", "unresolved"),
+    ("やり残しは？", "unresolved"), ("todoは何？", "unresolved"), ("タスクを教えて", "unresolved"),
+    ("議論をまとめて", "discussion"), ("話題をまとめて", "discussion"), ("結論は？", "discussion"),
+    ("決定を教えて", "discussion"), ("合意を教えて", "discussion"), ("みんなが話していた件は？", "discussion"),
+    ("会話をまとめて", "discussion"), ("話し合ったことは？", "discussion"),
+    ("活動を教えて", "activity"), ("活発だった？", "activity"), ("みんなの投稿をまとめて", "activity"),
+    ("参加の様子は？", "activity"), ("メンバーの発言を教えて", "activity"), ("盛り上がっている？", "activity"),
+    ("勢いを教えて", "activity"), ("静かだった？", "activity"),
+    ("構成を教えて", "snapshot"), ("ロールを教えて", "snapshot"), ("チャンネル一覧は？", "snapshot"),
+    ("全体像を教えて", "snapshot"), ("どんなサーバ？", "snapshot"), ("人数は？", "snapshot"),
+    ("サーバー情報を教えて", "snapshot"), ("サーバ情報を教えて", "snapshot"),
+])
+def test_every_specific_operation_pattern_admits_local_community_requests(query, operation):
+    assert community_intent(query) == (operation, 30)
+
+
+@pytest.mark.parametrize("query", [
+    "公式ドキュメントのタスク管理を調べて", "公開議論の合意をまとめて", "国会の発言を教えて",
+    "公開仕様の構成を教えて", "https://example.com のロールを教えて", "詳しく教えて",
+    "この製品の状態を教えて", "新型モデルについてまとめて", "改善の提案を教えて",
+])
+def test_specific_operation_routing_preserves_explicit_public_and_generic_questions(query):
+    assert community_intent(query) is None
+
+
+@pytest.mark.parametrize("query,operation", [
+    ("みんなの投稿をまとめて", "activity"), ("メンバーの発言を教えて", "activity"),
+    ("宿題を教えて", "unresolved"), ("合意を教えて", "discussion"), ("ロールを教えて", "snapshot"),
+    ("このサーバーの発言と公開資料を照合して", "activity"),
+    ("国会の発言を教えて", None), ("新型モデルについてまとめて", None),
+])
+async def test_specific_local_requests_reach_private_bridge_and_public_exceptions_stay_public(tmp_path, query, operation):
+    calls = []
+    class Gateway:
+        async def observe(self, question, previous=None, **kwargs):
+            assert operation is not None, "explicit public requests must keep their public route"
+            calls.append(("private", question, kwargs["operation"]))
+            return "観測した根拠に基づく回答です．"
+        async def answer(self, question, previous):
+            assert operation is None, "local community requests must never reach public planning"
+            calls.append(("public", question, None))
+            return "公開資料に基づく回答です．"
+    config = settings(tmp_path)
+    bridge = RuntimeDiscordBridge(config, Gateway(), BridgeLedger(config))
+    async def send(text):
+        return 1000
+    await bridge.handle(DiscordEvent(100, 11, 20, 30, "<@10> " + query, mentioned=True), send)
+    assert calls == [("private" if operation else "public", query, operation)]

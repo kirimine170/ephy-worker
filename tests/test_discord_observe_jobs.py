@@ -234,3 +234,151 @@ async def test_http_result_retention_expiry_and_existing_result_wire_shapes(tmp_
         await requester.aclose()
         await worker.aclose()
         await runner.cleanup()
+
+
+def aggregate_observation_result(manager):
+    from datetime import timedelta
+
+    from ephy_worker.discord_observer import activity
+
+    input = observation_input().model_copy(update={"channel_ids": ["456", "457"]})
+    register(manager, capabilities=["web.collect", "discord.observe",
+        *(observation_capability(input.guild_id, channel) for channel in input.channel_ids)])
+    view, _ = manager.submit(observation_submit().model_copy(update={"input": input}))
+    claim = manager.claim("worker-a", "a-secret")
+    result = bounded_observation_result(input, view, claim)
+    for index, (message, days) in enumerate(zip(result.payload.messages, (1, 8, 2, 29), strict=True)):
+        message.created_at = input.observed_before - timedelta(days=days)
+        message.author_id = str(789 + index)
+        message.author_bot = index == 1
+        message.operator = index in (0, 3)
+        message.reply_to_message_id = str(800 + index) if index else None
+    result.payload.activity = activity(result.payload.messages, input)
+    assert [summary.message_count for summary in result.payload.activity] == [2, 4]
+    assert [summary.unique_authors for summary in result.payload.activity] == [2, 4]
+    assert [summary.bot_messages for summary in result.payload.activity] == [0, 1]
+    assert [summary.operator_messages for summary in result.payload.activity] == [1, 2]
+    return input, view, claim, result
+
+
+def assert_observation_mismatch_not_retained(manager, view, claim, result, code):
+    original = result.model_dump(mode="json")
+    with pytest.raises(ManagerError, match=code) as error:
+        manager.finalize(view["job_id"], "worker-a", "a-secret", claim["attempt"]["lease_token"], result)
+    assert error.value.status == 409
+    assert result.model_dump(mode="json") == original
+    current = manager.job_view(view["job_id"])
+    assert current["state"] == "running" and current["result"] is None
+    assert manager._conn.execute("SELECT finalized_at FROM attempts").fetchone()[0] is None
+    assert manager._conn.execute("SELECT COUNT(*) FROM discord_observations").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("reported_count", [0, 1, 1000])
+def test_finalize_rejects_coverage_count_mismatch_even_within_requested_cap(manager, reported_count):
+    input, view, claim, result = aggregate_observation_result(manager)
+    assert input.max_messages_per_channel == 1000
+    result.payload.coverage.channels[0].message_count = reported_count
+    assert_observation_mismatch_not_retained(manager, view, claim, result, "observation_coverage_mismatch")
+
+
+@pytest.mark.parametrize("period_days", [7, 30])
+@pytest.mark.parametrize("field", [
+    "message_count", "unique_authors", "human_messages", "bot_messages", "operator_messages",
+    "nonoperator_messages", "reply_messages", "operator_reply_messages", "nonoperator_reply_messages",
+    "operator_conversation_starts", "nonoperator_conversation_starts",
+])
+def test_finalize_rejects_each_activity_scalar_inconsistent_with_evidence(manager, period_days, field):
+    _input, view, claim, result = aggregate_observation_result(manager)
+    summary = next(summary for summary in result.payload.activity if summary.period_days == period_days)
+    setattr(summary, field, 1000)
+    assert_observation_mismatch_not_retained(manager, view, claim, result, "observation_activity_mismatch")
+
+
+@pytest.mark.parametrize("period_days", [7, 30])
+@pytest.mark.parametrize("change", [
+    "channel_count", "channel_authors", "channel_unknown", "channel_duplicate", "channel_missing",
+    "daily_count", "daily_unknown", "daily_duplicate", "daily_missing",
+])
+def test_finalize_rejects_channel_and_daily_summary_mismatch_or_bad_keys(manager, period_days, change):
+    _input, view, claim, result = aggregate_observation_result(manager)
+    summary = next(summary for summary in result.payload.activity if summary.period_days == period_days)
+    if change == "channel_count":
+        summary.channels[0].message_count += 1
+    elif change == "channel_authors":
+        summary.channels[0].unique_authors += 1
+    elif change == "channel_unknown":
+        summary.channels[0].channel_id = "999"
+    elif change == "channel_duplicate":
+        summary.channels.append(summary.channels[0].model_copy())
+    elif change == "channel_missing":
+        summary.channels.pop()
+    elif change == "daily_count":
+        summary.daily[0].message_count += 1
+    elif change == "daily_unknown":
+        summary.daily[0].date = "2026-01-01"
+    elif change == "daily_duplicate":
+        summary.daily.append(summary.daily[0].model_copy())
+    else:
+        summary.daily.pop()
+    assert_observation_mismatch_not_retained(manager, view, claim, result, "observation_activity_mismatch")
+
+
+@pytest.mark.parametrize("change", ["duplicate", "missing", "unknown"])
+def test_finalize_rejects_duplicate_missing_or_unknown_activity_windows(manager, change):
+    _input, view, claim, result = aggregate_observation_result(manager)
+    if change == "duplicate":
+        result.payload.activity[1] = result.payload.activity[0].model_copy(deep=True)
+    elif change == "missing":
+        result.payload.activity.pop()
+    else:
+        result.payload.activity[0].period_days = 14
+    assert_observation_mismatch_not_retained(manager, view, claim, result, "observation_activity_mismatch")
+
+
+@pytest.mark.parametrize("case", ["empty", "partial", "reordered"])
+def test_finalize_accepts_matching_empty_partial_and_reordered_evidence_without_mutation(manager, case):
+    from ephy_worker.discord_observer import activity
+
+    input, view, claim, result = aggregate_observation_result(manager)
+    if case == "empty":
+        result.payload.messages.clear()
+        result.payload.activity = activity([], input)
+        for channel in result.payload.coverage.channels:
+            channel.message_count = 0
+    elif case == "partial":
+        result.status = "partial"
+        result.payload.coverage.status = "partial"
+        result.payload.coverage.channels[0].status = "partial"
+        result.payload.coverage.channels[0].reason = "content_unavailable"
+        result.payload.messages[0].content = None
+        result.payload.messages[0].content_status = "empty_or_unavailable"
+    else:
+        result.payload.activity.reverse()
+        result.payload.coverage.channels.reverse()
+        result.payload.messages.reverse()
+        for summary in result.payload.activity:
+            summary.channels.reverse()
+            summary.daily.reverse()
+    original = result.model_dump(mode="json")
+    final = manager.finalize(view["job_id"], "worker-a", "a-secret", claim["attempt"]["lease_token"], result)
+    assert final["state"] == ("partial" if case == "partial" else "completed")
+    assert manager.job_result(view["job_id"]) == original
+    assert result.model_dump(mode="json") == original
+
+
+@pytest.mark.parametrize("change", ["duplicate", "missing", "unknown"])
+def test_finalize_rejects_duplicate_missing_or_unknown_coverage_channels(manager, change):
+    _input, view, claim, result = aggregate_observation_result(manager)
+    if change == "duplicate":
+        result.payload.coverage.channels[1] = result.payload.coverage.channels[0].model_copy()
+    elif change == "missing":
+        result.payload.coverage.channels.pop()
+    else:
+        result.payload.coverage.channels[0].channel_id = "999"
+    assert_observation_mismatch_not_retained(manager, view, claim, result, "observation_scope_mismatch")
+
+
+def test_finalize_rejects_30_day_activity_disguised_as_7_day_summary(manager):
+    _input, view, claim, result = aggregate_observation_result(manager)
+    result.payload.activity[0] = result.payload.activity[1].model_copy(deep=True, update={"period_days": 7})
+    assert_observation_mismatch_not_retained(manager, view, claim, result, "observation_activity_mismatch")
