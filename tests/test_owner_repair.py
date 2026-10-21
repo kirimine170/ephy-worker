@@ -1222,6 +1222,8 @@ def test_discovery_queue_empty_then_read_more_then_real_code_selection(tmp_path,
 
 
 def test_discovery_queue_malformed_selection_retries_and_context_is_bounded(tmp_path, monkeypatch):
+    from ephy_worker.owner_repair_discovery import _ModelJSONError
+
     discovery, templates, inventories, selected = _discovery_queue_scope_fixture(tmp_path)
     for index in range(12):
         name = f"src/ephy_worker/search_{index}.py"
@@ -1231,7 +1233,7 @@ def test_discovery_queue_malformed_selection_retries_and_context_is_bounded(tmp_
     def complete(prompt, _runtime):
         prompts.append(json.loads(prompt))
         if len(prompts) == 1:
-            raise ValueError("fixture malformed JSON")
+            raise _ModelJSONError("fixture malformed JSON")
         if len(prompts) == 2:
             return {}
         return selected
@@ -1240,7 +1242,7 @@ def test_discovery_queue_malformed_selection_retries_and_context_is_bounded(tmp_
     assert discovery.select_scope({"text": "search", "previous": None}, templates, inventories, directory) == selected
     assert len(prompts) == 3
     assert all(len(json.dumps(prompt["code_context"], ensure_ascii=False).encode()) <= 24000 for prompt in prompts)
-    assert json.loads((directory / "scope-attempt-1.error.json").read_text())["type"] == "ValueError"
+    assert json.loads((directory / "scope-attempt-1.error.json").read_text())["type"] == "_ModelJSONError"
 
 
 def test_discovery_queue_exhaustion_retains_responses_and_public_explanation(tmp_path, monkeypatch):
@@ -1507,6 +1509,8 @@ def test_discovery_loop_recovers_after_three_with_shape_and_missing_test_feedbac
 
 
 def test_discovery_loop_parse_feedback_retains_raw_and_bounds_utf8(tmp_path, monkeypatch):
+    from ephy_worker.owner_repair_discovery import _ModelJSONError
+
     discovery, templates, inventories, selected = _discovery_queue_scope_fixture(tmp_path)
     prompts = []
     content = "```json\n" + "日本語" * 5000 + "\n```"
@@ -1515,7 +1519,7 @@ def test_discovery_loop_parse_feedback_retains_raw_and_bounds_utf8(tmp_path, mon
         if len(prompts) == 1:
             discovery.response_path.write_text(json.dumps({"choices": [{"message": {"content": content}}]},
                 ensure_ascii=False), encoding="utf-8")
-            raise ValueError("fixture strict JSON parse failure")
+            raise _ModelJSONError("fixture strict JSON parse failure")
         return selected
     monkeypatch.setattr(discovery, "completion", complete)
     directory = tmp_path / "private"
@@ -1989,3 +1993,207 @@ def test_feedback_initial_and_retry_explain_actual_temp_and_candidate_api_contra
                 "not only modify tests", "same standalone assertions"):
             assert required in text
     assert all(prompt["request"] == args[0]["text"] and prompt["source"] == args[7] for prompt in prompts)
+
+
+@pytest.mark.parametrize("binding,call", [("from unittest import TestCase", "TestCase().skipTest('fixture skip')"),
+    ("import unittest as ut", "ut.TestCase().skipTest('fixture skip')")])
+def test_review_v6_native_rejects_testcase_skiptest_direct_and_emitted(tmp_path, monkeypatch, binding, call):
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    original = "def test_original():\n    assert True\n"
+    appended = "\ndef test_nonexecution():\n    " + binding + "\n    " + call + "\n"
+    with pytest.raises(ValueError, match="new_test_skip_or_xfail"):
+        preserve_original_tests(original, original + appended, (), profile)
+    result, marker, _ = _native_tests_run_emitted(tmp_path, original, appended, profile)
+    assert result.returncode != 0 and "new_test_skip_or_xfail" in result.stderr and not marker.exists()
+
+
+@pytest.mark.parametrize("kind", ["ValueError", "TypeError", "unknown_discovery_gate"])
+def test_review_v6_scope_does_not_retry_generic_environment_errors(tmp_path, monkeypatch, kind):
+    from ephy_worker.formal_artifacts import GateFailure
+
+    discovery, templates, inventories, _ = _discovery_queue_scope_fixture(tmp_path)
+    error = {"ValueError": ValueError("fixture environment configuration"),
+        "TypeError": TypeError("fixture endpoint protocol"),
+        "unknown_discovery_gate": GateFailure("discovery_response_too_large")}[kind]
+    calls = []
+    def complete(*_):
+        calls.append(True)
+        raise error
+    monkeypatch.setattr(discovery, "completion", complete)
+    directory = tmp_path / "private"
+    with pytest.raises(type(error)) as caught:
+        discovery.select_scope({"text": "Improve search", "previous": None}, templates, inventories, directory)
+    assert caught.value is error and len(calls) == 1
+    assert json.loads((directory / "scope-attempt-1.error.json").read_text())["type"] == type(error).__name__
+    assert not list(directory.glob("*.validation.json")) and not list(directory.glob("scope-attempt-2.*"))
+
+
+@pytest.mark.parametrize("fault", ["identity_json", "endpoint_json", "endpoint_type"])
+def test_review_v6_real_config_and_http_protocol_errors_stop_scope(tmp_path, monkeypatch, fault):
+    discovery, templates, inventories, _ = _discovery_queue_scope_fixture(tmp_path)
+    identity = tmp_path / "identity.json"
+    identity.write_text("{" if fault == "identity_json" else json.dumps({"context": 32768, "model_id": "fixture-model"}),
+        encoding="utf-8")
+    templates["ephy-worker"]["runtime"] = {"models_ini": str(identity), "base_url": "http://127.0.0.1:18080"}
+    monkeypatch.setitem(sys.modules, "ephy_worker.existing_llama_runtime", SimpleNamespace(verify_identity=lambda _: None))
+    calls = []
+    def handler(request):
+        calls.append(request.url.path)
+        if request.url.path == "/apply-template":
+            return httpx.Response(200, content=b"{") if fault == "endpoint_json" else httpx.Response(200, json={"prompt": "fixture"})
+        if request.url.path == "/tokenize":
+            return httpx.Response(200, json={"tokens": [1]})
+        assert request.url.path == "/v1/chat/completions"
+        return httpx.Response(200, json={"choices": None})
+    actual_client = httpx.Client
+    monkeypatch.setattr("ephy_worker.owner_repair_discovery.httpx.Client", lambda **kwargs:
+        actual_client(transport=httpx.MockTransport(handler), **kwargs))
+    directory = tmp_path / "private"
+    expected = TypeError if fault == "endpoint_type" else json.JSONDecodeError
+    with pytest.raises(expected):
+        discovery.select_scope({"text": "Improve search", "previous": None}, templates, inventories, directory)
+    assert calls == {"identity_json": [], "endpoint_json": ["/apply-template"],
+        "endpoint_type": ["/apply-template", "/tokenize", "/v1/chat/completions"]}[fault]
+    assert json.loads((directory / "scope-attempt-1.error.json").read_text())["type"] == expected.__name__
+    assert not list(directory.glob("*.validation.json")) and not list(directory.glob("scope-attempt-2.*"))
+
+
+def test_review_v6_scope_source_decode_failure_is_not_a_model_retry(tmp_path, monkeypatch):
+    discovery, templates, inventories, _ = _discovery_queue_scope_fixture(tmp_path)
+    path = discovery.config.repositories["ephy-worker"].source / inventories["ephy-worker"][0]
+    path.write_bytes(b"\xff")
+    calls = []
+    monkeypatch.setattr(discovery, "completion", lambda *_: calls.append(True))
+    with pytest.raises(UnicodeDecodeError):
+        discovery.select_scope({"text": "Improve search", "previous": None}, templates, inventories, tmp_path / "private")
+    assert calls == []
+
+
+@pytest.mark.parametrize("malformed,code", [
+    ({"repository": [], "allowed_files": [], "semantic_scope": "fixture"}, "discovery_scope_empty_or_invalid"),
+    ({"repository": "ephy-worker", "allowed_files": [["nested"]], "semantic_scope": "fixture"}, "discovery_scope_protected_or_missing_tests"),
+    ({"repository": "ephy-worker", "allowed_files": ["src/ephy_worker/search.py", "tests/test_search.py"], "semantic_scope": {}}, "discovery_scope_protected_or_missing_tests"),
+    ({"read_more": {"ephy-worker": {"path": "src/ephy_worker/search.py"}}}, "discovery_read_more_invalid"),
+    ({"read_more": {"ephy-worker": [{"path": "src/ephy_worker/search.py"}]}}, "discovery_read_more_invalid")])
+def test_review_v6_malformed_selection_field_types_receive_explicit_retry(tmp_path, monkeypatch, malformed, code):
+    discovery, templates, inventories, selected = _discovery_queue_scope_fixture(tmp_path)
+    prompts = []
+    def complete(prompt, _runtime):
+        prompts.append(json.loads(prompt))
+        return malformed if len(prompts) == 1 else selected
+    monkeypatch.setattr(discovery, "completion", complete)
+    directory = tmp_path / "private"
+    assert discovery.select_scope({"text": "Improve search", "previous": "fixture prior"}, templates, inventories, directory) == selected
+    assert len(prompts) == 2 and prompts[1]["previous_selection_error"] == code
+    assert all(prompt["request"] == "Improve search" and prompt["previous_answer"] == "fixture prior" for prompt in prompts)
+    assert json.loads((directory / "scope-attempt-1.response.json").read_text()) == malformed
+    assert json.loads((directory / "scope-attempt-1.validation.json").read_text())["error"] == code
+
+
+@pytest.mark.parametrize("failure", ["json", "compile"])
+def test_replan_v7_retains_measured_guidance_across_unmeasured_proposals(tmp_path, monkeypatch, failure):
+    import hashlib
+
+    from ephy_worker.owner_repair_discovery import _ModelJSONError
+
+    discovery, args, proposal = _controls_loop_fixture(tmp_path, monkeypatch)
+    uncalled = {**proposal, "checker_python": "from ephy_worker.feature import answer\ndef test_answer():\n    assert answer(1) == 2\n"}
+    prompts = []
+    def complete(prompt, _runtime):
+        prompts.append(json.loads(prompt))
+        if len(prompts) == 1:
+            return json.loads(json.dumps(uncalled))
+        if len(prompts) == 2:
+            if failure == "json":
+                raise _ModelJSONError("fixture malformed completed JSON")
+            return {**json.loads(json.dumps(proposal)), "checker_python": "def broken(:\n"}
+        return json.loads(json.dumps(proposal))
+    monkeypatch.setattr(discovery, "completion", complete)
+    calls = []
+    _controls_loop_actual_transport(monkeypatch, calls)
+    artifacts = discovery.prepare_controls(*args)
+    assert artifacts["directory"].name == "attempt-03" and len(calls) == 10
+    feedback = prompts[2]["previous_attempt"]
+    assert feedback["actual_control_diagnostics"] == []
+    guidance = feedback["previous_measured_control_guidance"]
+    assert guidance["origin_attempt"] == 1
+    assert guidance["checker_sha256"] == hashlib.sha256(uncalled["checker_python"].encode()).hexdigest()
+    assert "never current-attempt success evidence" in guidance["use"]
+    assert len(guidance["actual_control_diagnostics"]) == 5
+    assert guidance["actual_control_diagnostics"][1]["name"] == "unchanged"
+    assert guidance["actual_control_diagnostics"][1]["exit_code"] == 0
+    assert not (args[1] / "control-attempts/attempt-02/checker-controls.json").exists()
+    final = json.loads(artifacts["controls_path"].read_bytes())
+    assert len(final) == 5 and all(row["actual"] == row["expected"] for row in final)
+    assert final != json.loads((args[1] / "control-attempts/attempt-01/checker-controls.json").read_bytes())
+    assert all(prompt["request"] == args[0]["text"] and prompt["source"] == args[7] for prompt in prompts)
+
+
+def test_replan_v7_five_identical_failed_checkers_change_strategy_without_stopping(tmp_path, monkeypatch):
+    import hashlib
+
+    discovery, args, proposal = _controls_loop_fixture(tmp_path, monkeypatch)
+    uncalled = {**proposal, "checker_python": "from ephy_worker.feature import answer\ndef test_answer():\n    assert answer(1) == 2\n"}
+    identical = json.loads(json.dumps(uncalled))
+    identical["wrong_answer"] = json.loads(json.dumps(identical["known_good"]))
+    invalid_edit = json.loads(json.dumps(uncalled))
+    invalid_edit["known_good"]["src/ephy_worker/feature.py"][0]["old"] = "absent fixture text"
+    responses = iter([uncalled, identical, invalid_edit, identical, identical, uncalled, proposal])
+    prompts = []
+    def complete(prompt, _runtime):
+        prompts.append(json.loads(prompt))
+        return json.loads(json.dumps(next(responses)))
+    monkeypatch.setattr(discovery, "completion", complete)
+    calls = []
+    _controls_loop_actual_transport(monkeypatch, calls)
+    artifacts = discovery.prepare_controls(*args)
+    assert artifacts["directory"].name == "attempt-07" and len(calls) == 15
+    assert len(prompts) == 7 and all(prompt["provisional_attempt_limit"] == 30 for prompt in prompts)
+    for index in range(1, 5):
+        feedback = prompts[index]["previous_attempt"]
+        assert feedback["checker_repetition"]["consecutive_failed_proposals"] == index
+        assert feedback["checker_repetition"]["fresh_strategy_required"] is False
+        assert feedback["previous_proposal"]["text"] and not feedback["previous_proposal"]["text_omitted_for_replan"]
+    feedback = prompts[5]["previous_attempt"]
+    assert feedback["actual_control_diagnostics"] == []
+    assert feedback["previous_measured_control_guidance"]["origin_attempt"] == 1
+    assert feedback["checker_repetition"]["consecutive_failed_proposals"] == 5
+    assert feedback["checker_repetition"]["fresh_strategy_required"] is True
+    assert feedback["previous_proposal"]["text"] == "" and feedback["previous_proposal"]["text_omitted_for_replan"] is True
+    previous = feedback["previous_proposal"]
+    private = (args[1] / previous["artifact"]).read_bytes()
+    assert len(private) == previous["utf8_bytes"] and hashlib.sha256(private).hexdigest() == previous["sha256"]
+    assert json.loads(private)["checker_python"] == uncalled["checker_python"]
+    for required in ("Fresh strategy required", "retained measured outcomes", "rebuild assertions", "real candidate APIs",
+            "rather than copying the prior self-created fixture", "Keep working within the existing budget"):
+        assert required in feedback["correction"]
+    later = prompts[6]["previous_attempt"]
+    assert later["checker_repetition"]["consecutive_failed_proposals"] == 6
+    assert later["previous_measured_control_guidance"]["origin_attempt"] == 6
+    assert len(later["actual_control_diagnostics"]) == 5
+    final = json.loads(artifacts["controls_path"].read_bytes())
+    assert len(final) == 5 and all(row["actual"] == row["expected"] for row in final)
+    assert all(prompt["request"] == args[0]["text"] and prompt["source"] == args[7] for prompt in prompts)
+
+
+@pytest.mark.parametrize("changed", ["different_checker", "missing_checker"])
+def test_replan_v7_changed_or_missing_checker_resets_failed_repetition(tmp_path, monkeypatch, changed):
+    discovery, args, proposal = _controls_loop_fixture(tmp_path, monkeypatch)
+    uncalled = {**proposal, "checker_python": "from ephy_worker.feature import answer\ndef test_answer():\n    assert answer(1) == 2\n"}
+    altered = {**uncalled, "checker_python": uncalled["checker_python"] + "# different checker\n"}
+    third = altered if changed == "different_checker" else {"unexpected": "no checker text"}
+    responses = iter([uncalled, uncalled, third, uncalled, proposal])
+    prompts = []
+    def complete(prompt, _runtime):
+        prompts.append(json.loads(prompt))
+        return json.loads(json.dumps(next(responses)))
+    monkeypatch.setattr(discovery, "completion", complete)
+    calls = []
+    _controls_loop_actual_transport(monkeypatch, calls)
+    artifacts = discovery.prepare_controls(*args)
+    assert artifacts["directory"].name == "attempt-05"
+    assert [prompt["previous_attempt"]["checker_repetition"]["consecutive_failed_proposals"] for prompt in prompts[1:]] == [
+        1, 2, 1 if changed == "different_checker" else 0, 1]
+    assert all(not prompt["previous_attempt"]["checker_repetition"]["fresh_strategy_required"] for prompt in prompts[1:])
+    assert all(prompt["request"] == args[0]["text"] and prompt["source"] == args[7] for prompt in prompts)
+    assert len(calls) == (25 if changed == "different_checker" else 20)

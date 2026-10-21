@@ -259,7 +259,7 @@ def preserve_original_tests(original: str, candidate: str, subjects: tuple[str, 
     old_test_names = {node.name for node in ast.walk(before)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_")}
     original_bindings = set(bindings)
-    nonexecution = {"skip", "skipif", "xfail", "importorskip", "SkipTest", "skipIf", "skipUnless", "expectedFailure", "Skipped", "XFailed"}
+    nonexecution = {"skip", "skipif", "xfail", "importorskip", "SkipTest", "skipTest", "skipIf", "skipUnless", "expectedFailure", "Skipped", "XFailed"}
     nonexecution_modules = {"pytest", "unittest", "unittest.case", "_pytest.outcomes"}
     imported_nonexecution = {alias.asname or alias.name for item in before.body
         if isinstance(item, ast.ImportFrom) and not item.level and item.module in nonexecution_modules
@@ -760,7 +760,9 @@ class LocalDiscovery:
                     continue
                 try:
                     include_excerpts([match], limit=12000 if attempt == 1 else 24000, maximum=1500, automatic=True)
-                except GateFailure:
+                except GateFailure as exc:
+                    if str(exc) != "discovery_context_request_too_large":
+                        raise
                     automatic_context_full = True
                     break
                 added += 1
@@ -782,13 +784,16 @@ class LocalDiscovery:
             initial = None
             try:
                 initial = self.ask(json.dumps(prompt, ensure_ascii=False), runtime, directory, "scope-attempt-" + str(attempt))
+                if not isinstance(initial, dict):
+                    raise GateFailure("discovery_scope_empty_or_invalid")
                 if set(initial) == {"read_more"}:
                     requested = initial["read_more"]
                     if not isinstance(requested, dict) or not requested or sum(len(names) for names in requested.values() if isinstance(names, list)) > 4:
                         raise GateFailure("discovery_read_more_invalid")
                     matches = []
                     for alias, names in requested.items():
-                        if alias not in inventories or not isinstance(names, list) or not names:
+                        if (not isinstance(alias, str) or alias not in inventories or not isinstance(names, list)
+                                or not names or any(not isinstance(name, str) for name in names)):
                             raise GateFailure("discovery_read_more_invalid")
                         for name in names:
                             match = next((row for row in ranked if row[1] == alias and row[2] == name), None)
@@ -802,7 +807,7 @@ class LocalDiscovery:
                     include_excerpts(matches)
                     raise GateFailure("discovery_read_more_requested")
                 if (set(initial) != {"repository", "allowed_files", "semantic_scope"}
-                        or initial["repository"] not in self.config.repositories):
+                        or not isinstance(initial["repository"], str) or initial["repository"] not in self.config.repositories):
                     raise GateFailure("discovery_scope_empty_or_invalid")
                 profile = self.config.repositories[initial["repository"]]
                 names = initial["allowed_files"]
@@ -825,8 +830,8 @@ class LocalDiscovery:
                 write_json(directory / ("scope-attempt-" + str(attempt) + ".validation.json"),
                     {"outcome": "selected", "round": attempt, "provisional_round_limit": round_limit})
                 return initial
-            except (GateFailure, TypeError, ValueError) as exc:
-                if isinstance(exc, GateFailure) and not str(exc).startswith("discovery_"):
+            except (GateFailure, _ModelJSONError) as exc:
+                if isinstance(exc, GateFailure) and str(exc) not in corrections:
                     raise
                 feedback = str(exc)[:8192]
                 raw_path = directory / ("scope-attempt-" + str(attempt) + ".raw.json")
@@ -932,6 +937,9 @@ class LocalDiscovery:
     def prepare_controls(self, job, directory, profile, template, initial, base, original_snapshot, sources, subjects):
         """Recover model proposals using actual control diagnostics; environment failures stop．"""
         feedback = None
+        latest_measurement = None
+        previous_checker_sha256 = None
+        consecutive_checker_failures = 0
         names = initial["allowed_files"]
         native_profile = _native_test_profile(template)
         test_instructions = ("Native profile allows ordinary sync/async test/helper bodies, existing fixture parameters such as tmp_path, "
@@ -970,6 +978,7 @@ class LocalDiscovery:
             attempt_directory = directory / "control-attempts" / ("attempt-" + str(attempt).zfill(2))
             attempt_directory.mkdir(parents=True)
             phase = "response"
+            prepared = None
             try:
                 prepared = self.ask(json.dumps({"request": job["text"], "scope": initial, "source": sources,
                     "approved_subject_calls_by_test_file": subjects,
@@ -1048,10 +1057,34 @@ class LocalDiscovery:
                             "stderr_tail": stderr[-1024:].decode("utf-8", errors="ignore"),
                             "stdout_prefix": stdout[:256].decode("utf-8", errors="ignore"),
                             "stderr_truncated": len(stderr) > 1024, "stdout_truncated": len(stdout) > 256})
+                failed_code = prepared.get("checker_python") if isinstance(prepared, dict) else None
+                checker_sha256 = (digest(failed_code.encode("utf-8"))
+                    if isinstance(failed_code, str) and 1 <= len(failed_code) <= 65536 else None)
+                consecutive_checker_failures = (consecutive_checker_failures + 1
+                    if checker_sha256 is not None and checker_sha256 == previous_checker_sha256
+                    else int(checker_sha256 is not None))
+                previous_checker_sha256 = checker_sha256
+                if len(diagnostics) == 5:
+                    latest_measurement = {"origin_attempt": attempt, "checker_sha256": checker_sha256,
+                        "use": "Previous measurement guidance only; never current-attempt success evidence.",
+                        "actual_control_diagnostics": diagnostics}
+                fresh_strategy = consecutive_checker_failures >= 5
                 feedback = {"error": str(exc)[:4096], "previous_proposal": {
-                    "text": previous[:8192].decode("utf-8", errors="ignore"), "utf8_bytes": len(previous),
-                    "truncated": len(previous) > 8192}, "actual_control_diagnostics": diagnostics,
-                    "correction": "Correct the actual proposal/verification errors without changing the request or weakening guards. "
+                    "text": "" if fresh_strategy else previous[:8192].decode("utf-8", errors="ignore"),
+                    "utf8_bytes": len(previous), "sha256": digest(previous),
+                    "artifact": proposal_path.relative_to(directory).as_posix() if proposal_path.is_file() else None,
+                    "text_omitted_for_replan": fresh_strategy, "truncated": not fresh_strategy and len(previous) > 8192},
+                    "actual_control_diagnostics": diagnostics,
+                    "previous_measured_control_guidance": latest_measurement,
+                    "checker_repetition": {"checker_sha256": checker_sha256,
+                        "consecutive_failed_proposals": consecutive_checker_failures,
+                        "provisional_replan_trigger": 5, "fresh_strategy_required": fresh_strategy},
+                    "correction": ("Fresh strategy required after five consecutive failures with byte-identical checker text. "
+                        "The prior proposal text is omitted from this prompt, but its complete private artifact and hash are retained. "
+                        "Use the retained measured outcomes to identify missing discrimination and rebuild assertions using real "
+                        "candidate APIs rather than copying the prior self-created fixture. Keep working within the existing budget. "
+                        if fresh_strategy else "")
+                        + "Correct the actual proposal/verification errors without changing the request or weakening guards. "
                         + test_instructions + checker_instructions + "The standalone checker must actually execute "
                         "assertions and reject unchanged/wrong behavior; defining a pytest fixture test alone does nothing. "
                         "Return all three keys with compact edits based independently on the original source."}
