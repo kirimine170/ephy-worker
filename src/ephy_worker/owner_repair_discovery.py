@@ -36,6 +36,10 @@ PROTECTED = ("src/ephy_worker/owner_repair", "src/ephy_worker/formal_", "src/eph
     "docs/system-development-governance", "tests/test_owner_repair", "tests/test_formal_", ".")
 
 
+class _ModelJSONError(ValueError):
+    """Only strict parsing of a completed model message is a recoverable response error．"""
+
+
 def allowed_name(name: str, profile) -> bool:
     path = Path(name)
     return (isinstance(name, str) and "\\" not in name and not path.is_absolute()
@@ -220,8 +224,18 @@ def authority_fingerprint(source: str) -> dict:
     return {"protected": protected, "signatures": signatures}
 
 
-def preserve_original_tests(original: str, candidate: str, subjects: tuple[str, ...] = ()) -> None:
-    """Exact prefix plus a closed appended-test DSL, not a Python sandbox．"""
+def preserve_original_tests(original: str, candidate: str, subjects: tuple[str, ...] = (), native_profile=None) -> None:
+    """Preserve collection/prefix; ordinary bodies require the frozen native profile．"""
+    native = native_profile is not None
+    if native and (not isinstance(native_profile, dict) or set(native_profile) != {
+            "execution_profile", "descriptor_sha256", "capability_sha256"}
+            or native_profile["execution_profile"] != "native_windows_code_v1"
+            or any(not isinstance(native_profile[key], str) or len(native_profile[key]) != 64
+                or any(c not in "0123456789abcdef" for c in native_profile[key])
+                for key in ("descriptor_sha256", "capability_sha256"))):
+        raise ValueError("native_test_profile_unbound")
+    if native and not candidate.startswith(original):
+        raise ValueError("original_test_module_changed")
     before, after = ast.parse(original), ast.parse(candidate)
     old_nodes = [ast.dump(node, include_attributes=False) for node in before.body]
     prefix = [ast.dump(node, include_attributes=False) for node in after.body[:len(before.body)]]
@@ -245,19 +259,39 @@ def preserve_original_tests(original: str, candidate: str, subjects: tuple[str, 
     old_test_names = {node.name for node in ast.walk(before)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_")}
     original_bindings = set(bindings)
+    inert_annotations = {"str", "int", "float", "bool", "bytes"} - original_bindings
+    async_markers = set()
+    if native:
+        for node in before.body:
+            if isinstance(node, ast.ImportFrom) and node.module == "pathlib" and not node.level:
+                inert_annotations.update(alias.asname or alias.name for alias in node.names if alias.name == "Path")
+            if isinstance(node, ast.Import):
+                async_markers.update((alias.asname or "pytest") + ".mark.asyncio" for alias in node.names if alias.name == "pytest")
+    def inert_annotation(node):
+        return (node is None or isinstance(node, ast.Constant) and (node.value is None
+            or isinstance(node.value, str) and node.value in inert_annotations | {"None"})
+            or isinstance(node, ast.Name) and node.id in inert_annotations)
+    def marker(node):
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return marker(node.value) + "." + node.attr
+        return ""
     for node in after.body[len(before.body):]:
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             raise ValueError("only_new_test_or_helper_functions_may_append")  # noqa: TRY004 — invalid source AST value．
         if node.name in bindings:
             raise ValueError("existing_test_binding_overridden")
         bindings.add(node.name)
-        if node.decorator_list:
+        if node.decorator_list and not (native and isinstance(node, ast.AsyncFunctionDef)
+                and len(node.decorator_list) == 1 and marker(node.decorator_list[0]) in async_markers):
             raise ValueError("new_test_collection_decorator")
         if node.args.defaults or any(value is not None for value in node.args.kw_defaults):
             raise ValueError("new_test_collection_default")
         arguments = [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
         arguments += [argument for argument in (node.args.vararg, node.args.kwarg) if argument is not None]
-        if node.returns is not None or any(argument.annotation is not None for argument in arguments):
+        annotations = [node.returns, *(argument.annotation for argument in arguments)]
+        if (any(not inert_annotation(value) for value in annotations) if native else any(value is not None for value in annotations)):
             raise ValueError("new_test_collection_annotation")
         if node.type_params:
             raise ValueError("new_test_collection_type_parameter")
@@ -270,6 +304,10 @@ def preserve_original_tests(original: str, candidate: str, subjects: tuple[str, 
     added = after.body[len(before.body):]
     if len(added) > 64 or sum(1 for node in added for _ in ast.walk(node)) > 4096:
         raise ValueError("new_test_body_budget")
+    if native:
+        if any(not node.name.startswith(("test_", "helper_")) or node.name.startswith("test_pytest_") for node in added):
+            raise ValueError("new_test_body_function_name")
+        return  # Function bodies run only in the operator-selected native verifier, not during collection．
     functions = {node.name: node for node in added}
     pure = {"abs", "all", "any", "bool", "bytes", "dict", "enumerate", "float", "frozenset", "int",
         "isinstance", "len", "list", "max", "min", "range", "reversed", "set", "sorted", "str", "sum", "tuple", "zip"}
@@ -525,6 +563,22 @@ def registered_test_subjects(original: str, sources: dict[str, str | None]) -> t
     return tuple(sorted(name for name in approved if counts.get(name.split(".")[0]) == 1))
 
 
+def _native_test_profile(template):
+    contract = template["contract"]
+    if contract.get("execution_profile") != "native_windows_code_v1":
+        return None
+    from .verifier_sandbox import validate_descriptor
+    descriptor = contract["verifier_sandbox"]
+    validate_descriptor(descriptor)
+    pins = contract.get("runtime_hashes", {})
+    if (any(pins.get(descriptor[key]["path"]) != descriptor[key]["sha256"]
+            for key in ("codex", "python", "acl_helper", "capability"))
+            or Path(template["runtime"]["python"]).resolve() != Path(descriptor["python"]["path"]).resolve()):
+        raise GateFailure("native_test_profile_not_pinned")
+    return {"execution_profile": "native_windows_code_v1", "descriptor_sha256": digest(encode(descriptor)),
+        "capability_sha256": descriptor["capability"]["sha256"]}
+
+
 class LocalDiscovery:
     def __init__(self, config):
         self.config = config
@@ -585,7 +639,10 @@ class LocalDiscovery:
         choice = response.json()["choices"][0]
         if choice.get("finish_reason") != "stop":
             raise GateFailure("contract_incomplete:discovery_generation_incomplete")
-        return strict_object(choice["message"]["content"])
+        try:
+            return strict_object(choice["message"]["content"])
+        except ValueError as exc:
+            raise _ModelJSONError(str(exc)) from exc
 
     def select_scope(self, job: dict, templates: dict, inventories: dict, directory: Path) -> dict:
         """Read bounded real code before selecting scope, with explicit read-more rounds．"""
@@ -824,63 +881,9 @@ class LocalDiscovery:
             raise GateFailure("contract_incomplete:discovery_context_too_large")
         subjects = {name: registered_test_subjects(text, sources) for name, text in sources.items()
             if name.startswith("tests/") and text is not None}
-        prepared = self.ask(json.dumps({"request": job["text"], "scope": initial, "source": sources,
-            "approved_subject_calls_by_test_file": subjects,
-            "response_schema": {"checker_python": "standalone Python checker; argv[1] candidate root; nonzero on wrong behavior",
-                "known_good": {"scoped/path": [{"old": "exact unique original substring", "new": "replacement"},
-                    {"append": "small additional test including its leading newline"}]},
-                "wrong_answer": {"scoped/path": [{"old": "exact unique original substring", "new": "intentionally faulty replacement"}]}},
-            "instruction": "Create behavior acceptance checker independent of proposed implementation. Checks must reject "
-                "unchanged baseline and wrong behavior, and pass a genuinely repaired known-good control. "
-                "Controls are temporary verifier specimens, not the formal implementation. Preserve every existing test "
-                "Acceptance checker must return normally or raise AssertionError; do not launch child processes, "
-                "nested pytest, native loading or SystemExit. Pytest runs as a separate trusted registered check. "
-                "module's original AST prefix exactly, including imports, decorators, fixtures and assertions. Only "
-                "append new uniquely named test/helper functions without decorators, defaults, parameter/return "
-                "annotations or type parameters. No imports anywhere in appended functions. Their closed body DSL "
-                "allows literal/local-name assignments, assert, return, if, bounded arithmetic/containers, one bounded "
-                "literal/range comprehension, pure builtins and bounded nonmutating data methods. Use test_ or helper_ "
-                "names; helpers may call only acyclic pure helpers and the exact approved subject calls listed above. "
-                "No dynamic/callback/parameter calls, exceptions, loops, nested definitions, async calls/await, hooks, "
-                "global mutation or filesystem/network/process/pytest capabilities. Test fixture parameters are allowed "
-                "only for original zero-argument @pytest.fixture functions returning an inert literal. "
-                "known_good MUST change an existing selected tests file by appending a non-weakening "
-                "regression test in addition to the repair control. No checker success markers, environment detection or simulated PASS. "
-                "Return only these three keys. Use compact edit operations, never repeat complete existing files or tests. "
-                "Edits are expanded by the trusted controller against the supplied original files; each old string must "
-                "occur exactly once at that step. Each control is based on the original source independently. "
-                "Checker may use standard libraries and offline installed project dependencies."},
-            ensure_ascii=False), template["runtime"], directory, "controls")
-        if set(prepared) != {"checker_python", "known_good", "wrong_answer"}:
-            raise GateFailure("contract_incomplete:checker")
-        code = prepared["checker_python"]
-        if not isinstance(code, str) or not 1 <= len(code) <= 65536:
-            raise GateFailure("contract_incomplete:checker_source")
-        compile(code, "<frozen-acceptance-checker>", "exec")
-        for key in ("known_good", "wrong_answer"):
-            prepared[key] = expand_control_edits(prepared[key], sources)
-        if prepared["known_good"] == prepared["wrong_answer"]:
-            raise GateFailure("contract_incomplete:identical_controls")
-        directory.mkdir(parents=True, exist_ok=True)
-        write_json(directory / "discovery.json", {"scope": initial, "base": base, "source_sha256":
-            {name: (original_snapshot.get(name) or {}).get("sha256") for name in sources},
-            "prepared": prepared})
-        acceptance = directory / "acceptance.py"
-        acceptance.write_text(code, encoding="utf-8", newline="")
-        checker = directory / "checker.py"
-        # The trusted wrapper independently enforces exact scope and preservation of
-        # all original test functions/assertions before executing the model checker．
-        guard = {"allowed": names, "snapshot": original_snapshot,
-            "authority": {name: authority_fingerprint(text) for name, text in sources.items()
-                if name == "src/ephy_worker/discord_runtime.py" and text is not None},
-            "tests": {name: text for name, text in sources.items() if name.startswith("tests/") and text is not None},
-            "subjects": subjects}
-        (directory / "checker-guard.json").write_text(json.dumps(guard, ensure_ascii=False), encoding="utf-8")
-        checker.write_text("import ast\n" + inspect.getsource(authority_fingerprint) + "\n"
-            + inspect.getsource(preserve_original_tests) + "\n" + _CHECKER, encoding="utf-8", newline="")
-        controls = self.measure_controls(profile, directory, prepared, checker, template)
-        controls_path = directory / "checker-controls.json"
-        write_json(controls_path, controls)
+        artifacts = self.prepare_controls(job, directory, profile, template, initial, base, original_snapshot, sources, subjects)
+        controls_directory = artifacts["directory"]
+        acceptance, checker, controls_path = artifacts["acceptance"], artifacts["checker"], artifacts["controls_path"]
         contract = {**template["contract"], "allowed_files": names, "semantic_scope": initial["semantic_scope"],
             "task": job["text"], "checker": str(checker), "checker_sha256": file_hash(checker),
             "checker_controls": str(controls_path), "checker_controls_sha256": file_hash(controls_path)}
@@ -895,9 +898,9 @@ class LocalDiscovery:
         controls_map = {name: file_hash(Path(runtime["governance_root"]) / relative)
             for name, relative in CONTROL_PATHS.items()}
         pins.update(injected_context_pins(runtime, controls_map))
-        for path in (acceptance, directory / "checker-guard.json"):
+        for path in (acceptance, controls_directory / "checker-guard.json"):
             pins[str(path)] = file_hash(path)
-        pins[str(directory / "discovery.json")] = file_hash(directory / "discovery.json")
+        pins[str(controls_directory / "discovery.json")] = file_hash(controls_directory / "discovery.json")
         contract["runtime_hashes"] = pins
         identities = {role: {"model_id": runtime["model_roles"][role],
             "model_artifact_manifest_sha256": digest(encode(runtime["model_manifests"][runtime["model_roles"][role]])),
@@ -917,6 +920,128 @@ class LocalDiscovery:
         if {key: value for key, value in spec.items() if key != "verifier_identity"} != draft:
             raise GateFailure("frozen_submission_draft_changed")
         return {"repository": alias, "spec": spec}
+
+    def prepare_controls(self, job, directory, profile, template, initial, base, original_snapshot, sources, subjects):
+        """Recover model proposals using actual control diagnostics; environment failures stop．"""
+        feedback = None
+        names = initial["allowed_files"]
+        native_profile = _native_test_profile(template)
+        test_instructions = ("Native profile allows ordinary sync/async test/helper bodies, existing fixture parameters such as tmp_path, "
+            "local imports, class/method and filesystem calls inside bodies. Use test_ or helper_ names. Path/None and basic inert annotations are allowed. "
+            "Only bare existing pytest.mark.asyncio is allowed as an async test marker. No new top-level imports/statements, "
+            "pytest fixtures/hooks/plugins, arbitrary decorators, defaults or executable annotations. Preserve the original raw/AST prefix. "
+            "Write a meaningful feature regression using real classes/fixtures even when approved_subject_calls is empty. "
+            if native_profile else "append new uniquely named test/helper functions without decorators, defaults, parameter/return "
+                "annotations or type parameters. No imports anywhere in appended functions. Their closed body DSL "
+                "allows literal/local-name assignments, assert, return, if, bounded arithmetic/containers, one bounded "
+                "literal/range comprehension, pure builtins and bounded nonmutating data methods. Use test_ or helper_ "
+                "names; helpers may call only acyclic pure helpers and the exact approved subject calls listed above. "
+                "No dynamic/callback/parameter calls, exceptions, loops, nested definitions, async calls/await, hooks, "
+                "global mutation or filesystem/network/process/pytest capabilities. Test fixture parameters are allowed "
+                "only for original zero-argument @pytest.fixture functions returning an inert literal. ")
+        guard = {"allowed": names, "snapshot": original_snapshot, "native_test_profile": native_profile,
+            "authority": {name: authority_fingerprint(text) for name, text in sources.items()
+                if name == "src/ephy_worker/discord_runtime.py" and text is not None},
+            "tests": {name: text for name, text in sources.items() if name.startswith("tests/") and text is not None},
+            "subjects": subjects}
+        recoverable = {"contract_incomplete:" + name for name in (
+            "checker", "checker_source", "control_scope", "control_edit", "ambiguous_control_edit", "control_size",
+            "identical_controls", "test_control_requires_test_scope", "checker_control_known_good",
+            "checker_control_unchanged", "checker_control_wrong_answer", "checker_control_test_weakening",
+            "checker_control_scope_escape")}
+        for attempt in range(1, 31):
+            if snapshot(profile.source) != original_snapshot:
+                raise GateFailure("discovery_source_changed")
+            attempt_directory = directory / "control-attempts" / ("attempt-" + str(attempt).zfill(2))
+            attempt_directory.mkdir(parents=True)
+            phase = "response"
+            try:
+                prepared = self.ask(json.dumps({"request": job["text"], "scope": initial, "source": sources,
+                    "approved_subject_calls_by_test_file": subjects,
+                    "previous_attempt": feedback, "attempt": attempt, "provisional_attempt_limit": 30,
+                    "response_schema": {"checker_python": "standalone Python checker; argv[1] candidate root; nonzero on wrong behavior",
+                        "known_good": {"scoped/path": [{"old": "exact unique original substring", "new": "replacement"},
+                            {"append": "small additional test including its leading newline"}]},
+                        "wrong_answer": {"scoped/path": [{"old": "exact unique original substring", "new": "intentionally faulty replacement"}]}},
+                    "instruction": "Create behavior acceptance checker independent of proposed implementation. Checks must reject "
+                        "unchanged baseline and wrong behavior, and pass a genuinely repaired known-good control. "
+                        "Controls are temporary verifier specimens, not the formal implementation. "
+                        "The acceptance checker is a standalone script: execute assertions at top level or explicitly call main(). "
+                        "Do not only define pytest test functions: they are never collected here. Do not use pytest fixture arguments "
+                        "such as tmp_path in the checker; create needed temporary data under the supplied temporary directory. "
+                        "Acceptance checker must return normally or raise AssertionError; do not launch child processes, "
+                        "nested pytest, native loading or SystemExit. Pytest runs as a separate trusted registered check. "
+                        "Preserve every existing test module's original AST prefix exactly, including imports, decorators, fixtures and assertions. Only "
+                        + test_instructions +
+                        "known_good MUST change an existing selected tests file by appending a non-weakening "
+                        "regression test in addition to the repair control. No checker success markers, environment detection or simulated PASS. "
+                        "Return only these three keys. Use compact edit operations, never repeat complete existing files or tests. "
+                        "Edits are expanded by the trusted controller against the supplied original files; each old string must "
+                        "occur exactly once at that step. Each control is based on the original source independently. "
+                        "Checker may use standard libraries and offline installed project dependencies."},
+                    ensure_ascii=False), template["runtime"], attempt_directory, "controls")
+                phase = "proposal"
+                if set(prepared) != {"checker_python", "known_good", "wrong_answer"}:
+                    raise GateFailure("contract_incomplete:checker")
+                code = prepared["checker_python"]
+                if not isinstance(code, str) or not 1 <= len(code) <= 65536:
+                    raise GateFailure("contract_incomplete:checker_source")
+                compile(code, "<frozen-acceptance-checker>", "exec")
+                for key in ("known_good", "wrong_answer"):
+                    prepared[key] = expand_control_edits(prepared[key], sources)
+                if prepared["known_good"] == prepared["wrong_answer"]:
+                    raise GateFailure("contract_incomplete:identical_controls")
+                phase = "artifacts"
+                write_json(attempt_directory / "discovery.json", {"scope": initial, "base": base, "source_sha256":
+                    {name: (original_snapshot.get(name) or {}).get("sha256") for name in sources},
+                    "prepared": prepared})
+                acceptance = attempt_directory / "acceptance.py"
+                acceptance.write_text(code, encoding="utf-8", newline="")
+                checker = attempt_directory / "checker.py"
+                # The trusted wrapper independently enforces exact scope and preservation of
+                # all original test functions/assertions before executing the model checker．
+                (attempt_directory / "checker-guard.json").write_text(json.dumps(guard, ensure_ascii=False), encoding="utf-8")
+                checker.write_text("import ast\n" + inspect.getsource(authority_fingerprint) + "\n"
+                    + inspect.getsource(preserve_original_tests) + "\n" + _CHECKER, encoding="utf-8", newline="")
+                phase = "measure"
+                controls = self.measure_controls(profile, attempt_directory, prepared, checker, template)
+                controls_path = attempt_directory / "checker-controls.json"
+                write_json(controls_path, controls)
+                return {"directory": attempt_directory, "prepared": prepared, "acceptance": acceptance,
+                    "checker": checker, "controls_path": controls_path}
+            except (GateFailure, ValueError, SyntaxError, TypeError) as exc:
+                retryable = (str(exc) in recoverable if isinstance(exc, GateFailure) else
+                    phase == "response" and isinstance(exc, _ModelJSONError) or
+                    phase == "proposal" and isinstance(exc, (ValueError, SyntaxError, TypeError)))
+                write_json(attempt_directory / "attempt-error.json", {"error": str(exc)[:4096],
+                    "type": type(exc).__name__, "phase": phase, "retryable": retryable})
+                if not retryable:
+                    raise
+                proposal_path = attempt_directory / "controls.response.json"
+                if not proposal_path.is_file():
+                    proposal_path = attempt_directory / "controls.raw.json"
+                previous = proposal_path.read_bytes() if proposal_path.is_file() else b"No model response available."
+                diagnostics = []
+                for name in ("known_good", "unchanged", "wrong_answer", "test_weakening", "scope_escape"):
+                    path = attempt_directory / ("control-" + name + ".json")
+                    if path.is_file():
+                        result = read_json(path)
+                        stderr = str(result.get("stderr", "")).encode("utf-8")
+                        stdout = str(result.get("stdout", "")).encode("utf-8")
+                        diagnostics.append({"name": name, "exit_code": result["exit_code"],
+                            "expected": 0 if name == "known_good" else 1,
+                            "stderr_tail": stderr[-1024:].decode("utf-8", errors="ignore"),
+                            "stdout_prefix": stdout[:256].decode("utf-8", errors="ignore"),
+                            "stderr_truncated": len(stderr) > 1024, "stdout_truncated": len(stdout) > 256})
+                feedback = {"error": str(exc)[:4096], "previous_proposal": {
+                    "text": previous[:8192].decode("utf-8", errors="ignore"), "utf8_bytes": len(previous),
+                    "truncated": len(previous) > 8192}, "actual_control_diagnostics": diagnostics,
+                    "correction": "Correct the actual proposal/verification errors without changing the request or weakening guards. "
+                        + test_instructions + "The standalone checker must actually execute "
+                        "assertions and reject unchanged/wrong behavior; defining a pytest fixture test alone does nothing. "
+                        "Return all three keys with compact edits based independently on the original source."}
+                write_json(attempt_directory / "retry-feedback.json", feedback)
+        raise GateFailure("discovery_controls_exhausted")
 
     def _git(self, root: Path, *args: str) -> bytes:
         result = subprocess.run([self.config.git, "-C", str(root), *args], capture_output=True,
@@ -952,7 +1077,7 @@ class LocalDiscovery:
                 if not tests:
                     raise GateFailure("contract_incomplete:test_control_requires_test_scope")
                 (root / tests[0]).write_text("# original tests removed\n", encoding="utf-8", newline="")
-            temporary = self.config.state_dir / "verifier-temp" / directory.name / name
+            temporary = self.config.state_dir / "verifier-temp" / digest(encode(str(directory.resolve())))[:24] / name
             temporary.mkdir(parents=True)
             environment = command_environment(root, temporary)
             environment["PYTHONPATH"] = str(root / "src") if profile.github_repository.endswith("/ephy-worker") else str(root)
@@ -975,11 +1100,13 @@ class LocalDiscovery:
             result["specimen_snapshot"] = specimen
             expected = 0 if name == "known_good" else 1
             write_json(directory / ("control-" + name + ".json"), result)
-            if (actual == 0) != (expected == 0):
-                raise GateFailure("contract_incomplete:checker_control_" + name)
             results.append({"name": name, "actual": 0 if actual == 0 else 1, "expected": expected,
                 "exit_code": actual, "specimen_snapshot_sha256": digest(encode(specimen)),
                 "evidence_sha256": file_hash(directory / ("control-" + name + ".json"))})
+        mismatches = [result["name"] for result in results if result["actual"] != result["expected"]]
+        if mismatches:
+            write_json(directory / "checker-controls.json", results)
+            raise GateFailure("contract_incomplete:checker_control_" + mismatches[0])
         return results
 
 
@@ -1000,7 +1127,7 @@ for name in guard['allowed']:
 for name, original in guard['authority'].items():
     assert authority_fingerprint((root/name).read_text(encoding='utf-8')) == original, 'protected_discord_authority_changed'
 for name, original in guard['tests'].items():
-    preserve_original_tests(original,(root/name).read_text(encoding='utf-8'),tuple(guard.get('subjects',{}).get(name,())))
+    preserve_original_tests(original,(root/name).read_text(encoding='utf-8'),tuple(guard.get('subjects',{}).get(name,())),guard.get('native_test_profile'))
 sys.path.insert(0,str(root))
 sys.path.insert(0,str(root/'src'))
 runpy.run_path(str(base/'acceptance.py'),run_name='__main__')

@@ -93,6 +93,10 @@ scope選択は，既存local modelへ厳密なJSON Schemaで「repository／allo
 
 discoveryは既存file全体をcontrolの出力として再生成させず，scope内のpathごとに`[{"old":"完全一致する一意な部分文字列","new":"置換後"}]`または`[{"append":"追加test"}]`という小さな編集を受け取ります．controllerが元のsourceへ展開し，曖昧な一致，scope外，未知fieldを拒否します．既存のassertionを残した回帰testの追加を必須にします．選択したmodelの`apply-template`と`tokenize`で実際の入力token数を測り，context上限からその入力とtemplate差分用の64 tokenを引いた残りを出力へ割り当てます．4096 tokenは固定の生成上限ではなく，生成開始に必要な最小空き容量です．残りが4096 token未満なら生成前に停止し，入力を切り詰めて続行しません．出力が実際のcontext上限まで続いて不完全になった場合も，JSONや生成完了条件を緩めて受理せず，生のresponseと失敗をprivateに保持します．
 
+checker／controlの提案も暫定30回まで修正を試みます．各回を`control-attempts/attempt-NN`へ分け，元の提案，checker，5本の実測結果を保持します．model由来のJSON・構文・編集・control結果不一致だけを，前回の提案（最大8192 UTF-8 byte）と実際のexit／stderr末尾などを次の回へ渡して修正します．既定の閉じたDSLでは，追加testの注釈やdecoratorは禁止のままです．native profileの許可範囲は以下に記載します．受入checkerは単体scriptとしてassertionを実行する必要があり，呼び出されないpytest関数を定義するだけではbaseline拒否を満たしません．5本すべての期待結果が揃うまで契約をfreezeしません．環境・model identity・native capability・実行証跡の異常はmodel修正へ流さず停止します．成功した回のcheckerと依存fileを最終契約へpinし，`frozen-spec.json`は従来どおり依頼の実行directory直下へ保存します．
+
+運用者が明示した`native_windows_code_v1`では，既存のdescriptor検証とcodex／python／ACL helper／capabilityの4つのpin一致を確認してから，そのdescriptorとcapabilityのhashを読み取り専用checker guardへ固定します．この場合だけ，追加testの通常のsync／async本文，既存fixture引数，本文内import，class・method・filesystem呼出しを許可します．Path／Noneなどの不活性な注釈と，既存pytestの裸のasyncio markerを扱えます．元のtest本文・raw prefix／AST，scope，新規module／plugin制限は維持し，追加top-level実行文・import・fixture／hook定義，任意decorator・default・実行する注釈は拒否します．それ以外のprofileは従来の閉じたDSLのままです．model／candidateはこの許可を選べず，実行は同じnative隔離を必須とし，host実行へ切り替えません．この本文検査を汎用Python sandboxとは見なしません．
+
 固定checkerのargvは`["{python}","-I","{checker}","{candidate}"]`とします．`-I`でcandidate由来の`ast.py`などによる標準libraryの乗っ取りを防ぎ，scope／assertion／authority guardを通過した後だけcandidateのimport pathを追加します．control実行も同じargvを使います．
 
 依存関係の異なるrepositoryには，各templateの`runtime.python`へ対応する検証用Pythonを固定します．契約のverifier identity freeze，formal runner，採用直前のproposal再検証は，その実際のPythonを使った別processで実行します．現在のcontrollerのPythonを別の検証環境だと申告しません．childのimport pathは固定Worker governance rootの`src`だけとし，native Gitのpathを固定してcredential環境を除去します．Runtimeのcontrolと受入checkerには対象candidate rootもimport pathとして渡します．
