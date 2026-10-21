@@ -2606,3 +2606,75 @@ def test_boundary_v12_deferred_annotation_and_literal_default_allow_middle_inser
     assert result.returncode == 0, result.stdout + result.stderr
     assert "native_added_test_outcomes=" in result.stdout and "1 passed" in result.stdout
     assert test.read_text() == candidate
+
+
+def test_diagnostics_v13_both_trace_ends_survive_proposal_only_failure(tmp_path, monkeypatch):
+    from ephy_worker.formal_artifacts import GateFailure, write_json
+
+    discovery, args, proposal = _controls_loop_fixture(tmp_path, monkeypatch)
+    trace = ('Traceback (most recent call last):\n'
+        '  File "fixture/storage.py", line 10, in persist\n'
+        '    descriptor = os.open(directory, os.O_RDONLY)\n'
+        "PermissionError: [Errno 13] Permission denied: 'fixture/state'\n"
+        '\nDuring handling of the above exception, another exception occurred:\n'
+        + '詳細な中間フレーム\n' * 180
+        + 'Traceback (most recent call last):\n'
+        '  File "fixture/thread.py", line 20, in collect\n'
+        '    assert result is not None\nAssertionError: thread result missing\n')
+    names = ('known_good', 'unchanged', 'wrong_answer', 'test_weakening', 'scope_escape')
+    errors = (trace, '短い説明\n', 'x' * 1023 + '境', 'é' * 512, '')
+    raw = {name: {'exit_code': 1, 'stdout': '観測' * 100 if index == 0 else '', 'stderr': errors[index]}
+        for index, name in enumerate(names)}
+    retained = {}
+    actual_measure = discovery.measure_controls
+    measurements = []
+    def measure(profile, directory, prepared, checker, template):
+        measurements.append(directory)
+        if len(measurements) > 1:
+            return actual_measure(profile, directory, prepared, checker, template)
+        # Sanitized diagnostic fixtures exercise feedback collection, not native capability．
+        for name, result in raw.items():
+            path = directory / ('control-' + name + '.json')
+            write_json(path, result)
+            retained[path] = path.read_bytes()
+        raise GateFailure('contract_incomplete:checker_control_known_good')
+    monkeypatch.setattr(discovery, 'measure_controls', measure)
+    prompts = []
+    def complete(prompt, _runtime):
+        prompts.append(json.loads(prompt))
+        result = json.loads(json.dumps(proposal))
+        if len(prompts) == 2:
+            result['checker_python'] = 'def broken(:\n'
+        return result
+    monkeypatch.setattr(discovery, 'completion', complete)
+    calls = []
+    _controls_loop_actual_transport(monkeypatch, calls)
+    artifacts = discovery.prepare_controls(*args)
+    assert artifacts['directory'].name == 'attempt-03' and len(calls) == 5
+    measured = prompts[1]['previous_attempt']['actual_control_diagnostics']
+    assert len(measured) == 5
+    for diagnostic, name in zip(measured, names, strict=True):
+        stderr, stdout = raw[name]['stderr'].encode('utf-8'), raw[name]['stdout'].encode('utf-8')
+        assert diagnostic['name'] == name and diagnostic['exit_code'] == 1
+        assert diagnostic['expected'] == (0 if name == 'known_good' else 1)
+        assert diagnostic['stderr_prefix'] == (stderr[:1024].decode('utf-8', errors='ignore') if len(stderr) > 1024 else '')
+        assert diagnostic['stderr_tail'] == stderr[-1024:].decode('utf-8', errors='ignore')
+        assert diagnostic['stdout_prefix'] == stdout[:256].decode('utf-8', errors='ignore')
+        assert diagnostic['stderr_truncated'] is (len(stderr) > 1024)
+        assert diagnostic['stdout_truncated'] is (len(stdout) > 256)
+    assert 'PermissionError' in measured[0]['stderr_prefix'] and 'os.open(directory' in measured[0]['stderr_prefix']
+    assert 'PermissionError' not in measured[0]['stderr_tail']
+    assert 'AssertionError: thread result missing' in measured[0]['stderr_tail']
+    assert measured[1]['stderr_prefix'] == measured[3]['stderr_prefix'] == measured[4]['stderr_prefix'] == ''
+    assert measured[2]['stderr_prefix'] == 'x' * 1023
+    feedback = prompts[2]['previous_attempt']
+    assert feedback['actual_control_diagnostics'] == []
+    guidance = feedback['previous_measured_control_guidance']
+    assert guidance['origin_attempt'] == 1 and guidance['actual_control_diagnostics'] == measured
+    assert guidance == prompts[1]['previous_attempt']['previous_measured_control_guidance']
+    assert not (args[1] / 'control-attempts/attempt-02/checker-controls.json').exists()
+    assert all(path.read_bytes() == content and json.loads(content) == raw[path.stem.removeprefix('control-')]
+        for path, content in retained.items())
+    final = json.loads(artifacts['controls_path'].read_bytes())
+    assert len(final) == 5 and all(row['actual'] == row['expected'] for row in final)
+    assert all(prompt['request'] == args[0]['text'] and prompt['source'] == args[7] for prompt in prompts)
