@@ -234,13 +234,62 @@ def preserve_original_tests(original: str, candidate: str, subjects: tuple[str, 
                 or any(c not in "0123456789abcdef" for c in native_profile[key])
                 for key in ("descriptor_sha256", "capability_sha256"))):
         raise ValueError("native_test_profile_unbound")
-    if native and not candidate.startswith(original):
-        raise ValueError("original_test_module_changed")
     before, after = ast.parse(original), ast.parse(candidate)
     old_nodes = [ast.dump(node, include_attributes=False) for node in before.body]
-    prefix = [ast.dump(node, include_attributes=False) for node in after.body[:len(before.body)]]
-    if prefix != old_nodes:
-        raise ValueError("original_test_module_changed")
+    if native:
+        original_lines, candidate_lines = original.splitlines(keepends=True), candidate.splitlines(keepends=True)
+        cursor = 0
+        added, matched = [], []
+        for index, node in enumerate(after.body):
+            if cursor < len(old_nodes) and ast.dump(node, include_attributes=False) == old_nodes[cursor]:
+                matched.append(index)
+                cursor += 1
+            else:
+                added.append(node)
+        if cursor != len(old_nodes) or matched and matched[0] != 0:
+            raise ValueError("original_test_module_changed")
+        def source_regions(tree, lines):
+            starts = [min([node.lineno, *(item.lineno for item in getattr(node, "decorator_list", ()))]) - 1
+                for node in tree.body]
+            regions = []
+            for index, node in enumerate(tree.body):
+                end = node.end_lineno
+                limit = starts[index + 1] if index + 1 < len(starts) else len(lines)
+                # A trailing indented comment belongs to this construct, not a later helper．
+                for line_index in range(end, limit):
+                    line = lines[line_index]
+                    if not line.strip():
+                        continue
+                    if line[:1].isspace() and line.lstrip().startswith("#"):
+                        end = line_index + 1
+                    else:
+                        break
+                regions.append((starts[index], end))
+            return regions
+        old_regions = source_regions(before, original_lines)
+        new_regions = source_regions(after, candidate_lines)
+        inserted_regions = [region for index, region in enumerate(new_regions) if index not in set(matched)]
+        old_end = new_end = 0
+        for old_index, new_index in [*enumerate(matched), (len(old_regions), len(new_regions))]:
+            old_start, old_stop = old_regions[old_index] if old_index < len(old_regions) else (len(original_lines), len(original_lines))
+            new_start, new_stop = new_regions[new_index] if new_index < len(new_regions) else (len(candidate_lines), len(candidate_lines))
+            if original_lines[old_start:old_stop] != candidate_lines[new_start:new_stop]:
+                raise ValueError("original_test_module_changed")
+            gap = [line for index, line in enumerate(candidate_lines[new_end:new_start], start=new_end)
+                if not any(start <= index < end for start, end in inserted_regions)]
+            cursor = 0
+            old_gap = original_lines[old_end:old_start]
+            for line in gap:
+                if cursor < len(old_gap) and line == old_gap[cursor]:
+                    cursor += 1
+            if cursor != len(old_gap):
+                raise ValueError("original_test_module_changed")
+            old_end, new_end = old_stop, new_stop
+    else:
+        prefix = [ast.dump(node, include_attributes=False) for node in after.body[:len(before.body)]]
+        if prefix != old_nodes:
+            raise ValueError("original_test_module_changed")
+        added = after.body[len(before.body):]
     bindings = set()
     def collect(item):
         if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -282,7 +331,25 @@ def preserve_original_tests(original: str, candidate: str, subjects: tuple[str, 
         if isinstance(node, ast.Attribute):
             return marker(node.value) + "." + node.attr
         return ""
-    for node in after.body[len(before.body):]:
+    if native:
+        deferred_annotations = any(isinstance(node, ast.ImportFrom) and node.module == "__future__"
+            and any(alias.name == "annotations" for alias in node.names) for node in before.body)
+        boundary = -1
+        for index, node in enumerate(before.body):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                arguments = [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
+                arguments += [argument for argument in (node.args.vararg, node.args.kwarg) if argument is not None]
+                annotations = [node.returns, *(argument.annotation for argument in arguments)]
+                defaults = [*node.args.defaults, *(value for value in node.args.kw_defaults if value is not None)]
+                if (not node.type_params and all(isinstance(value, ast.Constant) for value in defaults)
+                        and (not node.decorator_list or isinstance(node, ast.AsyncFunctionDef)
+                            and len(node.decorator_list) == 1 and marker(node.decorator_list[0]) in async_markers)
+                        and (deferred_annotations or all(inert_annotation(value) for value in annotations))):
+                    continue
+            boundary = matched[index]
+        if any(index <= boundary for index, node in enumerate(after.body) if node in added):
+            raise ValueError("original_test_module_changed")
+    for node in added:
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             raise ValueError("only_new_test_or_helper_functions_may_append")  # noqa: TRY004 — invalid source AST value．
         if node.name in bindings:
@@ -309,7 +376,6 @@ def preserve_original_tests(original: str, candidate: str, subjects: tuple[str, 
                 or isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load) and child.id in imported_nonexecution
                 for child in ast.walk(node)):
             raise ValueError("new_test_skip_or_xfail")
-    added = after.body[len(before.body):]
     if len(added) > 64 or sum(1 for node in added for _ in ast.walk(node)) > 4096:
         raise ValueError("new_test_body_budget")
     if native:
@@ -942,12 +1008,21 @@ class LocalDiscovery:
         consecutive_checker_failures = 0
         names = initial["allowed_files"]
         native_profile = _native_test_profile(template)
+        import_guidance = {"selected_source_paths": list(sources), "original_test_imports": {
+            name: [ast.unparse(node) for node in ast.walk(ast.parse(text))
+                if isinstance(node, (ast.Import, ast.ImportFrom))][:16]
+            for name, text in sources.items() if name.startswith("tests/") and text is not None}}
+        preservation_instructions = ("Preserve every original test source line in the supplied normalized text and original order and "
+            "every original top-level AST node, including imports, comments, decorators, fixtures and assertions. "
+            "Insert new function definitions between original top-level statements or append them at EOF; never modify originals. "
+            if native_profile else "Preserve every existing test module's original AST prefix exactly, including imports, decorators, fixtures and assertions. Only ")
         test_instructions = ("Native profile allows ordinary sync/async test/helper bodies, existing fixture parameters such as tmp_path, "
             "local imports, class/method and filesystem calls inside bodies. Use test_ or helper_ names. Path/None and basic inert annotations are allowed. "
+            "Insert new test/helper definitions between original top-level nodes or append them at EOF. "
             "Only bare existing pytest.mark.asyncio is allowed as an async test marker. No new top-level imports/statements, "
-            "pytest fixtures/hooks/plugins, arbitrary decorators, defaults or executable annotations. Preserve the original raw/AST prefix. "
+            "pytest fixtures/hooks/plugins, arbitrary decorators, defaults or executable annotations. Preserve all original raw lines and AST in order. "
             "Write a meaningful feature regression using real classes/fixtures even when approved_subject_calls is empty. "
-            "The trusted checker executes only appended test_ targets with pytest after semantic acceptance; every collected "
+            "The trusted checker executes all inserted or appended test_ targets with pytest after semantic acceptance; every collected "
             "case must pass setup, call and teardown without skip/xfail/deselection. "
             if native_profile else "append new uniquely named test/helper functions without decorators, defaults, parameter/return "
                 "annotations or type parameters. No imports anywhere in appended functions. Their closed body DSL "
@@ -962,8 +1037,10 @@ class LocalDiscovery:
             "under the existing TEMP/TMP/TMPDIR environment, never candidate/.mdsys or the checker directory. "
             "Import and invoke actual selected candidate APIs and assert measured behavior; asserting only self-created JSON "
             "or your own fixture does not test the candidate. known_good must repair actual selected implementation behavior "
-            "and append a meaningful regression, not only modify tests. Use the same standalone assertions to distinguish "
-            "repaired, unchanged and wrong behavior. Do not skip, xfail, importorskip or raise unittest.SkipTest. ")
+            "and add a meaningful regression, not only modify tests. Use the same standalone assertions to distinguish "
+            "repaired, unchanged and wrong behavior. Use the original_test_import_guidance spellings from existing tests; "
+            "do not assume a shorter package root or add import fallbacks. This is original-source guidance, not success proof. "
+            "Do not skip, xfail, importorskip or raise unittest.SkipTest. ")
         guard = {"allowed": names, "snapshot": original_snapshot, "native_test_profile": native_profile,
             "authority": {name: authority_fingerprint(text) for name, text in sources.items()
                 if name == "src/ephy_worker/discord_runtime.py" and text is not None},
@@ -983,7 +1060,7 @@ class LocalDiscovery:
             prepared = None
             try:
                 prepared = self.ask(json.dumps({"request": job["text"], "scope": initial, "source": sources,
-                    "approved_subject_calls_by_test_file": subjects,
+                    "approved_subject_calls_by_test_file": subjects, "original_test_import_guidance": import_guidance,
                     "previous_attempt": feedback, "attempt": attempt, "provisional_attempt_limit": 30,
                     "response_schema": {"checker_python": "standalone Python checker; argv[1] candidate root; nonzero on wrong behavior",
                         "known_good": {"scoped/path": [{"old": "exact unique original substring", "new": "replacement"},
@@ -997,9 +1074,8 @@ class LocalDiscovery:
                         "such as tmp_path in the checker. "
                         + checker_instructions + "Acceptance checker must return normally or raise AssertionError; do not launch child processes, "
                         "nested pytest, native loading or SystemExit. Pytest runs as a separate trusted registered check. "
-                        "Preserve every existing test module's original AST prefix exactly, including imports, decorators, fixtures and assertions. Only "
-                        + test_instructions +
-                        "known_good MUST change an existing selected tests file by appending a non-weakening "
+                        + preservation_instructions + test_instructions +
+                        "known_good MUST change an existing selected tests file by adding a non-weakening "
                         "regression test in addition to the repair control. No checker success markers, environment detection or simulated PASS. "
                         "Return only these three keys. Use compact edit operations, never repeat complete existing files or tests. "
                         "Edits are expanded by the trusted controller against the supplied original files; each old string must "
@@ -1181,9 +1257,9 @@ for name, original in guard['tests'].items():
     candidate_text=(root/name).read_text(encoding='utf-8')
     preserve_original_tests(original,candidate_text,tuple(guard.get('subjects',{}).get(name,())),guard.get('native_test_profile'))
     if guard.get('native_test_profile') is not None:
-        added=ast.parse(candidate_text).body[len(ast.parse(original).body):]
-        for node in added:
-            if isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef)) and node.name.startswith('test_'):
+        original_functions={node.name for node in ast.parse(original).body if isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef))}
+        for node in ast.parse(candidate_text).body:
+            if isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef)) and node.name not in original_functions and node.name.startswith('test_'):
                 native_targets[(str((root/name).resolve()),node.name)]=str(root/name)+'::'+node.name
 if native_targets:
     sys.dont_write_bytecode=True
