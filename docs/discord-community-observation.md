@@ -1,0 +1,31 @@
+# Discordコミュニティの観測
+
+Managerの既存queueへ`kind: discord.observe`，`input.mode: observe`を追加しました．既存`web.collect`の契約0.4と明示worker指定を維持します．`target_worker_id: auto`では，claim transaction内でheartbeatが新しく，契約，capability，空きconcurrencyが一致するworkerを選びます．active／concurrencyが低い順，同率では最後の割当が古い順，worker ID順です．稼働中leaseの喪失は既存の`lost`となり，自動再実行しません．CPU／GPU負荷は測定していません．
+
+collector設定は[設定例](../configs/collector-discord.example.yaml)を参照してください．Discord tokenは環境変数から接続時だけ解決します．guildと本文取得channelを列挙し，workerは`discord.observe`と各`discord.observe.channel.<guild>.<channel>` capabilityを登録します．本文のallowlistはmetadata取得対象のguildと区別します．snapshotはそのguildの取得可能なchannel／role構成を含みます．メンバー一覧，DM，thread列挙，添付ファイル取得は行いません．Discordへの通信は固定HTTPS APIのGETだけです．
+
+入力は`guild_id`，`channel_ids`，元のDiscord依頼snowflakeから固定したUTCの`observed_before`，`lookback_days: 30`，`max_messages_per_channel`です．依頼本文や過去回答はcollectorへ渡しません．channelごとの既定上限は1000件，全体は2000件，結果は8MiBまでです．本文は4000文字を超えると明示的にtruncatedとなります．API要求数，受信byte数，job時間にも既存budgetを適用します．429は待機上限内で1回だけ再試行します．
+
+Managerはfinalize時にchannelごとのmessage evidence件数とcoverageの報告件数を入力上限と照合し，超過は`observation_budget_exceeded`として結果を拒否します．上限ちょうどの結果は全evidenceを保持し，超過分の切捨てで成功扱いにはしません．保持期間を過ぎた結果のHTTP取得は`410 observation_retention_expired`となります．
+
+coverageのchannel別件数は実際のevidence件数と一致する必要があります．7／30日の活動集計も，投稿，利用者，bot／運営／replyなどの内訳，channel別／日別件数をevidenceから照合します．重複，不足，未知の集計行や値の不一致はfinalizeで拒否し，結果を補正して保存しません．同じ集計行の順序だけが違う場合は受け入れます．
+
+結果はsnapshot，7／30日活動集計，参照可能なmessage evidence，coverage，構造化failureです．投稿数とunique author数は取得した投稿から集計します．運営者は設定したIDだけで判定し，非reply投稿をconversation start，reply referenceのある投稿をreplyとして数えます．実際の会話session，返信の解決，関係性を証明する値ではありません．個人の専門性推測や関係graphは実装していません．個人profileの将来実装には本人の明示opt-inが必要です．
+
+Botの自己member record，role，channel overwriteから履歴権限を確認します．確認できない状態の空履歴は「投稿0件で完全取得」としません．Message Content Intentがない場合，空本文と本当に空の投稿は区別できないため`empty_or_unavailable`と記録します．本文取得を無効にした場合は`not_requested`です．取得上限，権限不足，本文不足，thread除外，観測期間を回答根拠へ渡します．部分取得は`partial`で返し，取得できた事実と不確実性を併記します．
+
+raw evidenceと集計はManagerのSQLiteへjob／attempt単位で保存します．同じfinalizeの再送は重複しません．収集から30日で本文を含むSQLite resultとresult-pack artifactを削除し，取得時は`observation_retention_expired`を返します．SQLite secure-deleteとWAL checkpointを使用します．本機能は30日を超える個人識別可能な観測履歴を保持しません．運用側のbackupにも同じ保持期間を適用してください．
+
+Discord bridgeではprivate TOMLに`community_guild_ids = [123]`を追加したguildだけで自然文をcommunity経路へ振り分けます．既存channel／user allowlist，受付，durable inbox，120秒の進捗通知，分割回答，返信履歴を使用し，`POST /v1/discord/observe`へ渡します．例は「このサーバーの構成を教えて」「最近の議論をまとめて」「未解決の課題は？」「HackSickの今週の活動を教えて」です．運営操作，投稿，role変更，event変更は観測経路にありません．通常の公開web調査と，既存のprimary channel限定owner repairは従来どおりです．Runtimeはlocal modelで議論／課題の根拠を整理し，不明な担当者／期限を補いません．
+
+設定したguildでは「昨日の議論をまとめて」「昨日みんなが話していた件の結論は？」など，サーバー名を省略した議論／話題／結論の依頼もprivateな観測へ渡します．公開資料，公式ドキュメント，ニュースなどの明示的な公開調査は，このサーバーを参照していない場合に従来のweb調査へ渡します．
+
+「みんなの投稿をまとめて」「メンバーの発言を教えて」なども，分類に使うactivity／discussion／snapshot／unresolvedの同じ語句でprivateな観測へ振り分けます．一般的な「教えて」「まとめて」だけの依頼には引き続きcommunity参照が必要です．
+
+回答生成の総時間とpoll回数には上限を設けません．pending応答には，実作業の進捗番号`progress_seq`と`phase`（submitting／collecting／analyzing／rendering）が必要です．進捗番号が増えない状態が`read_idle_timeout_seconds`続いた場合だけ，進捗停止を明示して待機を終了します．poll応答が返ること自体は進捗に数えず，実際の収集やmodel生成が進んでいる間は，合計時間がidle時間を超えても回答を待ち続けます．
+
+idleの残り時間は，各HTTP応答のheader待機とJSON本文全体の読取りにも適用します．keepaliveのbyteだけが届き続けても待機を延長せず，停止時には応答を閉じ，待機中の次の依頼へ進みます．完了した応答の実進捗番号が増えた場合はidleを更新するため，正常に進んでいる生成の総時間を制限しません．
+
+primary guild／channelのowner依頼は，communityの語句に一致していても，必ず既存のdurable intakeへ保存して修正／会話の分類を先に行います．修正と分類した依頼は既存の修正queueへ，会話と分類したcommunity依頼はprivateな観測へ渡します．他の利用者や追加guild／channelに修正権限を与える変更はありません．
+
+community回答への「詳しく教えて」などの返信は，保存した回答のoperation／期間を継承してprivateな観測を続けます．分割した各回答にも同じprovenanceを保存し，明示的な新しいcommunity依頼があればそのoperation／期間を優先します．公開回答への返信は公開調査のままです．provenanceは回答本文やURLから推測せず，従来と同じguild／channel／利用者／24時間の照合条件で読みます．pending inboxとowner intakeにも保存するため，intake保存直後の停止から復旧してもprivateな過去回答を公開plannerへ渡しません．現在の設定でcommunity観測が無効なら外部検索へ切り替えず，利用できない旨を返します．既存行はnullableなprovenanceを追加して移行し，過去の回答や依頼本文を書き換えません．

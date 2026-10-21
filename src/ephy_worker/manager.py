@@ -30,6 +30,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import Counter
 from pathlib import Path
 
 from aiohttp import web
@@ -38,15 +39,19 @@ from pydantic import ValidationError
 from .contracts import (
     CONTRACT_VERSION,
     JOB_KIND,
+    OBSERVE_KIND,
     TERMINAL_STATES,
     ArtifactRef,
     JobUsage,
+    ObserveJobInput,
+    ObservePayload,
     ResultEnvelope,
     SubmitJob,
     WorkerRegistration,
     job_input_hash,
-    required_capabilities,
+    required_job_capabilities,
 )
+from .discord_observer import activity
 from .schema import Limits
 from .store import output_root
 
@@ -135,6 +140,14 @@ CREATE TABLE IF NOT EXISTS artifacts (
     stored_path TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS artifacts_job ON artifacts (job_id);
+CREATE TABLE IF NOT EXISTS discord_observations (
+    job_id TEXT PRIMARY KEY,
+    attempt_id TEXT NOT NULL,
+    collected_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    payload TEXT NOT NULL,
+    activity TEXT NOT NULL
+);
 """
 
 _MIGRATED_JOB_COLUMNS = {
@@ -163,6 +176,7 @@ class Manager:
         self._conn = sqlite3.connect(self.database_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA secure_delete=ON")
         if os.name == "posix":
             os.chmod(self.database_path, 0o600)
         self._conn.executescript(_SCHEMA)
@@ -264,17 +278,37 @@ class Manager:
         return self._conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
 
     def _wait_reason(self, row: sqlite3.Row) -> str | None:
+        if row["target_worker_id"] == "auto":
+            eligible = self._eligible_workers(row, time.time())
+            return None if eligible else "no_eligible_worker"
         worker = self._worker_row(row["target_worker_id"])
         if worker is None:
             return "target_worker_unregistered"
-        if worker["state"] != "online":
+        if worker["state"] != "online" or worker["last_heartbeat_at"] < time.time() - self.offline_after_seconds:
             return "target_worker_offline"
         if worker["contract_version"] != CONTRACT_VERSION:
             return "target_worker_contract_mismatch"
         capabilities = set(json.loads(worker["capabilities"]))
-        if not set(required_capabilities(row["mode"])) <= capabilities:
+        if not self._required_capabilities(row) <= capabilities:
             return "target_worker_capability_mismatch"
         return None
+
+    @staticmethod
+    def _required_capabilities(row: sqlite3.Row) -> set[str]:
+        return set(required_job_capabilities(row["kind"], row["mode"], json.loads(row["input"])))
+
+    def _eligible_workers(self, job: sqlite3.Row, now: float) -> list[sqlite3.Row]:
+        rows = self._conn.execute(
+            "SELECT w.*, (SELECT COUNT(*) FROM jobs j WHERE j.worker_id=w.worker_id "
+            "AND j.state IN ('running','cancel_requested')) AS active, "
+            "COALESCE((SELECT MAX(a.created_at) FROM attempts a WHERE a.worker_id=w.worker_id),0) AS assigned "
+            "FROM workers w WHERE w.state='online' AND w.last_heartbeat_at>=? AND w.contract_version=?",
+            (now - self.offline_after_seconds, CONTRACT_VERSION),
+        ).fetchall()
+        required = self._required_capabilities(job)
+        eligible = [w for w in rows if w["worker_id"] != "auto" and w["active"] < w["concurrency"]
+            and required <= set(json.loads(w["capabilities"]))]
+        return sorted(eligible, key=lambda w: (w["active"] / w["concurrency"], w["assigned"], w["worker_id"]))
 
     def _job_view(self, row: sqlite3.Row) -> dict:
         result = json.loads(row["result"]) if row["result"] else None
@@ -306,6 +340,7 @@ class Manager:
 
     @serialized
     def job_view(self, job_id: str) -> dict:
+        self._expire_observations()
         row = self._job_row(job_id)
         if row is None:
             raise ManagerError("unknown_job", 404)
@@ -313,7 +348,10 @@ class Manager:
 
     @serialized
     def job_result(self, job_id: str) -> dict:
+        self._expire_observations()
         view = self.job_view(job_id)
+        if view["stop_reason"] == "observation_retention_expired":
+            raise ManagerError("observation_retention_expired", 410)
         if view["state"] not in TERMINAL_STATES:
             raise ManagerError("not_terminal", 409)
         if view["result"] is None:
@@ -368,6 +406,9 @@ class Manager:
             "fetch_requests": root_limits.fetch_requests - used["fetch_requests"],
             "model_requests": root_limits.model_requests - used["model_requests"],
         }
+        if parent["kind"] == OBSERVE_KIND:
+            # Discord HTTP reads consume fetch_requests，not the web source-selection allowance．
+            available["max_sources"] = root_limits.max_sources
         for field, remaining in available.items():
             if getattr(submit.budget, field) > remaining:
                 raise ManagerError("child_budget_exceeds_parent", 409)
@@ -377,7 +418,7 @@ class Manager:
         if submit.contract != CONTRACT_VERSION:
             raise ManagerError("unsupported_contract", 409)
         payload = submit.input
-        input_hash = job_input_hash(payload.model_dump())
+        input_hash = job_input_hash(payload.model_dump(mode="json"))
         with self._lock:
             existing = self._conn.execute(
                 "SELECT * FROM jobs WHERE submit_key = ?", (submit.submit_key,)
@@ -391,6 +432,8 @@ class Manager:
                 if parent is None:
                     raise ManagerError("unknown_parent_job", 404)
                 self._validate_child_allocation(parent, submit)
+                if parent["kind"] != submit.kind:
+                    raise ManagerError("parent_kind_mismatch", 409)
             now = time.time()
             job_id = uuid.uuid4().hex
             self._conn.execute(
@@ -405,7 +448,7 @@ class Manager:
                     submit.parent_job_id,
                     submit.kind,
                     payload.mode,
-                    json.dumps(payload.model_dump(), ensure_ascii=False),
+                    json.dumps(payload.model_dump(mode="json"), ensure_ascii=False),
                     submit.target_worker_id,
                     json.dumps(submit.budget.model_dump()),
                     submit.deadline_seconds,
@@ -424,7 +467,8 @@ class Manager:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 worker = self._worker_row(worker_id)
-                if worker is None or worker["state"] != "online":
+                if (worker is None or worker["state"] != "online"
+                        or worker["last_heartbeat_at"] < time.time() - self.offline_after_seconds):
                     self._conn.rollback()
                     return None
                 if worker["contract_version"] != CONTRACT_VERSION:
@@ -439,16 +483,25 @@ class Manager:
                     return None
                 capabilities = set(json.loads(worker["capabilities"]))
                 now = time.time()
-                row = self._conn.execute(
+                rows = self._conn.execute(
                     """
                     SELECT * FROM jobs
-                    WHERE state = 'queued' AND target_worker_id = ? AND deadline_at > ?
+                    WHERE state = 'queued' AND target_worker_id IN (?, 'auto') AND deadline_at > ?
                     ORDER BY created_at ASC, job_id ASC
-                    LIMIT 1
                     """,
                     (worker_id, now),
-                ).fetchone()
-                if row is None or not set(required_capabilities(row["mode"])) <= capabilities:
+                ).fetchall()
+                row = None
+                for candidate in rows:
+                    if not self._required_capabilities(candidate) <= capabilities:
+                        continue
+                    if candidate["target_worker_id"] == "auto":
+                        eligible = self._eligible_workers(candidate, now)
+                        if not eligible or eligible[0]["worker_id"] != worker_id:
+                            continue
+                    row = candidate
+                    break
+                if row is None:
                     self._conn.rollback()
                     return None
                 attempt_id = uuid.uuid4().hex
@@ -568,6 +621,8 @@ class Manager:
             raise ManagerError("attempt_mismatch", 409)
         if result.payload.mode != row["mode"]:
             raise ManagerError("mode_mismatch", 409)
+        if row["kind"] == OBSERVE_KIND:
+            self._validate_observation_result(row, result)
         state = row["state"]
         status = result.status
         if state == "running" and status in {"succeeded", "partial", "failed"}:
@@ -599,12 +654,20 @@ class Manager:
             stop_reason = "cancelled_by_requester"
         self._conn.execute(
             "UPDATE jobs SET state = ?, stop_reason = ?, result = ? WHERE job_id = ?",
-            (new_state, stop_reason, json.dumps(result.model_dump(), ensure_ascii=False), job_id),
+            (new_state, stop_reason, json.dumps(result.model_dump(mode="json"), ensure_ascii=False), job_id),
         )
         self._conn.execute(
             "UPDATE attempts SET finalized_at = ? WHERE attempt_id = ?",
             (time.time(), attempt["attempt_id"]),
         )
+        if isinstance(result.payload, ObservePayload):
+            collected = result.payload.coverage.observed_at.timestamp()
+            self._conn.execute(
+                "INSERT INTO discord_observations VALUES (?,?,?,?,?,?)",
+                (job_id, attempt["attempt_id"], collected, collected + 30 * 86400,
+                 json.dumps(result.payload.model_dump(mode="json"), ensure_ascii=False),
+                 json.dumps([a.model_dump(mode="json") for a in result.payload.activity])),
+            )
         self._conn.commit()
         return self._job_view(self._job_row(job_id))
 
@@ -631,6 +694,10 @@ class Manager:
         remaining_search = parent.search_requests - usage.search_requests - 1
         remaining_sources = parent.max_sources - usage.fetch_requests - 1
         remaining_fetch = parent.fetch_requests - usage.fetch_requests - 1
+        if row["kind"] == OBSERVE_KIND:
+            remaining_queries = parent.max_queries
+            remaining_search = parent.search_requests
+            remaining_sources = parent.max_sources
         if min(remaining_queries, remaining_search, remaining_sources, remaining_fetch) < 1:
             raise ManagerError("no_remaining_budget", 409)
         child_budget = Limits(
@@ -661,7 +728,7 @@ class Manager:
             contract=CONTRACT_VERSION,
             submit_key=key,
             parent_job_id=job_id,
-            kind=JOB_KIND,
+            kind=row["kind"],
             input=json.loads(row["input"]),
             target_worker_id=row["target_worker_id"],
             budget=child_budget,
@@ -687,6 +754,7 @@ class Manager:
             except OSError:
                 pass
         self._conn.execute("DELETE FROM artifacts WHERE job_id = ?", (job_id,))
+        self._conn.execute("DELETE FROM discord_observations WHERE job_id = ?", (job_id,))
         self._conn.execute("DELETE FROM attempts WHERE job_id = ?", (job_id,))
         self._conn.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
         self._conn.commit()
@@ -696,6 +764,71 @@ class Manager:
         return {"job_id": job_id, "deleted_artifacts": len(artifacts)}
 
     # -- artifacts ----------------------------------------------------------
+
+    def _validate_observation_result(self, row: sqlite3.Row, result: ResultEnvelope) -> None:
+        payload = result.payload
+        if not isinstance(payload, ObservePayload):
+            raise ManagerError("observation_payload_mismatch", 409)
+        input = ObserveJobInput.model_validate(json.loads(row["input"]))
+        coverage = payload.coverage
+        if (coverage.guild_id != input.guild_id or coverage.channel_ids != input.channel_ids
+                or coverage.window_end != input.observed_before
+                or (coverage.window_end - coverage.window_start).total_seconds() != 30 * 86400
+                or {c.channel_id for c in coverage.channels} != set(input.channel_ids)
+                or len(coverage.channels) != len(input.channel_ids)):
+            raise ManagerError("observation_scope_mismatch", 409)
+        if not row["created_at"] - 1 <= coverage.observed_at.timestamp() <= time.time() + 60:
+            raise ManagerError("observation_collection_time_invalid", 409)
+        if (result.status == "succeeded" and (coverage.status != "complete" or payload.failures)
+                or result.usage.search_requests or result.usage.model_requests):
+            raise ManagerError("observation_status_or_usage_mismatch", 409)
+        if payload.snapshot.guild is not None and payload.snapshot.guild.id != input.guild_id:
+            raise ManagerError("observation_scope_mismatch", 409)
+        if any(c.guild_id != input.guild_id for c in payload.snapshot.channels):
+            raise ManagerError("observation_scope_mismatch", 409)
+        message_counts = Counter(message.channel_id for message in payload.messages)
+        if (any(count > input.max_messages_per_channel for count in message_counts.values())
+                or any(channel.message_count > input.max_messages_per_channel for channel in coverage.channels)):
+            raise ManagerError("observation_budget_exceeded", 409)
+        if any(channel.message_count != message_counts[channel.channel_id] for channel in coverage.channels):
+            raise ManagerError("observation_coverage_mismatch", 409)
+
+        def summary(value):
+            data = value.model_dump(mode="json")
+            data["channels"] = sorted(data["channels"], key=lambda channel: channel["channel_id"])
+            data["daily"] = sorted(data["daily"], key=lambda day: day["date"])
+            return data
+
+        reported = sorted((summary(value) for value in payload.activity), key=lambda value: value["period_days"])
+        expected = [summary(value) for value in activity(payload.messages, input)]
+        if reported != expected:
+            raise ManagerError("observation_activity_mismatch", 409)
+        limits = Limits.model_validate(json.loads(row["budget"]))
+        if result.usage.fetch_requests > limits.fetch_requests or result.usage.document_bytes > 8 * 1024**2:
+            raise ManagerError("observation_budget_exceeded", 409)
+
+    def _expire_observations(self) -> int:
+        now = time.time()
+        rows = self._conn.execute(
+            "SELECT j.job_id FROM jobs j LEFT JOIN discord_observations o ON o.job_id=j.job_id "
+            "WHERE j.kind=? AND (o.expires_at<=? OR (o.job_id IS NULL AND j.created_at<=? "
+            "AND j.stop_reason IS NOT 'observation_retention_expired'))",
+            (OBSERVE_KIND, now, now - 30 * 86400),
+        ).fetchall()
+        for row in rows:
+            artifacts = self._conn.execute("SELECT stored_path FROM artifacts WHERE job_id=?", (row["job_id"],)).fetchall()
+            for artifact in artifacts:
+                path = Path(artifact["stored_path"])
+                path.resolve().relative_to(self.artifact_dir.resolve())
+                path.unlink(missing_ok=True)
+            self._conn.execute("DELETE FROM artifacts WHERE job_id=?", (row["job_id"],))
+            self._conn.execute("DELETE FROM discord_observations WHERE job_id=?", (row["job_id"],))
+            self._conn.execute("UPDATE jobs SET result=NULL,stop_reason='observation_retention_expired' WHERE job_id=?",
+                (row["job_id"],))
+        if rows:
+            self._conn.commit()
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return len(rows)
 
     def _active_attempt(self, job_id: str, attempt_id: str) -> sqlite3.Row:
         row = self._attempt_row(job_id, attempt_id)
@@ -808,6 +941,7 @@ class Manager:
 
     @serialized
     def get_artifact(self, job_id: str, artifact_id: str) -> tuple[ArtifactRef, Path]:
+        self._expire_observations()
         row = self._job_row(job_id)
         if row is None:
             raise ManagerError("unknown_job", 404)
@@ -833,6 +967,7 @@ class Manager:
 
     @serialized
     def sweep_once(self) -> dict:
+        self._expire_observations()
         now = time.time()
         lost = self._conn.execute(
             "UPDATE jobs SET state = 'lost', stop_reason = 'lease_expired' "
@@ -888,7 +1023,7 @@ class ManagerApp:
         self.settings = settings
         self._sweeper_task: asyncio.Task | None = None
         self.artifact_limit = min(settings.max_artifact_bytes, MAX_ARTIFACT_BYTES)
-        self.app = web.Application(middlewares=[_manager_error_middleware])
+        self.app = web.Application(middlewares=[_manager_error_middleware], client_max_size=9 * 1024**2)
         self.app.on_startup.append(self._startup)
         self.app.on_cleanup.append(self._cleanup)
         self.app.router.add_get("/health", self._health)
@@ -990,13 +1125,19 @@ class ManagerApp:
         view = await asyncio.to_thread(self.manager.job_view, request.match_info["job_id"])
         if view["state"] not in TERMINAL_STATES:
             raise ManagerError("not_terminal", 409)
+        try:
+            result = await asyncio.to_thread(self.manager.job_result, request.match_info["job_id"])
+        except ManagerError as exc:
+            if exc.code != "result_unavailable":
+                raise
+            result = None
         return web.json_response(
             {
                 "job_id": view["job_id"],
                 "state": view["state"],
                 "stop_reason": view["stop_reason"],
                 "usage": view["usage"],
-                "result": view["result"],
+                "result": result,
             }
         )
 
