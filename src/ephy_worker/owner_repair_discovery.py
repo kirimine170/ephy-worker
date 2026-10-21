@@ -568,11 +568,14 @@ class LocalDiscovery:
             tokens = tokenized.json().get("tokens")
             if not isinstance(tokens, list) or any(type(token) is not int or token < 0 for token in tokens):
                 raise GateFailure("contract_incomplete:discovery_token_measurement_invalid")
-            if len(tokens) + 4096 > identity["context"]:
+            # Keep a small allowance for server-side template/BOS overhead, not a response cap.
+            template_margin = 64
+            output_tokens = identity["context"] - len(tokens) - template_margin
+            if output_tokens < 4096:
                 raise GateFailure("contract_incomplete:discovery_context_budget_exceeded")
             response = client.post(runtime["base_url"] + "/v1/chat/completions", json={
                 "model": identity["model_id"], "stream": False, "temperature": 0,
-                "max_tokens": 4096, "messages": messages, "response_format": response_format})
+                "max_tokens": output_tokens, "messages": messages, "response_format": response_format})
         response.raise_for_status()
         if self.response_path is not None and len(response.content) <= 2097152:
             self.response_path.write_bytes(response.content)

@@ -587,7 +587,7 @@ def test_discovery_uses_actual_template_tokens_and_rejects_context_before_infere
         assert [path for path, _ in calls] == ["/apply-template", "/tokenize"]
     else:
         assert discovery.completion("source fixture", runtime) == {"fixture": True}
-        assert calls[-1][1]["max_tokens"] == 4096
+        assert calls[-1][1]["max_tokens"] == 5000 - 10 - 64
         assert calls[-1][1]["messages"] == calls[0][1]["messages"]
 
 
@@ -1407,7 +1407,7 @@ def test_discovery_json_http_request_format_and_strict_raw_evidence(tmp_path, mo
     raw = json.loads((directory / "scope.raw.json").read_bytes())
     assert raw["choices"][0]["message"]["content"] == content
     assert calls[-1][1]["messages"] == calls[0][1]["messages"]
-    assert calls[-1][1]["max_tokens"] == 4096 and calls[-1][1]["stream"] is False
+    assert calls[-1][1]["max_tokens"] == 32768 - 3 - 64 and calls[-1][1]["stream"] is False
 
 
 @pytest.mark.parametrize("fault,expected", [("origin", "discovery_origin_changed"),
@@ -1561,3 +1561,66 @@ def test_discovery_loop_http_uses_exclusive_json_schema_for_both_shapes(tmp_path
         actual_client(transport=httpx.MockTransport(handler), **kwargs))
     assert discovery.select_scope({"text": "Improve search", "previous": None}, templates, inventories, tmp_path / "private") == selected
     assert len(formats) == (2 if read_more else 1)
+
+
+@pytest.mark.parametrize("context,input_tokens,expected_output", [(32768, 16175, 16529),
+    (4260, 100, 4096), (4259, 100, None)])
+def test_discovery_generation_uses_remaining_context_and_minimum_headroom(tmp_path, monkeypatch,
+        context, input_tokens, expected_output):
+    from ephy_worker.formal_artifacts import GateFailure
+
+    identity = tmp_path / "identity.json"
+    identity.write_text(json.dumps({"context": context, "model_id": "fixture-model"}), encoding="utf-8")
+    monkeypatch.setitem(sys.modules, "ephy_worker.existing_llama_runtime", SimpleNamespace(verify_identity=lambda _: None))
+    calls = []
+    def handler(request):
+        data = json.loads(request.content)
+        calls.append((request.url.path, data))
+        if request.url.path == "/apply-template":
+            return httpx.Response(200, json={"prompt": "measured formatted fixture"})
+        if request.url.path == "/tokenize":
+            assert data == {"content": "measured formatted fixture", "add_special": False}
+            return httpx.Response(200, json={"tokens": [1] * input_tokens})
+        assert request.url.path == "/v1/chat/completions"
+        assert data["max_tokens"] == expected_output
+        assert input_tokens + data["max_tokens"] + 64 == context
+        assert data["messages"] == calls[0][1]["messages"]
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": '{"fixture":true}'}}]})
+    actual_client = httpx.Client
+    monkeypatch.setattr("ephy_worker.owner_repair_discovery.httpx.Client", lambda **kwargs:
+        actual_client(transport=httpx.MockTransport(handler), **kwargs))
+    discovery = LocalDiscovery(SimpleNamespace())
+    runtime = {"models_ini": str(identity), "base_url": "http://127.0.0.1:18080"}
+    if expected_output is None:
+        with pytest.raises(GateFailure, match="context_budget_exceeded"):
+            discovery.completion("original private fixture request", runtime)
+        assert [path for path, _ in calls] == ["/apply-template", "/tokenize"]
+    else:
+        assert discovery.completion("original private fixture request", runtime) == {"fixture": True}
+        assert calls[-1][1]["max_tokens"] == expected_output
+
+
+@pytest.mark.parametrize("finish_reason,content,error", [("length", '{"fixture":true}', RuntimeError),
+    ("stop", '{"fixture":', ValueError)])
+def test_discovery_generation_rejects_incomplete_and_preserves_raw_response(tmp_path, monkeypatch, finish_reason, content, error):
+    identity = tmp_path / "identity.json"
+    identity.write_text(json.dumps({"context": 32768, "model_id": "fixture-model"}), encoding="utf-8")
+    monkeypatch.setitem(sys.modules, "ephy_worker.existing_llama_runtime", SimpleNamespace(verify_identity=lambda _: None))
+    def handler(request):
+        if request.url.path == "/apply-template":
+            return httpx.Response(200, json={"prompt": "measured fixture prompt"})
+        if request.url.path == "/tokenize":
+            return httpx.Response(200, json={"tokens": [1, 2, 3]})
+        assert request.url.path == "/v1/chat/completions"
+        assert json.loads(request.content)["max_tokens"] == 32768 - 3 - 64
+        return httpx.Response(200, json={"choices": [{"finish_reason": finish_reason, "message": {"content": content}}]})
+    actual_client = httpx.Client
+    monkeypatch.setattr("ephy_worker.owner_repair_discovery.httpx.Client", lambda **kwargs:
+        actual_client(transport=httpx.MockTransport(handler), **kwargs))
+    discovery = LocalDiscovery(SimpleNamespace())
+    directory = tmp_path / "private"
+    with pytest.raises(error, match="generation_incomplete" if finish_reason == "length" else None):
+        discovery.ask("fixture request", {"models_ini": str(identity), "base_url": "http://127.0.0.1:18080"}, directory, "controls")
+    raw = json.loads((directory / "controls.raw.json").read_bytes())
+    assert raw["choices"][0] == {"finish_reason": finish_reason, "message": {"content": content}}
+    assert (directory / "controls.error.json").is_file()
