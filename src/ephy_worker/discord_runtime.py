@@ -440,6 +440,8 @@ class RuntimeGateway:
             "previous_answer": bounded_text(safe_final(previous_answer, self.secrets), 1200) if previous_answer else None}
         bound = {}
         worker_id = None
+        progress_seq = -1
+        last_progress = time.monotonic()
         while True:
             try:
                 timeout = httpx.Timeout(connect=10, read=self.settings.read_idle_timeout_seconds, write=30, pool=30)
@@ -471,6 +473,15 @@ class RuntimeGateway:
                     if response.status_code == 202:
                         if status.get("status") != "pending":
                             raise BridgeError("runtime_observation_identity_mismatch")
+                        sequence = status.get("progress_seq")
+                        if (type(sequence) is not int or sequence < 0 or sequence < progress_seq
+                                or status.get("phase") not in {"submitting", "collecting", "analyzing", "rendering"}):
+                            raise BridgeError("runtime_observation_progress_invalid")
+                        now = time.monotonic()
+                        if sequence > progress_seq:
+                            progress_seq, last_progress = sequence, now
+                        elif now - last_progress >= self.settings.read_idle_timeout_seconds:
+                            raise BridgeError("runtime_observation_stalled")
                         await asyncio.sleep(self.settings.poll_interval_seconds)
                         continue
                     if (status.get("status") not in {"completed", "partial"} or worker_id is None
@@ -667,6 +678,7 @@ class BridgeLedger:
 
 
 _FAILURES = {
+    "runtime_observation_stalled": "コミュニティ調査の進捗を一定時間確認できなかったため，待機を停止しました．完了した結果は確認できていません．",
     "search_confirmation_required": "この検索は確認が必要なため，実行していません．",
     "search_blocked": "この内容は検索できません．検索は実行していません．",
     "question_not_public": "秘密情報や私的な情報を含まない公開の質問でお願いします．",

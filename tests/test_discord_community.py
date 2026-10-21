@@ -1,9 +1,11 @@
 import asyncio
 import json
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
+from ephy_worker import discord_runtime
 from ephy_worker.discord_community import community_intent
 from ephy_worker.discord_runtime import (
     PROGRESS,
@@ -23,6 +25,9 @@ from ephy_worker.discord_runtime import (
     ("最近の議論で何が決まった？", "discussion", 30),
     ("未解決の課題は何が残っている？", "unresolved", 30),
     ("HackSickの現状と運営の改善案を教えて", "report", 30),
+    ("昨日の議論をまとめて", "discussion", 7),
+    ("昨日みんなが話していた件の結論は？", "discussion", 7),
+    ("その話題の結論を教えて", "discussion", 30),
 ])
 def test_natural_japanese_community_intents(query, operation, days):
     assert community_intent(query) == (operation, days)
@@ -37,7 +42,7 @@ def settings(tmp_path, **updates):
 def status(**updates):
     return {"provider": "worker", "contract": "0.4", "request_id": "100", "job_id": "observation1",
         "input_hash": "a" * 64, "worker_id": "worker-a", "status": "completed", "state": "completed",
-        "analysis_status": "verified", **updates}
+        "analysis_status": "verified", "progress_seq": 0, "phase": "collecting", **updates}
 
 
 async def test_dedicated_gateway_pending_identity_and_partial_completion(tmp_path):
@@ -82,6 +87,60 @@ async def test_gateway_rejects_changed_job_or_worker_identity(tmp_path):
         await gateway.aclose()
 
 
+async def test_stagnant_pending_sequence_fails_on_idle_without_overall_poll_cap(tmp_path, monkeypatch):
+    clock, calls = [0.0], []
+    monkeypatch.setattr(discord_runtime, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    async def fixture(request):
+        calls.append(request)
+        clock[0] += 0.6
+        return httpx.Response(202, json={"discord_observe_status": status(status="pending", phase="analyzing")})
+    gateway = RuntimeGateway(settings(tmp_path, read_idle_timeout_seconds=1, max_polls=1),
+        transport=httpx.MockTransport(fixture))
+    try:
+        with pytest.raises(BridgeError, match="runtime_observation_stalled"):
+            await gateway.observe("昨日の議論をまとめて", request_id="100", guild_id="11", channel_id="20",
+                operation="discussion", period_days=7)
+        assert len(calls) == 3 and clock[0] > gateway.settings.read_idle_timeout_seconds
+    finally:
+        await gateway.aclose()
+
+
+async def test_real_progress_can_exceed_idle_total_and_original_max_polls(tmp_path, monkeypatch):
+    clock, calls = [0.0], []
+    monkeypatch.setattr(discord_runtime, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    async def fixture(request):
+        calls.append(request)
+        clock[0] += 0.6
+        pending = len(calls) <= 5
+        return httpx.Response(202 if pending else 200, json={"discord_observe_status": status(
+            status="pending" if pending else "completed", phase="analyzing" if pending else "rendering",
+            progress_seq=len(calls)), "choices": [{"message": {"content": "わたしが確認した議論の結論です．"}}]})
+    gateway = RuntimeGateway(settings(tmp_path, read_idle_timeout_seconds=1, max_polls=1),
+        transport=httpx.MockTransport(fixture))
+    try:
+        answer = await gateway.observe("昨日の議論をまとめて", request_id="100", guild_id="11", channel_id="20",
+            operation="discussion", period_days=7)
+        assert "結論" in answer and len(calls) == 6
+        assert clock[0] > 3 * gateway.settings.read_idle_timeout_seconds
+        assert len(calls) > gateway.settings.max_polls
+    finally:
+        await gateway.aclose()
+
+
+@pytest.mark.parametrize("updates", [
+    {"progress_seq": True}, {"progress_seq": -1}, {"progress_seq": None}, {"phase": "polling"},
+])
+async def test_pending_requires_real_typed_progress_fields(tmp_path, updates):
+    gateway = RuntimeGateway(settings(tmp_path), transport=httpx.MockTransport(lambda request:
+        httpx.Response(202, json={"discord_observe_status": status(status="pending", **updates)})))
+    try:
+        with pytest.raises(BridgeError, match="runtime_observation_progress_invalid"):
+            await gateway.observe("昨日の議論をまとめて", request_id="100", guild_id="11", channel_id="20",
+                operation="discussion", period_days=7)
+    finally:
+        await gateway.aclose()
+
+
 async def test_community_inbox_ack_progress_split_reply_without_public_search(tmp_path):
     class Gateway:
         def __init__(self):
@@ -113,3 +172,28 @@ async def test_community_inbox_ack_progress_split_reply_without_public_search(tm
 def test_ordinary_public_question_is_not_community_intent():
     assert community_intent("Pythonの公開仕様を調べて") is None
     assert community_intent("Discordコミュニティの作り方を調べて") is None
+    assert community_intent("昨日の国会での議論をニュースで調べて") is None
+    assert community_intent("Pythonの公開仕様についての議論を公式ドキュメントで調べて") is None
+    assert community_intent("コミュニティ運営の公開資料を検索して") is None
+    assert community_intent("このサーバーの議論を公開情報と比べて") == ("discussion", 30)
+
+
+@pytest.mark.parametrize("query", ["昨日の議論をまとめて", "昨日みんなが話していた件の結論は？"])
+async def test_contextual_local_discussion_inbox_never_uses_public_search(tmp_path, query):
+    class Gateway:
+        def __init__(self):
+            self.calls = []
+        async def observe(self, query, previous_answer=None, **kwargs):
+            self.calls.append((query, kwargs))
+            return "わたしが観測した範囲の議論を確認しました．"
+        async def answer(self, *args):
+            raise AssertionError("ambiguous local discussion must stay private")
+    gateway, config, sent = Gateway(), settings(tmp_path), []
+    bridge = RuntimeDiscordBridge(config, gateway, BridgeLedger(config))
+    async def send(text):
+        sent.append(text)
+        return 1000 + len(sent)
+    await bridge.handle(DiscordEvent(100, 11, 20, 30, "<@10> " + query, mentioned=True), send)
+    assert sent[0] == RECEIPT and len(sent) == 2
+    assert gateway.calls == [(query, {"request_id": "100", "guild_id": "11", "channel_id": "20",
+        "operation": "discussion", "period_days": 7})]

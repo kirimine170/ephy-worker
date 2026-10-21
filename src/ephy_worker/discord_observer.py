@@ -197,8 +197,10 @@ class DiscordObserver:
                     if not isinstance(page, list):
                         raise ObservationError("history_invalid")
                     if not page:
-                        coverage.status = "complete" if permission == "granted" else "unavailable"
-                        coverage.reason = None if permission == "granted" else "empty_history_permission_unknown"
+                        coverage.status = "complete" if permission == "granted" else (
+                            "partial" if coverage.message_count else "unavailable")
+                        coverage.reason = None if permission == "granted" else (
+                            "history_permission_unknown" if coverage.message_count else "empty_history_permission_unknown")
                         break
                     oldest = min(int(m["id"]) for m in page)
                     if oldest >= int(before):

@@ -13,3 +13,7 @@ Botの自己member record，role，channel overwriteから履歴権限を確認�
 raw evidenceと集計はManagerのSQLiteへjob／attempt単位で保存します．同じfinalizeの再送は重複しません．収集から30日で本文を含むSQLite resultとresult-pack artifactを削除し，取得時は`observation_retention_expired`を返します．SQLite secure-deleteとWAL checkpointを使用します．本機能は30日を超える個人識別可能な観測履歴を保持しません．運用側のbackupにも同じ保持期間を適用してください．
 
 Discord bridgeではprivate TOMLに`community_guild_ids = [123]`を追加したguildだけで自然文をcommunity経路へ振り分けます．既存channel／user allowlist，受付，durable inbox，120秒の進捗通知，分割回答，返信履歴を使用し，`POST /v1/discord/observe`へ渡します．例は「このサーバーの構成を教えて」「最近の議論をまとめて」「未解決の課題は？」「HackSickの今週の活動を教えて」です．運営操作，投稿，role変更，event変更は観測経路にありません．通常の公開web調査と，既存のprimary channel限定owner repairは従来どおりです．Runtimeはlocal modelで議論／課題の根拠を整理し，不明な担当者／期限を補いません．
+
+設定したguildでは「昨日の議論をまとめて」「昨日みんなが話していた件の結論は？」など，サーバー名を省略した議論／話題／結論の依頼もprivateな観測へ渡します．公開資料，公式ドキュメント，ニュースなどの明示的な公開調査は，このサーバーを参照していない場合に従来のweb調査へ渡します．
+
+回答生成の総時間とpoll回数には上限を設けません．pending応答には，実作業の進捗番号`progress_seq`と`phase`（submitting／collecting／analyzing／rendering）が必要です．進捗番号が増えない状態が`read_idle_timeout_seconds`続いた場合だけ，進捗停止を明示して待機を終了します．poll応答が返ること自体は進捗に数えず，実際の収集やmodel生成が進んでいる間は，合計時間がidle時間を超えても回答を待ち続けます．

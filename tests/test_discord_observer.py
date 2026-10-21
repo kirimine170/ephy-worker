@@ -118,6 +118,18 @@ async def test_unknown_permission_reaching_window_start_keeps_evidence_partial(m
     assert [a.message_count for a in payload.activity] == [1, 1]
 
 
+async def test_unknown_permission_empty_page_after_messages_keeps_evidence_partial(monkeypatch):
+    fixture = DiscordFixture(member_failure=True)
+    payload, _ = await collect(monkeypatch, fixture)
+    channel = payload.coverage.channels[0]
+    assert fixture.pages == 2
+    assert payload.coverage.status == "partial" and channel.status == "partial"
+    assert channel.history_permission == "unknown" and channel.reason == "history_permission_unknown"
+    assert channel.message_count == 1 and len(payload.messages) == 1
+    assert payload.messages[0].content == "今週の計画を相談しました．"
+    assert [a.message_count for a in payload.activity] == [1, 1]
+
+
 async def test_allowlist_failure_precedes_any_network(monkeypatch):
     fixture = DiscordFixture()
     payload, _ = await collect(monkeypatch, fixture,
