@@ -2480,3 +2480,42 @@ def test_spans_v10_fifty_two_line_middle_insertion_keeps_commented_decorated_reg
     assert summary["invalid"] == []
     assert next(iter(summary["reports"].values())) == {"setup": "passed", "call": "passed", "teardown": "passed"}
     assert test.read_text() == candidate
+
+
+@pytest.mark.parametrize("name", ["helper_prepended", "test_prepended"])
+def test_prologue_v11_docstring_prepend_rejected_direct_and_emitted(tmp_path, monkeypatch, name):
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    original = ('# original module header\n"""Original module documentation."""\n\n'
+        'def test_original():\n    assert __doc__ == "Original module documentation."\n')
+    candidate = "def " + name + "():\n    assert True\n\n" + original
+    assert ast.get_docstring(ast.parse(original)) == "Original module documentation."
+    assert ast.get_docstring(ast.parse(candidate)) is None
+    with pytest.raises(ValueError, match="original_test_module_changed"):
+        preserve_original_tests(original, candidate, (), profile)
+    result, _, test = _insertion_v9_run_emitted(tmp_path, original, candidate, profile)
+    assert result.returncode != 0 and "original_test_module_changed" in result.stderr
+    assert "native_added_test_outcomes=" not in result.stdout
+    assert test.read_text() == candidate
+
+
+def test_prologue_v11_after_prologue_insertion_preserves_docstring_and_executes(tmp_path, monkeypatch):
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    original = ('# original module header\n"""Original module documentation."""\n'
+        'from __future__ import annotations\n\n'
+        'def test_original():\n    assert __doc__ == "Original module documentation."\n')
+    inserted = ('def helper_documentation():\n    return __doc__\n\n'
+        'def test_inserted_documentation(tmp_path):\n'
+        '    assert helper_documentation() == __doc__ == "Original module documentation."\n'
+        '    path = tmp_path / "documentation.txt"\n    path.write_text(__doc__)\n'
+        '    assert path.read_text() == "Original module documentation."\n\n')
+    candidate = original.replace("def test_original():", inserted + "def test_original():")
+    assert ast.get_docstring(ast.parse(candidate)) == ast.get_docstring(ast.parse(original))
+    preserve_original_tests(original, candidate, (), profile)
+    result, _, test = _insertion_v9_run_emitted(tmp_path, original, candidate, profile)
+    assert result.returncode == 0, result.stdout + result.stderr
+    summary = json.loads(next(line.split("=", 1)[1] for line in result.stdout.splitlines()
+        if line.startswith("native_added_test_outcomes=")))
+    assert len(summary["collected"]) == 1 and summary["collected"][0].endswith("::test_inserted_documentation")
+    assert summary["invalid"] == []
+    assert next(iter(summary["reports"].values())) == {"setup": "passed", "call": "passed", "teardown": "passed"}
+    assert test.read_text() == candidate

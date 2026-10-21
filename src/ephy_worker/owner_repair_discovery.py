@@ -246,7 +246,7 @@ def preserve_original_tests(original: str, candidate: str, subjects: tuple[str, 
                 cursor += 1
             else:
                 added.append(node)
-        if cursor != len(old_nodes):
+        if cursor != len(old_nodes) or matched and matched[0] != 0:
             raise ValueError("original_test_module_changed")
         def source_regions(tree, lines):
             starts = [min([node.lineno, *(item.lineno for item in getattr(node, "decorator_list", ()))]) - 1
