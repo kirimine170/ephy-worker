@@ -36,6 +36,10 @@ PROTECTED = ("src/ephy_worker/owner_repair", "src/ephy_worker/formal_", "src/eph
     "docs/system-development-governance", "tests/test_owner_repair", "tests/test_formal_", ".")
 
 
+class _ModelJSONError(ValueError):
+    """Only strict parsing of a completed model message is a recoverable response error．"""
+
+
 def allowed_name(name: str, profile) -> bool:
     path = Path(name)
     return (isinstance(name, str) and "\\" not in name and not path.is_absolute()
@@ -220,8 +224,18 @@ def authority_fingerprint(source: str) -> dict:
     return {"protected": protected, "signatures": signatures}
 
 
-def preserve_original_tests(original: str, candidate: str, subjects: tuple[str, ...] = ()) -> None:
-    """Exact prefix plus a closed appended-test DSL, not a Python sandbox．"""
+def preserve_original_tests(original: str, candidate: str, subjects: tuple[str, ...] = (), native_profile=None) -> None:
+    """Preserve collection/prefix; ordinary bodies require the frozen native profile．"""
+    native = native_profile is not None
+    if native and (not isinstance(native_profile, dict) or set(native_profile) != {
+            "execution_profile", "descriptor_sha256", "capability_sha256"}
+            or native_profile["execution_profile"] != "native_windows_code_v1"
+            or any(not isinstance(native_profile[key], str) or len(native_profile[key]) != 64
+                or any(c not in "0123456789abcdef" for c in native_profile[key])
+                for key in ("descriptor_sha256", "capability_sha256"))):
+        raise ValueError("native_test_profile_unbound")
+    if native and not candidate.startswith(original):
+        raise ValueError("original_test_module_changed")
     before, after = ast.parse(original), ast.parse(candidate)
     old_nodes = [ast.dump(node, include_attributes=False) for node in before.body]
     prefix = [ast.dump(node, include_attributes=False) for node in after.body[:len(before.body)]]
@@ -245,31 +259,63 @@ def preserve_original_tests(original: str, candidate: str, subjects: tuple[str, 
     old_test_names = {node.name for node in ast.walk(before)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_")}
     original_bindings = set(bindings)
+    nonexecution = {"skip", "skipif", "xfail", "importorskip", "SkipTest", "skipTest", "skipIf", "skipUnless", "expectedFailure", "Skipped", "XFailed"}
+    nonexecution_modules = {"pytest", "unittest", "unittest.case", "_pytest.outcomes"}
+    imported_nonexecution = {alias.asname or alias.name for item in before.body
+        if isinstance(item, ast.ImportFrom) and not item.level and item.module in nonexecution_modules
+        for alias in item.names if alias.name in nonexecution}
+    inert_annotations = {"str", "int", "float", "bool", "bytes"} - original_bindings
+    async_markers = set()
+    if native:
+        for node in before.body:
+            if isinstance(node, ast.ImportFrom) and node.module == "pathlib" and not node.level:
+                inert_annotations.update(alias.asname or alias.name for alias in node.names if alias.name == "Path")
+            if isinstance(node, ast.Import):
+                async_markers.update((alias.asname or "pytest") + ".mark.asyncio" for alias in node.names if alias.name == "pytest")
+    def inert_annotation(node):
+        return (node is None or isinstance(node, ast.Constant) and (node.value is None
+            or isinstance(node.value, str) and node.value in inert_annotations | {"None"})
+            or isinstance(node, ast.Name) and node.id in inert_annotations)
+    def marker(node):
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return marker(node.value) + "." + node.attr
+        return ""
     for node in after.body[len(before.body):]:
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             raise ValueError("only_new_test_or_helper_functions_may_append")  # noqa: TRY004 — invalid source AST value．
         if node.name in bindings:
             raise ValueError("existing_test_binding_overridden")
         bindings.add(node.name)
-        if node.decorator_list:
+        if node.decorator_list and not (native and isinstance(node, ast.AsyncFunctionDef)
+                and len(node.decorator_list) == 1 and marker(node.decorator_list[0]) in async_markers):
             raise ValueError("new_test_collection_decorator")
         if node.args.defaults or any(value is not None for value in node.args.kw_defaults):
             raise ValueError("new_test_collection_default")
         arguments = [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
         arguments += [argument for argument in (node.args.vararg, node.args.kwarg) if argument is not None]
-        if node.returns is not None or any(argument.annotation is not None for argument in arguments):
+        annotations = [node.returns, *(argument.annotation for argument in arguments)]
+        if (any(not inert_annotation(value) for value in annotations) if native else any(value is not None for value in annotations)):
             raise ValueError("new_test_collection_annotation")
         if node.type_params:
             raise ValueError("new_test_collection_type_parameter")
         if any(isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name in old_test_names
                 for child in ast.walk(node)):
             raise ValueError("existing_test_name_duplicated")
-        if any(isinstance(child, ast.Attribute) and child.attr in {"skip", "skipif", "xfail"}
+        if any(isinstance(child, ast.Attribute) and child.attr in nonexecution
+                or isinstance(child, ast.ImportFrom) and not child.level and child.module in nonexecution_modules
+                    and any(alias.name in nonexecution for alias in child.names)
+                or isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load) and child.id in imported_nonexecution
                 for child in ast.walk(node)):
             raise ValueError("new_test_skip_or_xfail")
     added = after.body[len(before.body):]
     if len(added) > 64 or sum(1 for node in added for _ in ast.walk(node)) > 4096:
         raise ValueError("new_test_body_budget")
+    if native:
+        if any(not node.name.startswith(("test_", "helper_")) or node.name.startswith("test_pytest_") for node in added):
+            raise ValueError("new_test_body_function_name")
+        return  # Function bodies run only in the operator-selected native verifier, not during collection．
     functions = {node.name: node for node in added}
     pure = {"abs", "all", "any", "bool", "bytes", "dict", "enumerate", "float", "frozenset", "int",
         "isinstance", "len", "list", "max", "min", "range", "reversed", "set", "sorted", "str", "sum", "tuple", "zip"}
@@ -525,6 +571,22 @@ def registered_test_subjects(original: str, sources: dict[str, str | None]) -> t
     return tuple(sorted(name for name in approved if counts.get(name.split(".")[0]) == 1))
 
 
+def _native_test_profile(template):
+    contract = template["contract"]
+    if contract.get("execution_profile") != "native_windows_code_v1":
+        return None
+    from .verifier_sandbox import validate_descriptor
+    descriptor = contract["verifier_sandbox"]
+    validate_descriptor(descriptor)
+    pins = contract.get("runtime_hashes", {})
+    if (any(pins.get(descriptor[key]["path"]) != descriptor[key]["sha256"]
+            for key in ("codex", "python", "acl_helper", "capability"))
+            or Path(template["runtime"]["python"]).resolve() != Path(descriptor["python"]["path"]).resolve()):
+        raise GateFailure("native_test_profile_not_pinned")
+    return {"execution_profile": "native_windows_code_v1", "descriptor_sha256": digest(encode(descriptor)),
+        "capability_sha256": descriptor["capability"]["sha256"]}
+
+
 class LocalDiscovery:
     def __init__(self, config):
         self.config = config
@@ -546,6 +608,10 @@ class LocalDiscovery:
 
     def completion(self, prompt: str, runtime: dict) -> dict:
         from .existing_llama_runtime import verify_identity
+        response_format = {"type": "json_object"}
+        if "discovery_response_schema" in runtime:
+            response_format = {"type": "json_schema", "json_schema": {"name": "discovery_scope",
+                "strict": True, "schema": runtime["discovery_response_schema"]}}
         identity = read_json(Path(runtime["models_ini"]))
         verify_identity(identity)
         messages = [{"role": "system", "content":
@@ -564,11 +630,14 @@ class LocalDiscovery:
             tokens = tokenized.json().get("tokens")
             if not isinstance(tokens, list) or any(type(token) is not int or token < 0 for token in tokens):
                 raise GateFailure("contract_incomplete:discovery_token_measurement_invalid")
-            if len(tokens) + 4096 > identity["context"]:
+            # Keep a small allowance for server-side template/BOS overhead, not a response cap.
+            template_margin = 64
+            output_tokens = identity["context"] - len(tokens) - template_margin
+            if output_tokens < 4096:
                 raise GateFailure("contract_incomplete:discovery_context_budget_exceeded")
             response = client.post(runtime["base_url"] + "/v1/chat/completions", json={
                 "model": identity["model_id"], "stream": False, "temperature": 0,
-                "max_tokens": 4096, "messages": messages, "response_format": {"type": "json_object"}})
+                "max_tokens": output_tokens, "messages": messages, "response_format": response_format})
         response.raise_for_status()
         if self.response_path is not None and len(response.content) <= 2097152:
             self.response_path.write_bytes(response.content)
@@ -578,11 +647,24 @@ class LocalDiscovery:
         choice = response.json()["choices"][0]
         if choice.get("finish_reason") != "stop":
             raise GateFailure("contract_incomplete:discovery_generation_incomplete")
-        return strict_object(choice["message"]["content"])
+        try:
+            return strict_object(choice["message"]["content"])
+        except ValueError as exc:
+            raise _ModelJSONError(str(exc)) from exc
 
     def select_scope(self, job: dict, templates: dict, inventories: dict, directory: Path) -> dict:
         """Read bounded real code before selecting scope, with explicit read-more rounds．"""
-        runtime = next(iter(templates.values()))["runtime"]
+        output_schema = {"oneOf": [
+            {"type": "object", "required": ["repository", "allowed_files", "semantic_scope"],
+                "additionalProperties": False, "properties": {
+                    "repository": {"type": "string", "enum": list(inventories)},
+                    "allowed_files": {"type": "array", "minItems": 1, "maxItems": 12, "items": {"type": "string"}},
+                    "semantic_scope": {"type": "string", "minLength": 1}}},
+            {"type": "object", "required": ["read_more"], "additionalProperties": False, "properties": {
+                "read_more": {"type": "object", "minProperties": 1, "additionalProperties": False,
+                    "properties": {alias: {"type": "array", "minItems": 1, "maxItems": 4,
+                        "items": {"type": "string", "enum": names}} for alias, names in inventories.items() if names}}}}]}
+        runtime = {**next(iter(templates.values()))["runtime"], "discovery_response_schema": output_schema}
         query = job["text"].casefold()
         terms = set(re.findall(r"[a-z_][a-z0-9_-]{2,}", query))
         for word, extra in (("検索", "search web tool"), ("reasoning", "reasoning prompt llm harness"),
@@ -649,10 +731,26 @@ class LocalDiscovery:
 
         cursor = 0
         feedback = None
-        for attempt in range(1, 4):
+        previous_output = None
+        automatic_context_full = False
+        # Provisional recovery budget; actual successful/exhausted rounds are retained privately．
+        round_limit = 30
+        corrections = {
+            "discovery_scope_empty_or_invalid": "Return exactly repository, allowed_files and semantic_scope, or read_more alone. Do not mix these shapes.",
+            "discovery_scope_protected_or_missing_tests": "Select only permitted paths and include an existing tests/ file from existing_test_files; supply a nonempty semantic_scope.",
+            "discovery_scope_confirmation_required": "The selected code is now in code_context. Inspect it and confirm the complete selection with its existing tests file.",
+            "discovery_read_more_requested": "The requested excerpts are now in code_context. Inspect them and return a complete selection or request different needed files.",
+            "discovery_read_more_already_available": "Those requested excerpts are already present. Inspect code_context and select scope, or request different needed files.",
+            "discovery_context_request_too_large": "That entire batch was rejected without changing accepted context. Request fewer files; do not repeat the oversized batch.",
+            "discovery_read_more_invalid": "Return only read_more mapping registered aliases to at most four distinct existing inventory paths in total.",
+            "discovery_read_more_protected_or_unknown": "Choose only exact permitted existing paths in repositories; do not invent names or request protected files."}
+        existing_tests = {alias: [name for _, row_alias, name, _ in ranked if row_alias == alias and name.startswith("tests/")]
+            for alias in inventories}
+        for attempt in range(1, round_limit + 1):
             # Expand retrieval automatically after an empty/invalid answer, without inventing scope．
             added = 0
-            automatic_count = 0 if feedback in {"discovery_read_more_requested", "discovery_scope_confirmation_required",
+            automatic_count = 0 if automatic_context_full or feedback in {"discovery_read_more_requested",
+                "discovery_read_more_already_available", "discovery_scope_confirmation_required",
                 "discovery_context_request_too_large"} else (6 if attempt == 1 else 4)
             while cursor < len(ranked) and added < automatic_count:
                 match = ranked[cursor]
@@ -662,11 +760,17 @@ class LocalDiscovery:
                     continue
                 try:
                     include_excerpts([match], limit=12000 if attempt == 1 else 24000, maximum=1500, automatic=True)
-                except GateFailure:
+                except GateFailure as exc:
+                    if str(exc) != "discovery_context_request_too_large":
+                        raise
+                    automatic_context_full = True
                     break
                 added += 1
             prompt = {"request": job["text"], "previous_answer": job.get("previous"),
                 "repositories": inventories, "code_context": context, "previous_selection_error": feedback,
+                "previous_model_output": previous_output, "existing_test_files": existing_tests,
+                "correction": corrections.get(feedback, "Return a valid strict JSON object matching one exact output shape, without fences or commentary."),
+                "round": attempt, "provisional_round_limit": round_limit,
                 "response_schema": {"repository": "registered alias", "allowed_files": ["up to12 exact source/test/doc paths"],
                     "semantic_scope": "short public-safe repair and acceptance summary"},
                 "read_more_schema": {"read_more": {"registered alias": ["up to4 existing paths to inspect"]}},
@@ -677,15 +781,19 @@ class LocalDiscovery:
                     "If more code is needed, return only read_more instead of an empty object. Do not change governance, secrets, "
                     "repair controller, Discord authorization, release settings or unrelated code. Protected paths stay forbidden. "
                     "semantic_scope is a public-safe implementation summary, not a quotation of the private request/context."}
+            initial = None
             try:
                 initial = self.ask(json.dumps(prompt, ensure_ascii=False), runtime, directory, "scope-attempt-" + str(attempt))
+                if not isinstance(initial, dict):
+                    raise GateFailure("discovery_scope_empty_or_invalid")
                 if set(initial) == {"read_more"}:
                     requested = initial["read_more"]
                     if not isinstance(requested, dict) or not requested or sum(len(names) for names in requested.values() if isinstance(names, list)) > 4:
                         raise GateFailure("discovery_read_more_invalid")
                     matches = []
                     for alias, names in requested.items():
-                        if alias not in inventories or not isinstance(names, list) or not names:
+                        if (not isinstance(alias, str) or alias not in inventories or not isinstance(names, list)
+                                or not names or any(not isinstance(name, str) for name in names)):
                             raise GateFailure("discovery_read_more_invalid")
                         for name in names:
                             match = next((row for row in ranked if row[1] == alias and row[2] == name), None)
@@ -694,10 +802,12 @@ class LocalDiscovery:
                             matches.append(match)
                     if len({(row[1], row[2]) for row in matches}) != len(matches):
                         raise GateFailure("discovery_read_more_invalid")
+                    if all((row[1], row[2]) in requested_context for row in matches):
+                        raise GateFailure("discovery_read_more_already_available")
                     include_excerpts(matches)
                     raise GateFailure("discovery_read_more_requested")
                 if (set(initial) != {"repository", "allowed_files", "semantic_scope"}
-                        or initial["repository"] not in self.config.repositories):
+                        or not isinstance(initial["repository"], str) or initial["repository"] not in self.config.repositories):
                     raise GateFailure("discovery_scope_empty_or_invalid")
                 profile = self.config.repositories[initial["repository"]]
                 names = initial["allowed_files"]
@@ -717,12 +827,24 @@ class LocalDiscovery:
                 if unseen:
                     include_excerpts(unseen)
                     raise GateFailure("discovery_scope_confirmation_required")
+                write_json(directory / ("scope-attempt-" + str(attempt) + ".validation.json"),
+                    {"outcome": "selected", "round": attempt, "provisional_round_limit": round_limit})
                 return initial
-            except (GateFailure, TypeError, ValueError) as exc:
-                if isinstance(exc, GateFailure) and not str(exc).startswith("discovery_"):
+            except (GateFailure, _ModelJSONError) as exc:
+                if isinstance(exc, GateFailure) and str(exc) not in corrections:
                     raise
-                feedback = str(exc)
-                write_json(directory / ("scope-attempt-" + str(attempt) + ".validation.json"), {"error": feedback})
+                feedback = str(exc)[:8192]
+                raw_path = directory / ("scope-attempt-" + str(attempt) + ".raw.json")
+                text = json.dumps(initial, ensure_ascii=False) if initial is not None else (
+                    raw_path.read_text(encoding="utf-8") if raw_path.is_file() else "No model content available; see the private error record.")
+                encoded = text.encode("utf-8")
+                previous_output = {"text": encoded[:8192].decode("utf-8", errors="ignore"),
+                    "representation": "parsed_json" if initial is not None else "raw_http_response",
+                    "utf8_bytes": len(encoded), "truncated": len(encoded) > 8192}
+                write_json(directory / ("scope-attempt-" + str(attempt) + ".validation.json"),
+                    {"error": feedback, "round": attempt, "provisional_round_limit": round_limit,
+                        "previous_model_output": previous_output, "correction": corrections.get(feedback,
+                            "Return a valid strict JSON object matching one exact output shape, without fences or commentary.")})
         raise GateFailure("discovery_scope_exhausted")
 
     def prepare(self, job: dict, directory: Path) -> dict:
@@ -772,63 +894,9 @@ class LocalDiscovery:
             raise GateFailure("contract_incomplete:discovery_context_too_large")
         subjects = {name: registered_test_subjects(text, sources) for name, text in sources.items()
             if name.startswith("tests/") and text is not None}
-        prepared = self.ask(json.dumps({"request": job["text"], "scope": initial, "source": sources,
-            "approved_subject_calls_by_test_file": subjects,
-            "response_schema": {"checker_python": "standalone Python checker; argv[1] candidate root; nonzero on wrong behavior",
-                "known_good": {"scoped/path": [{"old": "exact unique original substring", "new": "replacement"},
-                    {"append": "small additional test including its leading newline"}]},
-                "wrong_answer": {"scoped/path": [{"old": "exact unique original substring", "new": "intentionally faulty replacement"}]}},
-            "instruction": "Create behavior acceptance checker independent of proposed implementation. Checks must reject "
-                "unchanged baseline and wrong behavior, and pass a genuinely repaired known-good control. "
-                "Controls are temporary verifier specimens, not the formal implementation. Preserve every existing test "
-                "Acceptance checker must return normally or raise AssertionError; do not launch child processes, "
-                "nested pytest, native loading or SystemExit. Pytest runs as a separate trusted registered check. "
-                "module's original AST prefix exactly, including imports, decorators, fixtures and assertions. Only "
-                "append new uniquely named test/helper functions without decorators, defaults, parameter/return "
-                "annotations or type parameters. No imports anywhere in appended functions. Their closed body DSL "
-                "allows literal/local-name assignments, assert, return, if, bounded arithmetic/containers, one bounded "
-                "literal/range comprehension, pure builtins and bounded nonmutating data methods. Use test_ or helper_ "
-                "names; helpers may call only acyclic pure helpers and the exact approved subject calls listed above. "
-                "No dynamic/callback/parameter calls, exceptions, loops, nested definitions, async calls/await, hooks, "
-                "global mutation or filesystem/network/process/pytest capabilities. Test fixture parameters are allowed "
-                "only for original zero-argument @pytest.fixture functions returning an inert literal. "
-                "known_good MUST change an existing selected tests file by appending a non-weakening "
-                "regression test in addition to the repair control. No checker success markers, environment detection or simulated PASS. "
-                "Return only these three keys. Use compact edit operations, never repeat complete existing files or tests. "
-                "Edits are expanded by the trusted controller against the supplied original files; each old string must "
-                "occur exactly once at that step. Each control is based on the original source independently. "
-                "Checker may use standard libraries and offline installed project dependencies."},
-            ensure_ascii=False), template["runtime"], directory, "controls")
-        if set(prepared) != {"checker_python", "known_good", "wrong_answer"}:
-            raise GateFailure("contract_incomplete:checker")
-        code = prepared["checker_python"]
-        if not isinstance(code, str) or not 1 <= len(code) <= 65536:
-            raise GateFailure("contract_incomplete:checker_source")
-        compile(code, "<frozen-acceptance-checker>", "exec")
-        for key in ("known_good", "wrong_answer"):
-            prepared[key] = expand_control_edits(prepared[key], sources)
-        if prepared["known_good"] == prepared["wrong_answer"]:
-            raise GateFailure("contract_incomplete:identical_controls")
-        directory.mkdir(parents=True, exist_ok=True)
-        write_json(directory / "discovery.json", {"scope": initial, "base": base, "source_sha256":
-            {name: (original_snapshot.get(name) or {}).get("sha256") for name in sources},
-            "prepared": prepared})
-        acceptance = directory / "acceptance.py"
-        acceptance.write_text(code, encoding="utf-8", newline="")
-        checker = directory / "checker.py"
-        # The trusted wrapper independently enforces exact scope and preservation of
-        # all original test functions/assertions before executing the model checker．
-        guard = {"allowed": names, "snapshot": original_snapshot,
-            "authority": {name: authority_fingerprint(text) for name, text in sources.items()
-                if name == "src/ephy_worker/discord_runtime.py" and text is not None},
-            "tests": {name: text for name, text in sources.items() if name.startswith("tests/") and text is not None},
-            "subjects": subjects}
-        (directory / "checker-guard.json").write_text(json.dumps(guard, ensure_ascii=False), encoding="utf-8")
-        checker.write_text("import ast\n" + inspect.getsource(authority_fingerprint) + "\n"
-            + inspect.getsource(preserve_original_tests) + "\n" + _CHECKER, encoding="utf-8", newline="")
-        controls = self.measure_controls(profile, directory, prepared, checker, template)
-        controls_path = directory / "checker-controls.json"
-        write_json(controls_path, controls)
+        artifacts = self.prepare_controls(job, directory, profile, template, initial, base, original_snapshot, sources, subjects)
+        controls_directory = artifacts["directory"]
+        acceptance, checker, controls_path = artifacts["acceptance"], artifacts["checker"], artifacts["controls_path"]
         contract = {**template["contract"], "allowed_files": names, "semantic_scope": initial["semantic_scope"],
             "task": job["text"], "checker": str(checker), "checker_sha256": file_hash(checker),
             "checker_controls": str(controls_path), "checker_controls_sha256": file_hash(controls_path)}
@@ -843,9 +911,9 @@ class LocalDiscovery:
         controls_map = {name: file_hash(Path(runtime["governance_root"]) / relative)
             for name, relative in CONTROL_PATHS.items()}
         pins.update(injected_context_pins(runtime, controls_map))
-        for path in (acceptance, directory / "checker-guard.json"):
+        for path in (acceptance, controls_directory / "checker-guard.json"):
             pins[str(path)] = file_hash(path)
-        pins[str(directory / "discovery.json")] = file_hash(directory / "discovery.json")
+        pins[str(controls_directory / "discovery.json")] = file_hash(controls_directory / "discovery.json")
         contract["runtime_hashes"] = pins
         identities = {role: {"model_id": runtime["model_roles"][role],
             "model_artifact_manifest_sha256": digest(encode(runtime["model_manifests"][runtime["model_roles"][role]])),
@@ -865,6 +933,165 @@ class LocalDiscovery:
         if {key: value for key, value in spec.items() if key != "verifier_identity"} != draft:
             raise GateFailure("frozen_submission_draft_changed")
         return {"repository": alias, "spec": spec}
+
+    def prepare_controls(self, job, directory, profile, template, initial, base, original_snapshot, sources, subjects):
+        """Recover model proposals using actual control diagnostics; environment failures stop．"""
+        feedback = None
+        latest_measurement = None
+        previous_checker_sha256 = None
+        consecutive_checker_failures = 0
+        names = initial["allowed_files"]
+        native_profile = _native_test_profile(template)
+        test_instructions = ("Native profile allows ordinary sync/async test/helper bodies, existing fixture parameters such as tmp_path, "
+            "local imports, class/method and filesystem calls inside bodies. Use test_ or helper_ names. Path/None and basic inert annotations are allowed. "
+            "Only bare existing pytest.mark.asyncio is allowed as an async test marker. No new top-level imports/statements, "
+            "pytest fixtures/hooks/plugins, arbitrary decorators, defaults or executable annotations. Preserve the original raw/AST prefix. "
+            "Write a meaningful feature regression using real classes/fixtures even when approved_subject_calls is empty. "
+            "The trusted checker executes only appended test_ targets with pytest after semantic acceptance; every collected "
+            "case must pass setup, call and teardown without skip/xfail/deselection. "
+            if native_profile else "append new uniquely named test/helper functions without decorators, defaults, parameter/return "
+                "annotations or type parameters. No imports anywhere in appended functions. Their closed body DSL "
+                "allows literal/local-name assignments, assert, return, if, bounded arithmetic/containers, one bounded "
+                "literal/range comprehension, pure builtins and bounded nonmutating data methods. Use test_ or helper_ "
+                "names; helpers may call only acyclic pure helpers and the exact approved subject calls listed above. "
+                "No dynamic/callback/parameter calls, exceptions, loops, nested definitions, async calls/await, hooks, "
+                "global mutation or filesystem/network/process/pytest capabilities. Test fixture parameters are allowed "
+                "only for original zero-argument @pytest.fixture functions returning an inert literal. ")
+        checker_instructions = ("argv[1] is the read-only candidate source/import root, not a writable data root. "
+            "The checker directory is also read-only. Put ALL protocol/test writable data in tempfile.TemporaryDirectory() "
+            "under the existing TEMP/TMP/TMPDIR environment, never candidate/.mdsys or the checker directory. "
+            "Import and invoke actual selected candidate APIs and assert measured behavior; asserting only self-created JSON "
+            "or your own fixture does not test the candidate. known_good must repair actual selected implementation behavior "
+            "and append a meaningful regression, not only modify tests. Use the same standalone assertions to distinguish "
+            "repaired, unchanged and wrong behavior. Do not skip, xfail, importorskip or raise unittest.SkipTest. ")
+        guard = {"allowed": names, "snapshot": original_snapshot, "native_test_profile": native_profile,
+            "authority": {name: authority_fingerprint(text) for name, text in sources.items()
+                if name == "src/ephy_worker/discord_runtime.py" and text is not None},
+            "tests": {name: text for name, text in sources.items() if name.startswith("tests/") and text is not None},
+            "subjects": subjects}
+        recoverable = {"contract_incomplete:" + name for name in (
+            "checker", "checker_source", "control_scope", "control_edit", "ambiguous_control_edit", "control_size",
+            "identical_controls", "test_control_requires_test_scope", "checker_control_known_good",
+            "checker_control_unchanged", "checker_control_wrong_answer", "checker_control_test_weakening",
+            "checker_control_scope_escape")}
+        for attempt in range(1, 31):
+            if snapshot(profile.source) != original_snapshot:
+                raise GateFailure("discovery_source_changed")
+            attempt_directory = directory / "control-attempts" / ("attempt-" + str(attempt).zfill(2))
+            attempt_directory.mkdir(parents=True)
+            phase = "response"
+            prepared = None
+            try:
+                prepared = self.ask(json.dumps({"request": job["text"], "scope": initial, "source": sources,
+                    "approved_subject_calls_by_test_file": subjects,
+                    "previous_attempt": feedback, "attempt": attempt, "provisional_attempt_limit": 30,
+                    "response_schema": {"checker_python": "standalone Python checker; argv[1] candidate root; nonzero on wrong behavior",
+                        "known_good": {"scoped/path": [{"old": "exact unique original substring", "new": "replacement"},
+                            {"append": "small additional test including its leading newline"}]},
+                        "wrong_answer": {"scoped/path": [{"old": "exact unique original substring", "new": "intentionally faulty replacement"}]}},
+                    "instruction": "Create behavior acceptance checker independent of proposed implementation. Checks must reject "
+                        "unchanged baseline and wrong behavior, and pass a genuinely repaired known-good control. "
+                        "Controls are temporary verifier specimens, not the formal implementation. "
+                        "The acceptance checker is a standalone script: execute assertions at top level or explicitly call main(). "
+                        "Do not only define pytest test functions: they are never collected here. Do not use pytest fixture arguments "
+                        "such as tmp_path in the checker. "
+                        + checker_instructions + "Acceptance checker must return normally or raise AssertionError; do not launch child processes, "
+                        "nested pytest, native loading or SystemExit. Pytest runs as a separate trusted registered check. "
+                        "Preserve every existing test module's original AST prefix exactly, including imports, decorators, fixtures and assertions. Only "
+                        + test_instructions +
+                        "known_good MUST change an existing selected tests file by appending a non-weakening "
+                        "regression test in addition to the repair control. No checker success markers, environment detection or simulated PASS. "
+                        "Return only these three keys. Use compact edit operations, never repeat complete existing files or tests. "
+                        "Edits are expanded by the trusted controller against the supplied original files; each old string must "
+                        "occur exactly once at that step. Each control is based on the original source independently. "
+                        "Checker may use standard libraries and offline installed project dependencies."},
+                    ensure_ascii=False), template["runtime"], attempt_directory, "controls")
+                phase = "proposal"
+                if set(prepared) != {"checker_python", "known_good", "wrong_answer"}:
+                    raise GateFailure("contract_incomplete:checker")
+                code = prepared["checker_python"]
+                if not isinstance(code, str) or not 1 <= len(code) <= 65536:
+                    raise GateFailure("contract_incomplete:checker_source")
+                compile(code, "<frozen-acceptance-checker>", "exec")
+                for key in ("known_good", "wrong_answer"):
+                    prepared[key] = expand_control_edits(prepared[key], sources)
+                if prepared["known_good"] == prepared["wrong_answer"]:
+                    raise GateFailure("contract_incomplete:identical_controls")
+                phase = "artifacts"
+                write_json(attempt_directory / "discovery.json", {"scope": initial, "base": base, "source_sha256":
+                    {name: (original_snapshot.get(name) or {}).get("sha256") for name in sources},
+                    "prepared": prepared})
+                acceptance = attempt_directory / "acceptance.py"
+                acceptance.write_text(code, encoding="utf-8", newline="")
+                checker = attempt_directory / "checker.py"
+                # The trusted wrapper independently enforces exact scope and preservation of
+                # all original test functions/assertions before executing the model checker．
+                (attempt_directory / "checker-guard.json").write_text(json.dumps(guard, ensure_ascii=False), encoding="utf-8")
+                checker.write_text("import ast\n" + inspect.getsource(authority_fingerprint) + "\n"
+                    + inspect.getsource(preserve_original_tests) + "\n" + _CHECKER, encoding="utf-8", newline="")
+                phase = "measure"
+                controls = self.measure_controls(profile, attempt_directory, prepared, checker, template)
+                controls_path = attempt_directory / "checker-controls.json"
+                write_json(controls_path, controls)
+                return {"directory": attempt_directory, "prepared": prepared, "acceptance": acceptance,
+                    "checker": checker, "controls_path": controls_path}
+            except (GateFailure, ValueError, SyntaxError, TypeError) as exc:
+                retryable = (str(exc) in recoverable if isinstance(exc, GateFailure) else
+                    phase == "response" and isinstance(exc, _ModelJSONError) or
+                    phase == "proposal" and isinstance(exc, (ValueError, SyntaxError, TypeError)))
+                write_json(attempt_directory / "attempt-error.json", {"error": str(exc)[:4096],
+                    "type": type(exc).__name__, "phase": phase, "retryable": retryable})
+                if not retryable:
+                    raise
+                proposal_path = attempt_directory / "controls.response.json"
+                if not proposal_path.is_file():
+                    proposal_path = attempt_directory / "controls.raw.json"
+                previous = proposal_path.read_bytes() if proposal_path.is_file() else b"No model response available."
+                diagnostics = []
+                for name in ("known_good", "unchanged", "wrong_answer", "test_weakening", "scope_escape"):
+                    path = attempt_directory / ("control-" + name + ".json")
+                    if path.is_file():
+                        result = read_json(path)
+                        stderr = str(result.get("stderr", "")).encode("utf-8")
+                        stdout = str(result.get("stdout", "")).encode("utf-8")
+                        diagnostics.append({"name": name, "exit_code": result["exit_code"],
+                            "expected": 0 if name == "known_good" else 1,
+                            "stderr_tail": stderr[-1024:].decode("utf-8", errors="ignore"),
+                            "stdout_prefix": stdout[:256].decode("utf-8", errors="ignore"),
+                            "stderr_truncated": len(stderr) > 1024, "stdout_truncated": len(stdout) > 256})
+                failed_code = prepared.get("checker_python") if isinstance(prepared, dict) else None
+                checker_sha256 = (digest(failed_code.encode("utf-8"))
+                    if isinstance(failed_code, str) and 1 <= len(failed_code) <= 65536 else None)
+                consecutive_checker_failures = (consecutive_checker_failures + 1
+                    if checker_sha256 is not None and checker_sha256 == previous_checker_sha256
+                    else int(checker_sha256 is not None))
+                previous_checker_sha256 = checker_sha256
+                if len(diagnostics) == 5:
+                    latest_measurement = {"origin_attempt": attempt, "checker_sha256": checker_sha256,
+                        "use": "Previous measurement guidance only; never current-attempt success evidence.",
+                        "actual_control_diagnostics": diagnostics}
+                fresh_strategy = consecutive_checker_failures >= 5
+                feedback = {"error": str(exc)[:4096], "previous_proposal": {
+                    "text": "" if fresh_strategy else previous[:8192].decode("utf-8", errors="ignore"),
+                    "utf8_bytes": len(previous), "sha256": digest(previous),
+                    "artifact": proposal_path.relative_to(directory).as_posix() if proposal_path.is_file() else None,
+                    "text_omitted_for_replan": fresh_strategy, "truncated": not fresh_strategy and len(previous) > 8192},
+                    "actual_control_diagnostics": diagnostics,
+                    "previous_measured_control_guidance": latest_measurement,
+                    "checker_repetition": {"checker_sha256": checker_sha256,
+                        "consecutive_failed_proposals": consecutive_checker_failures,
+                        "provisional_replan_trigger": 5, "fresh_strategy_required": fresh_strategy},
+                    "correction": ("Fresh strategy required after five consecutive failures with byte-identical checker text. "
+                        "The prior proposal text is omitted from this prompt, but its complete private artifact and hash are retained. "
+                        "Use the retained measured outcomes to identify missing discrimination and rebuild assertions using real "
+                        "candidate APIs rather than copying the prior self-created fixture. Keep working within the existing budget. "
+                        if fresh_strategy else "")
+                        + "Correct the actual proposal/verification errors without changing the request or weakening guards. "
+                        + test_instructions + checker_instructions + "The standalone checker must actually execute "
+                        "assertions and reject unchanged/wrong behavior; defining a pytest fixture test alone does nothing. "
+                        "Return all three keys with compact edits based independently on the original source."}
+                write_json(attempt_directory / "retry-feedback.json", feedback)
+        raise GateFailure("discovery_controls_exhausted")
 
     def _git(self, root: Path, *args: str) -> bytes:
         result = subprocess.run([self.config.git, "-C", str(root), *args], capture_output=True,
@@ -900,7 +1127,7 @@ class LocalDiscovery:
                 if not tests:
                     raise GateFailure("contract_incomplete:test_control_requires_test_scope")
                 (root / tests[0]).write_text("# original tests removed\n", encoding="utf-8", newline="")
-            temporary = self.config.state_dir / "verifier-temp" / directory.name / name
+            temporary = self.config.state_dir / "verifier-temp" / digest(encode(str(directory.resolve())))[:24] / name
             temporary.mkdir(parents=True)
             environment = command_environment(root, temporary)
             environment["PYTHONPATH"] = str(root / "src") if profile.github_repository.endswith("/ephy-worker") else str(root)
@@ -923,11 +1150,13 @@ class LocalDiscovery:
             result["specimen_snapshot"] = specimen
             expected = 0 if name == "known_good" else 1
             write_json(directory / ("control-" + name + ".json"), result)
-            if (actual == 0) != (expected == 0):
-                raise GateFailure("contract_incomplete:checker_control_" + name)
             results.append({"name": name, "actual": 0 if actual == 0 else 1, "expected": expected,
                 "exit_code": actual, "specimen_snapshot_sha256": digest(encode(specimen)),
                 "evidence_sha256": file_hash(directory / ("control-" + name + ".json"))})
+        mismatches = [result["name"] for result in results if result["actual"] != result["expected"]]
+        if mismatches:
+            write_json(directory / "checker-controls.json", results)
+            raise GateFailure("contract_incomplete:checker_control_" + mismatches[0])
         return results
 
 
@@ -947,9 +1176,58 @@ for name in guard['allowed']:
     assert not (collection or lowered.endswith('.py')) or guard['snapshot'].get(name) is not None, 'new_collection_module_not_allowed'
 for name, original in guard['authority'].items():
     assert authority_fingerprint((root/name).read_text(encoding='utf-8')) == original, 'protected_discord_authority_changed'
+native_targets={}
 for name, original in guard['tests'].items():
-    preserve_original_tests(original,(root/name).read_text(encoding='utf-8'),tuple(guard.get('subjects',{}).get(name,())))
+    candidate_text=(root/name).read_text(encoding='utf-8')
+    preserve_original_tests(original,candidate_text,tuple(guard.get('subjects',{}).get(name,())),guard.get('native_test_profile'))
+    if guard.get('native_test_profile') is not None:
+        added=ast.parse(candidate_text).body[len(ast.parse(original).body):]
+        for node in added:
+            if isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef)) and node.name.startswith('test_'):
+                native_targets[(str((root/name).resolve()),node.name)]=str(root/name)+'::'+node.name
+if native_targets:
+    sys.dont_write_bytecode=True
+    import os, tempfile, pytest
+    pytest_main=pytest.main
+    temporary_directory=tempfile.TemporaryDirectory
+    temporary_root=Path(os.environ['TEMP']).resolve(strict=True)
+    assert temporary_root.is_dir() and not temporary_root.is_relative_to(root) and not temporary_root.is_relative_to(base), 'native_test_temp_invalid'
+    class NativeOutcomes:
+        def __init__(self):
+            self.collected=[]
+            self.seen_targets=set()
+            self.reports={}
+            self.invalid=[]
+        def pytest_collection_finish(self,session):
+            for item in session.items:
+                target=(str(item.path.resolve()),getattr(item,'originalname',item.name.split('[')[0]))
+                if target not in native_targets:
+                    self.invalid.append('unexpected_target')
+                self.seen_targets.add(target)
+                self.collected.append(item.nodeid)
+        def pytest_deselected(self,items):
+            if items:
+                self.invalid.append('deselected')
+        def pytest_collectreport(self,report):
+            if report.failed or report.skipped:
+                self.invalid.append('collection_not_passed')
+        def pytest_runtest_logreport(self,report):
+            phases=self.reports.setdefault(report.nodeid,{})
+            if report.when in phases or report.outcome!='passed' or hasattr(report,'wasxfail'):
+                self.invalid.append('case_not_passed')
+            phases[report.when]=report.outcome
+    native_outcomes=NativeOutcomes()
 sys.path.insert(0,str(root))
 sys.path.insert(0,str(root/'src'))
 runpy.run_path(str(base/'acceptance.py'),run_name='__main__')
+if native_targets:
+    with temporary_directory(prefix='ephy-added-tests-',dir=temporary_root) as writable:
+        exit_code=int(pytest_main(['-q','-p','no:capture','-p','no:cacheprovider','-o','addopts=','--rootdir',str(root),
+            '--confcutdir',str(root),'--basetemp',str(Path(writable)/'pytest'),*native_targets.values()],plugins=[native_outcomes]))
+    summary={'collected':native_outcomes.collected,'reports':native_outcomes.reports,'invalid':native_outcomes.invalid}
+    print('native_added_test_outcomes='+json.dumps(summary,sort_keys=True))
+    assert (exit_code==0 and not native_outcomes.invalid and native_outcomes.seen_targets==set(native_targets)
+        and len(native_outcomes.collected)==len(set(native_outcomes.collected))
+        and set(native_outcomes.reports)==set(native_outcomes.collected)
+        and all(phases=={'setup':'passed','call':'passed','teardown':'passed'} for phases in native_outcomes.reports.values())), 'native_added_tests_not_passed'
 '''

@@ -587,7 +587,7 @@ def test_discovery_uses_actual_template_tokens_and_rejects_context_before_infere
         assert [path for path, _ in calls] == ["/apply-template", "/tokenize"]
     else:
         assert discovery.completion("source fixture", runtime) == {"fixture": True}
-        assert calls[-1][1]["max_tokens"] == 4096
+        assert calls[-1][1]["max_tokens"] == 5000 - 10 - 64
         assert calls[-1][1]["messages"] == calls[0][1]["messages"]
 
 
@@ -1222,6 +1222,8 @@ def test_discovery_queue_empty_then_read_more_then_real_code_selection(tmp_path,
 
 
 def test_discovery_queue_malformed_selection_retries_and_context_is_bounded(tmp_path, monkeypatch):
+    from ephy_worker.owner_repair_discovery import _ModelJSONError
+
     discovery, templates, inventories, selected = _discovery_queue_scope_fixture(tmp_path)
     for index in range(12):
         name = f"src/ephy_worker/search_{index}.py"
@@ -1231,7 +1233,7 @@ def test_discovery_queue_malformed_selection_retries_and_context_is_bounded(tmp_
     def complete(prompt, _runtime):
         prompts.append(json.loads(prompt))
         if len(prompts) == 1:
-            raise ValueError("fixture malformed JSON")
+            raise _ModelJSONError("fixture malformed JSON")
         if len(prompts) == 2:
             return {}
         return selected
@@ -1240,7 +1242,7 @@ def test_discovery_queue_malformed_selection_retries_and_context_is_bounded(tmp_
     assert discovery.select_scope({"text": "search", "previous": None}, templates, inventories, directory) == selected
     assert len(prompts) == 3
     assert all(len(json.dumps(prompt["code_context"], ensure_ascii=False).encode()) <= 24000 for prompt in prompts)
-    assert json.loads((directory / "scope-attempt-1.error.json").read_text())["type"] == "ValueError"
+    assert json.loads((directory / "scope-attempt-1.error.json").read_text())["type"] == "_ModelJSONError"
 
 
 def test_discovery_queue_exhaustion_retains_responses_and_public_explanation(tmp_path, monkeypatch):
@@ -1250,7 +1252,7 @@ def test_discovery_queue_exhaustion_retains_responses_and_public_explanation(tmp
     directory = tmp_path / "private"
     with pytest.raises(GateFailure, match="discovery_scope_exhausted"):
         discovery.select_scope({"text": "fixture private directive", "previous": "fixture previous"}, templates, inventories, directory)
-    assert len(list(directory.glob("*.response.json"))) == len(list(directory.glob("*.validation.json"))) == 3
+    assert len(list(directory.glob("*.response.json"))) == len(list(directory.glob("*.validation.json"))) == 30
     def fail(*_):
         raise GateFailure("discovery_scope_exhausted")
     config = SimpleNamespace(state_dir=tmp_path / "state", guild_id=11, channel_ids=(20,))
@@ -1359,7 +1361,7 @@ def test_context_review_oversized_read_more_is_atomic_and_preserves_accepted_con
             inventories["ephy-worker"].append(name)
             names.append(name)
         groups.append(names)
-    responses = iter([{"read_more": {"ephy-worker": groups[0]}}, {"read_more": {"ephy-worker": groups[1]}}, {}])
+    responses = iter([{"read_more": {"ephy-worker": groups[0]}}, {"read_more": {"ephy-worker": groups[1]}}, {}] + [{}] * 27)
     prompts = []
     def complete(prompt, _runtime):
         prompts.append(json.loads(prompt))
@@ -1407,7 +1409,7 @@ def test_discovery_json_http_request_format_and_strict_raw_evidence(tmp_path, mo
     raw = json.loads((directory / "scope.raw.json").read_bytes())
     assert raw["choices"][0]["message"]["content"] == content
     assert calls[-1][1]["messages"] == calls[0][1]["messages"]
-    assert calls[-1][1]["max_tokens"] == 4096 and calls[-1][1]["stream"] is False
+    assert calls[-1][1]["max_tokens"] == 32768 - 3 - 64 and calls[-1][1]["stream"] is False
 
 
 @pytest.mark.parametrize("fault,expected", [("origin", "discovery_origin_changed"),
@@ -1474,3 +1476,832 @@ def test_preflight_review_direct_scope_rejects_linked_parent_before_read_or_infe
     with pytest.raises(GateFailure, match="Link/reparse point prohibited"):
         discovery.select_scope({"text": "Improve fixture feature", "previous": None},
             {"ephy-worker": {"runtime": {}}}, {"ephy-worker": ["src/ephy_worker/feature.py"]}, tmp_path / "private")
+
+
+def test_discovery_loop_recovers_after_three_with_shape_and_missing_test_feedback(tmp_path, monkeypatch):
+    discovery, templates, inventories, selected = _discovery_queue_scope_fixture(tmp_path)
+    missing_tests = {**selected, "allowed_files": [inventories["ephy-worker"][0]]}
+    mixed = {**selected, "read_more": {"ephy-worker": [inventories["ephy-worker"][0]]}}
+    responses = iter([{"files": selected["allowed_files"]}, missing_tests, mixed,
+        {"read_more": {"ephy-worker": [inventories["ephy-worker"][0]]}}, selected])
+    prompts = []
+    def complete(prompt, runtime):
+        prompts.append(json.loads(prompt))
+        assert "oneOf" in runtime["discovery_response_schema"]
+        return next(responses)
+    monkeypatch.setattr(discovery, "completion", complete)
+    job = {"text": "Improve fixture search behavior", "previous": "Fixture prior answer"}
+    directory = tmp_path / "private"
+    assert discovery.select_scope(job, templates, inventories, directory) == selected
+    assert len(prompts) == 5
+    assert all(prompt["request"] == job["text"] and prompt["previous_answer"] == job["previous"] for prompt in prompts)
+    assert json.loads(prompts[1]["previous_model_output"]["text"]) == {"files": selected["allowed_files"]}
+    assert "Do not mix" in prompts[1]["correction"]
+    assert prompts[2]["previous_selection_error"] == "discovery_scope_protected_or_missing_tests"
+    assert prompts[2]["existing_test_files"]["ephy-worker"] == ["tests/test_search.py"]
+    assert "existing tests/ file" in prompts[2]["correction"]
+    assert json.loads(prompts[2]["previous_model_output"]["text"]) == missing_tests
+    assert prompts[3]["previous_selection_error"] == "discovery_scope_empty_or_invalid"
+    outcome = json.loads((directory / "scope-attempt-5.validation.json").read_bytes())
+    assert outcome == {"outcome": "selected", "round": 5, "provisional_round_limit": 30}
+    assert len(list(directory.glob("*.response.json"))) == len(list(directory.glob("*.validation.json"))) == 5
+    assert "discovery_response_schema" not in templates["ephy-worker"]["runtime"]
+
+
+def test_discovery_loop_parse_feedback_retains_raw_and_bounds_utf8(tmp_path, monkeypatch):
+    from ephy_worker.owner_repair_discovery import _ModelJSONError
+
+    discovery, templates, inventories, selected = _discovery_queue_scope_fixture(tmp_path)
+    prompts = []
+    content = "```json\n" + "日本語" * 5000 + "\n```"
+    def complete(prompt, _runtime):
+        prompts.append(json.loads(prompt))
+        if len(prompts) == 1:
+            discovery.response_path.write_text(json.dumps({"choices": [{"message": {"content": content}}]},
+                ensure_ascii=False), encoding="utf-8")
+            raise _ModelJSONError("fixture strict JSON parse failure")
+        return selected
+    monkeypatch.setattr(discovery, "completion", complete)
+    directory = tmp_path / "private"
+    assert discovery.select_scope({"text": "Improve search", "previous": None}, templates, inventories, directory) == selected
+    previous = prompts[1]["previous_model_output"]
+    assert previous["representation"] == "raw_http_response" and previous["truncated"] is True
+    assert "```json" in previous["text"] and 0 < len(previous["text"].encode("utf-8")) <= 8192
+    assert previous["utf8_bytes"] > 8192 and "without fences" in prompts[1]["correction"]
+    assert json.loads((directory / "scope-attempt-1.raw.json").read_bytes())["choices"][0]["message"]["content"] == content
+
+
+@pytest.mark.parametrize("read_more", [False, True])
+def test_discovery_loop_http_uses_exclusive_json_schema_for_both_shapes(tmp_path, monkeypatch, read_more):
+    from jsonschema import Draft7Validator
+
+    discovery, templates, inventories, selected = _discovery_queue_scope_fixture(tmp_path)
+    identity = tmp_path / "identity.json"
+    identity.write_text(json.dumps({"context": 32768, "model_id": "fixture-model"}), encoding="utf-8")
+    templates["ephy-worker"]["runtime"] = {"models_ini": str(identity), "base_url": "http://127.0.0.1:18080"}
+    monkeypatch.setitem(sys.modules, "ephy_worker.existing_llama_runtime", SimpleNamespace(verify_identity=lambda _: None))
+    formats = []
+    request_more = {"read_more": {"ephy-worker": [inventories["ephy-worker"][0]]}}
+    def handler(request):
+        body = json.loads(request.content)
+        if request.url.path == "/apply-template":
+            return httpx.Response(200, json={"prompt": "fixture formatted prompt"})
+        if request.url.path == "/tokenize":
+            return httpx.Response(200, json={"tokens": [1, 2, 3]})
+        assert request.url.path == "/v1/chat/completions"
+        formats.append(body["response_format"])
+        contract = body["response_format"]
+        assert contract["type"] == "json_schema"
+        assert contract["json_schema"]["name"] == "discovery_scope" and contract["json_schema"]["strict"] is True
+        validator = Draft7Validator(contract["json_schema"]["schema"])
+        assert validator.is_valid(selected) and validator.is_valid(request_more)
+        assert not validator.is_valid({**selected, **request_more})
+        assert not validator.is_valid({k: v for k, v in selected.items() if k != "semantic_scope"})
+        assert not validator.is_valid({"read_more": {"unregistered": ["src/feature.py"]}})
+        response = request_more if read_more and len(formats) == 1 else selected
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(response)}}]})
+    actual_client = httpx.Client
+    monkeypatch.setattr("ephy_worker.owner_repair_discovery.httpx.Client", lambda **kwargs:
+        actual_client(transport=httpx.MockTransport(handler), **kwargs))
+    assert discovery.select_scope({"text": "Improve search", "previous": None}, templates, inventories, tmp_path / "private") == selected
+    assert len(formats) == (2 if read_more else 1)
+
+
+@pytest.mark.parametrize("context,input_tokens,expected_output", [(32768, 16175, 16529),
+    (4260, 100, 4096), (4259, 100, None)])
+def test_discovery_generation_uses_remaining_context_and_minimum_headroom(tmp_path, monkeypatch,
+        context, input_tokens, expected_output):
+    from ephy_worker.formal_artifacts import GateFailure
+
+    identity = tmp_path / "identity.json"
+    identity.write_text(json.dumps({"context": context, "model_id": "fixture-model"}), encoding="utf-8")
+    monkeypatch.setitem(sys.modules, "ephy_worker.existing_llama_runtime", SimpleNamespace(verify_identity=lambda _: None))
+    calls = []
+    def handler(request):
+        data = json.loads(request.content)
+        calls.append((request.url.path, data))
+        if request.url.path == "/apply-template":
+            return httpx.Response(200, json={"prompt": "measured formatted fixture"})
+        if request.url.path == "/tokenize":
+            assert data == {"content": "measured formatted fixture", "add_special": False}
+            return httpx.Response(200, json={"tokens": [1] * input_tokens})
+        assert request.url.path == "/v1/chat/completions"
+        assert data["max_tokens"] == expected_output
+        assert input_tokens + data["max_tokens"] + 64 == context
+        assert data["messages"] == calls[0][1]["messages"]
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": '{"fixture":true}'}}]})
+    actual_client = httpx.Client
+    monkeypatch.setattr("ephy_worker.owner_repair_discovery.httpx.Client", lambda **kwargs:
+        actual_client(transport=httpx.MockTransport(handler), **kwargs))
+    discovery = LocalDiscovery(SimpleNamespace())
+    runtime = {"models_ini": str(identity), "base_url": "http://127.0.0.1:18080"}
+    if expected_output is None:
+        with pytest.raises(GateFailure, match="context_budget_exceeded"):
+            discovery.completion("original private fixture request", runtime)
+        assert [path for path, _ in calls] == ["/apply-template", "/tokenize"]
+    else:
+        assert discovery.completion("original private fixture request", runtime) == {"fixture": True}
+        assert calls[-1][1]["max_tokens"] == expected_output
+
+
+@pytest.mark.parametrize("finish_reason,content,error", [("length", '{"fixture":true}', RuntimeError),
+    ("stop", '{"fixture":', ValueError)])
+def test_discovery_generation_rejects_incomplete_and_preserves_raw_response(tmp_path, monkeypatch, finish_reason, content, error):
+    identity = tmp_path / "identity.json"
+    identity.write_text(json.dumps({"context": 32768, "model_id": "fixture-model"}), encoding="utf-8")
+    monkeypatch.setitem(sys.modules, "ephy_worker.existing_llama_runtime", SimpleNamespace(verify_identity=lambda _: None))
+    def handler(request):
+        if request.url.path == "/apply-template":
+            return httpx.Response(200, json={"prompt": "measured fixture prompt"})
+        if request.url.path == "/tokenize":
+            return httpx.Response(200, json={"tokens": [1, 2, 3]})
+        assert request.url.path == "/v1/chat/completions"
+        assert json.loads(request.content)["max_tokens"] == 32768 - 3 - 64
+        return httpx.Response(200, json={"choices": [{"finish_reason": finish_reason, "message": {"content": content}}]})
+    actual_client = httpx.Client
+    monkeypatch.setattr("ephy_worker.owner_repair_discovery.httpx.Client", lambda **kwargs:
+        actual_client(transport=httpx.MockTransport(handler), **kwargs))
+    discovery = LocalDiscovery(SimpleNamespace())
+    directory = tmp_path / "private"
+    with pytest.raises(error, match="generation_incomplete" if finish_reason == "length" else None):
+        discovery.ask("fixture request", {"models_ini": str(identity), "base_url": "http://127.0.0.1:18080"}, directory, "controls")
+    raw = json.loads((directory / "controls.raw.json").read_bytes())
+    assert raw["choices"][0] == {"finish_reason": finish_reason, "message": {"content": content}}
+    assert (directory / "controls.error.json").is_file()
+
+
+def _controls_loop_fixture(tmp_path, monkeypatch):
+    import hashlib
+
+    source = tmp_path / "source"
+    names = ["src/ephy_worker/feature.py", "tests/test_feature.py"]
+    sources = {names[0]: "def answer(value):\n    return value\n",
+        names[1]: "from ephy_worker.feature import answer\n\ndef test_original():\n    assert answer(0) >= 0\n"}
+    original = {"src/ephy_worker/__init__.py": "", **sources}
+    for name, text in original.items():
+        path = source / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    observed = {name: {"sha256": hashlib.sha256(text.encode()).hexdigest()} for name, text in original.items()}
+    monkeypatch.setattr("ephy_worker.owner_repair_discovery.snapshot", lambda _: observed)
+    discovery = LocalDiscovery(SimpleNamespace(state_dir=tmp_path / "state"))
+    profile = SimpleNamespace(source=source, github_repository="kirimine170/ephy-worker")
+    template = {"runtime": {"python": sys.executable}, "contract": {"verifier_sandbox": {}}}
+    scope = {"repository": "ephy-worker", "allowed_files": names, "semantic_scope": "Correct fixture answer"}
+    proposal = {"checker_python": "from ephy_worker.feature import answer\nassert answer(1) == 2\n",
+        "known_good": {names[0]: [{"old": "return value", "new": "return value + 1"}],
+            names[1]: [{"append": "\ndef test_added():\n    assert answer(1) == 2\n"}]},
+        "wrong_answer": {names[0]: [{"old": "return value", "new": "return value - 1"}],
+            names[1]: [{"append": "\ndef test_added():\n    assert answer(1) == 2\n"}]}}
+    args = ({"text": "Correct fixture answer", "previous": "Fixture previous answer"}, tmp_path / "job", profile,
+        template, scope, "d" * 40, observed, sources, {names[1]: ["answer"]})
+    return discovery, args, proposal
+
+
+def _controls_loop_actual_transport(monkeypatch, calls):
+    def run_isolated(_descriptor, argv, **kwargs):
+        calls.append((kwargs["candidate"], kwargs["temp"]))
+        result = subprocess.run(argv, cwd=kwargs["cwd"], env=kwargs["environment"],
+            capture_output=True, timeout=30, check=False)
+        return {"exit_code": result.returncode, "stdout": result.stdout.decode("utf-8"),
+            "stderr": result.stderr.decode("utf-8")}
+    # The unit transport runs real fixture checker subprocesses; no native capability is claimed．
+    monkeypatch.setitem(sys.modules, "ephy_worker.verifier_sandbox", SimpleNamespace(run_isolated=run_isolated))
+
+
+def test_controls_loop_actual_annotation_and_uncalled_checker_diagnostics_recover(tmp_path, monkeypatch):
+    import shutil
+
+    discovery, args, proposal = _controls_loop_fixture(tmp_path, monkeypatch)
+    annotated = json.loads(json.dumps(proposal))
+    annotated["known_good"]["tests/test_feature.py"][0]["append"] = "\ndef test_added() -> None:\n    assert answer(1) == 2\n"
+    uncalled = {**proposal, "checker_python": "from ephy_worker.feature import answer\ndef test_answer(tmp_path):\n    assert answer(1) == 2\n"}
+    proposals = iter([annotated, uncalled, proposal])
+    prompts = []
+    def complete(prompt, _runtime):
+        prompts.append(json.loads(prompt))
+        return json.loads(json.dumps(next(proposals)))
+    monkeypatch.setattr(discovery, "completion", complete)
+    calls = []
+    _controls_loop_actual_transport(monkeypatch, calls)
+    artifacts = discovery.prepare_controls(*args)
+    assert artifacts["directory"].name == "attempt-03" and len(calls) == 15
+    assert all(prompt["request"] == args[0]["text"] and prompt["source"] == args[7] for prompt in prompts)
+    assert "annotations" in prompts[0]["instruction"] and "standalone script" in prompts[0]["instruction"]
+    first = prompts[1]["previous_attempt"]["actual_control_diagnostics"]
+    assert len(first) == 5 and first[0]["exit_code"] != 0
+    assert "new_test_collection_annotation" in first[0]["stderr_tail"]
+    second = prompts[2]["previous_attempt"]["actual_control_diagnostics"]
+    assert len(second) == 5 and second[1]["name"] == "unchanged" and second[1]["exit_code"] == 0 and second[1]["expected"] == 1
+    assert "def test_answer(tmp_path)" in prompts[2]["previous_attempt"]["previous_proposal"]["text"]
+    for number in (1, 2, 3):
+        directory = args[1] / "control-attempts" / f"attempt-{number:02d}"
+        results = json.loads((directory / "checker-controls.json").read_bytes())
+        assert len(results) == 5 and len(list(directory.glob("control-*.json"))) == 5
+        assert all((directory / ("control-" + row["name"] + ".json")).is_file() for row in results)
+        assert all(row["actual"] == row["expected"] for row in results) == (number == 3)
+    # Same leaf attempt name in another job must not collide in the shared verifier temp root．
+    other = tmp_path / "other-job" / "control-attempts" / "attempt-03"
+    other.mkdir(parents=True)
+    for name in ("checker.py", "acceptance.py", "checker-guard.json"):
+        shutil.copyfile(artifacts["directory"] / name, other / name)
+    results = discovery.measure_controls(args[2], other, artifacts["prepared"], other / "checker.py", args[3])
+    assert len(results) == 5 and len(calls) == len({temp for _, temp in calls}) == 20
+    assert not (args[1] / "frozen-spec.json").exists()
+
+
+@pytest.mark.parametrize("failure", ["json", "compile", "edit"])
+def test_controls_loop_model_json_compile_and_edit_failures_retry(tmp_path, monkeypatch, failure):
+    from ephy_worker.owner_repair_discovery import _ModelJSONError
+
+    discovery, args, proposal = _controls_loop_fixture(tmp_path, monkeypatch)
+    calls = []
+    _controls_loop_actual_transport(monkeypatch, calls)
+    prompts = []
+    def complete(prompt, _runtime):
+        prompts.append(json.loads(prompt))
+        result = json.loads(json.dumps(proposal))
+        if len(prompts) == 1:
+            if failure == "json":
+                raise _ModelJSONError("fixture invalid completed model JSON")
+            if failure == "compile":
+                result["checker_python"] = "def broken(:\n"
+            else:
+                result["known_good"]["src/ephy_worker/feature.py"][0]["old"] = "absent text"
+        return result
+    monkeypatch.setattr(discovery, "completion", complete)
+    artifacts = discovery.prepare_controls(*args)
+    assert artifacts["directory"].name == "attempt-02" and len(prompts) == 2 and len(calls) == 5
+    first = args[1] / "control-attempts/attempt-01"
+    error = json.loads((first / "attempt-error.json").read_bytes())
+    assert error["retryable"] is True and (first / "retry-feedback.json").is_file()
+    assert prompts[1]["previous_attempt"]["error"] == error["error"]
+
+
+@pytest.mark.parametrize("failure", ["identity", "environment_value", "native"])
+def test_controls_loop_environment_identity_and_capability_failures_stop(tmp_path, monkeypatch, failure):
+    from ephy_worker.formal_artifacts import GateFailure
+
+    discovery, args, proposal = _controls_loop_fixture(tmp_path, monkeypatch)
+    calls = []
+    def complete(*_):
+        calls.append("model")
+        if failure == "identity":
+            raise GateFailure("Existing llama.cpp model/context changed")
+        if failure == "environment_value":
+            raise ValueError("fixture invalid environment identity JSON")
+        return json.loads(json.dumps(proposal))
+    def isolated(*_args, **_kwargs):
+        raise GateFailure("fixture native capability unavailable")
+    monkeypatch.setattr(discovery, "completion", complete)
+    monkeypatch.setitem(sys.modules, "ephy_worker.verifier_sandbox", SimpleNamespace(run_isolated=isolated))
+    with pytest.raises((GateFailure, ValueError)):
+        discovery.prepare_controls(*args)
+    assert calls == ["model"]
+    directory = args[1] / "control-attempts/attempt-01"
+    assert json.loads((directory / "attempt-error.json").read_bytes())["retryable"] is False
+    assert not (args[1] / "control-attempts/attempt-02").exists()
+
+
+def test_controls_loop_exhaustion_preserves_thirty_distinct_failed_proposals(tmp_path, monkeypatch):
+    from ephy_worker.formal_artifacts import GateFailure
+
+    discovery, args, _ = _controls_loop_fixture(tmp_path, monkeypatch)
+    calls = []
+    def complete(prompt, _runtime):
+        calls.append(json.loads(prompt))
+        return {"unexpected": "fixture wrong proposal shape"}
+    monkeypatch.setattr(discovery, "completion", complete)
+    with pytest.raises(GateFailure, match="discovery_controls_exhausted"):
+        discovery.prepare_controls(*args)
+    assert len(calls) == 30 and all(row["provisional_attempt_limit"] == 30 for row in calls)
+    attempts = args[1] / "control-attempts"
+    assert len(list(attempts.glob("attempt-*/controls.response.json"))) == 30
+    assert len(list(attempts.glob("attempt-*/attempt-error.json"))) == 30
+    assert not (args[1] / "frozen-spec.json").exists()
+
+
+def _native_tests_bound_fixture(tmp_path, monkeypatch):
+    from test_verifier_sandbox import descriptor_fixture
+
+    from ephy_worker.owner_repair_discovery import _native_test_profile
+
+    home = tmp_path / "synthetic-native-home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: home)
+    root = tmp_path / "synthetic-native-binding"
+    root.mkdir()
+    descriptor = descriptor_fixture(root)
+    template = {"runtime": {"python": descriptor["python"]["path"]}, "contract": {
+        "execution_profile": "native_windows_code_v1", "verifier_sandbox": descriptor,
+        "runtime_hashes": {descriptor[key]["path"]: descriptor[key]["sha256"]
+            for key in ("codex", "python", "acl_helper", "capability")}}}
+    # Synthetic retained transcripts check binding only, never actual native isolation．
+    return template, _native_test_profile(template)
+
+
+def _native_tests_run_emitted(tmp_path, original, appended, profile):
+    import hashlib
+    import inspect
+
+    from ephy_worker.owner_repair_discovery import _CHECKER
+
+    candidate, directory = tmp_path / "candidate", tmp_path / "checker"
+    candidate.mkdir()
+    directory.mkdir()
+    name = "test_feature.py"
+    test = candidate / name
+    test.write_text(original + appended, encoding="utf-8")
+    guard = {"allowed": [name], "snapshot": {name: {"sha256": hashlib.sha256(original.encode()).hexdigest()}},
+        "authority": {}, "tests": {name: original}, "native_test_profile": profile}
+    (directory / "checker-guard.json").write_text(json.dumps(guard), encoding="utf-8")
+    marker = tmp_path / "acceptance-reached"
+    (directory / "acceptance.py").write_text("from pathlib import Path\nPath(" + repr(str(marker)) + ").touch()\n", encoding="utf-8")
+    checker = directory / "checker.py"
+    checker.write_text("import ast\n" + inspect.getsource(authority_fingerprint) + "\n"
+        + inspect.getsource(preserve_original_tests) + "\n" + _CHECKER, encoding="utf-8")
+    environment = dict(os.environ)
+    temporary = tmp_path / "trusted-emitted-temp"
+    temporary.mkdir()
+    environment.update({name: str(temporary) for name in ("TEMP", "TMP", "TMPDIR")})
+    result = subprocess.run([sys.executable, "-I", "-X", "utf8", "-B", str(checker), str(candidate)],
+        env=environment, capture_output=True, text=True, encoding="utf-8", timeout=30, check=False)
+    return result, marker, test
+
+
+def test_native_tests_bound_profile_allows_real_fixture_class_filesystem_and_async(tmp_path, monkeypatch):
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    original = ("from pathlib import Path\nimport pytest\n\nclass Feature:\n"
+        "    def write(self, path):\n        path.write_text('{\"answer\":42}', encoding='utf-8')\n"
+        "\ndef test_original():\n    assert True\n")
+    appended = ("\ndef test_native_sync(tmp_path: Path) -> None:\n    import json\n"
+        "    path = tmp_path / 'answer.json'\n    Feature().write(path)\n"
+        "    assert json.loads(path.read_text()) == {'answer': 42}\n"
+        "\n@pytest.mark.asyncio\nasync def test_native_async(tmp_path: Path) -> None:\n    import asyncio\n"
+        "    await asyncio.sleep(0)\n    path = tmp_path / 'answer.json'\n    Feature().write(path)\n"
+        "    assert path.read_text() == '{\"answer\":42}'\n")
+    preserve_original_tests(original, original + appended, (), profile)
+    with pytest.raises(ValueError):
+        preserve_original_tests(original, original + appended)
+    result, marker, test = _native_tests_run_emitted(tmp_path, original, appended, profile)
+    assert result.returncode == 0, result.stderr
+    assert marker.exists()
+    # Ordinary fixture bodies really execute; this unit run is not an OS-isolation claim．
+    result = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", str(test),
+        "--basetemp", str(tmp_path / "pytest-native-bodies")], capture_output=True, text=True,
+        encoding="utf-8", timeout=30, check=False)
+    assert result.returncode == 0 and "3 passed" in result.stdout, result.stdout + result.stderr
+    assert len({path.resolve() for path in (tmp_path / "pytest-native-bodies").glob("test_native_*/answer.json")}) == 2
+
+
+@pytest.mark.parametrize("appended", ["\nimport os\n", "\nactivated = object()\n",
+    "\n@pytest.fixture\ndef helper_fixture():\n    return 1\n",
+    "\ndef pytest_sessionfinish():\n    return 0\n",
+    "\ndef test_default(value=object()):\n    assert True\n",
+    "\ndef test_annotation(value: object()) -> None:\n    assert True\n",
+    "\n@pytest.mark.asyncio()\nasync def test_marker():\n    assert True\n"])
+def test_native_tests_reject_collection_execution_hooks_and_fixtures(tmp_path, monkeypatch, appended):
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    original = "from pathlib import Path\nimport pytest\n\ndef test_original():\n    assert True\n"
+    with pytest.raises(ValueError):
+        preserve_original_tests(original, original + appended, (), profile)
+    result, marker, _ = _native_tests_run_emitted(tmp_path, original, appended, profile)
+    assert result.returncode != 0 and not marker.exists()
+
+
+def test_native_tests_preserve_original_raw_prefix_and_ast(tmp_path, monkeypatch):
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    original = "# original comment\ndef test_original():\n    assert True\n"
+    for candidate in (original.replace("assert True", "assert False"), original.replace("original comment", "changed comment")):
+        with pytest.raises(ValueError, match="original_test_module_changed"):
+            preserve_original_tests(original, candidate, (), profile)
+
+
+@pytest.mark.parametrize("mutation", ["profile", "pin", "python", "descriptor"])
+def test_native_tests_capability_requires_validated_pinned_operator_profile(tmp_path, monkeypatch, mutation):
+    from ephy_worker.formal_artifacts import GateFailure
+    from ephy_worker.owner_repair_discovery import _native_test_profile
+
+    template, _ = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    contract = template["contract"]
+    if mutation == "profile":
+        contract["execution_profile"] = "untrusted_other_profile"
+        assert _native_test_profile(template) is None
+        with pytest.raises(ValueError):
+            preserve_original_tests("", "def test_capability(tmp_path):\n    import pathlib\n    assert True\n", (), None)
+        return
+    if mutation == "pin":
+        contract["runtime_hashes"][contract["verifier_sandbox"]["capability"]["path"]] = "0" * 64
+    elif mutation == "python":
+        template["runtime"]["python"] = sys.executable
+    else:
+        Path(contract["verifier_sandbox"]["capability"]["path"]).write_text("fixture altered capability")
+    with pytest.raises(GateFailure):
+        _native_test_profile(template)
+
+
+def test_native_tests_prepare_binds_guard_and_uses_matching_native_feedback(tmp_path, monkeypatch):
+    from ephy_worker.formal_artifacts import GateFailure
+
+    discovery, args, proposal = _controls_loop_fixture(tmp_path, monkeypatch)
+    template, binding = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    prompts = []
+    def complete(prompt, _runtime):
+        prompts.append(json.loads(prompt))
+        if len(prompts) == 1:
+            return {"bad": "fixture invalid proposal"}
+        return json.loads(json.dumps(proposal))
+    monkeypatch.setattr(discovery, "completion", complete)
+    observed = []
+    def measure(_profile, directory, _prepared, checker, _template):
+        guard = json.loads((checker.parent / "checker-guard.json").read_bytes())
+        observed.append(guard["native_test_profile"])
+        assert directory.name == "attempt-02" and guard["native_test_profile"] == binding
+        original = args[7]["tests/test_feature.py"]
+        preserve_original_tests(original, original + "\ndef test_real_fixture(tmp_path):\n    from pathlib import Path\n    assert Path(tmp_path).is_dir()\n",
+            (), guard["native_test_profile"])
+        raise GateFailure("fixture_native_guard_observed")
+    monkeypatch.setattr(discovery, "measure_controls", measure)
+    with pytest.raises(GateFailure, match="fixture_native_guard_observed"):
+        discovery.prepare_controls(*args[:3], template, *args[4:])
+    assert observed == [binding] and len(prompts) == 2
+    assert "ordinary sync/async" in prompts[0]["instruction"]
+    assert "real classes/fixtures even when approved_subject_calls is empty" in prompts[1]["previous_attempt"]["correction"]
+    assert "Appended tests must have no annotations" not in prompts[1]["previous_attempt"]["correction"]
+
+
+@pytest.mark.parametrize("body", [
+    "from pytest import skip as omitted\n    omitted('fixture skip')",
+    "from pytest import xfail as expected\n    expected('fixture xfail')",
+    "from pytest import importorskip as optional\n    optional('fixture_unavailable_module')",
+    "import pytest as pt\n    pt.importorskip('fixture_unavailable_module')",
+    "import unittest as ut\n    raise ut.SkipTest('fixture skip')",
+    "from unittest import SkipTest as Omitted\n    raise Omitted('fixture skip')",
+    "from unittest.case import SkipTest as Omitted\n    raise Omitted('fixture skip')",
+    "from _pytest.outcomes import Skipped as Omitted\n    raise Omitted('fixture skip')",
+    "import unittest as ut\n    ut.skipIf(True, 'fixture skip')",
+    "from unittest import expectedFailure as ignored\n    ignored(lambda: None)"])
+def test_feedback_native_rejects_skip_import_aliases_and_direct_equivalents(tmp_path, monkeypatch, body):
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    original = "import pytest\n\ndef test_original():\n    assert True\n"
+    appended = "\ndef test_nonexecution():\n    " + body + "\n"
+    with pytest.raises(ValueError, match="new_test_skip_or_xfail"):
+        preserve_original_tests(original, original + appended, (), profile)
+    result, marker, _ = _native_tests_run_emitted(tmp_path, original, appended, profile)
+    assert result.returncode != 0 and "new_test_skip_or_xfail" in result.stderr
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("binding,call", [("from pytest import skip as omitted", "omitted('fixture skip')"),
+    ("from unittest import SkipTest as Omitted", "raise Omitted('fixture skip')")])
+def test_feedback_native_rejects_existing_skip_alias_in_added_body(tmp_path, monkeypatch, binding, call):
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    original = binding + "\n\ndef test_original():\n    assert True\n"
+    appended = "\ndef test_nonexecution():\n    " + call + "\n"
+    with pytest.raises(ValueError, match="new_test_skip_or_xfail"):
+        preserve_original_tests(original, original + appended, (), profile)
+    result, marker, _ = _native_tests_run_emitted(tmp_path, original, appended, profile)
+    assert result.returncode != 0 and "new_test_skip_or_xfail" in result.stderr and not marker.exists()
+
+
+def test_feedback_native_keeps_normal_imports_class_fixture_and_exception_assertions(tmp_path, monkeypatch):
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    original = "import pytest\n\ndef test_original():\n    assert True\n"
+    appended = ("\ndef test_normal(tmp_path):\n    from pathlib import Path\n    from unittest import TestCase\n"
+        "    import pytest as pt\n    path = Path(tmp_path) / 'answer.txt'\n    path.write_text('42')\n"
+        "    TestCase().assertEqual(path.read_text(), '42')\n    with pt.raises(ValueError):\n        int('fixture invalid integer')\n")
+    preserve_original_tests(original, original + appended, (), profile)
+    result, marker, _ = _native_tests_run_emitted(tmp_path, original, appended, profile)
+    assert result.returncode == 0 and marker.exists(), result.stderr
+
+
+def test_feedback_initial_and_retry_explain_actual_temp_and_candidate_api_contract(tmp_path, monkeypatch):
+    from ephy_worker.formal_artifacts import GateFailure
+
+    discovery, args, proposal = _controls_loop_fixture(tmp_path, monkeypatch)
+    prompts = []
+    def complete(prompt, _runtime):
+        prompts.append(json.loads(prompt))
+        return {"bad": "fixture shape"} if len(prompts) == 1 else json.loads(json.dumps(proposal))
+    def measured(*_):
+        raise GateFailure("fixture_feedback_contract_observed")
+    monkeypatch.setattr(discovery, "completion", complete)
+    monkeypatch.setattr(discovery, "measure_controls", measured)
+    with pytest.raises(GateFailure, match="fixture_feedback_contract_observed"):
+        discovery.prepare_controls(*args)
+    assert len(prompts) == 2
+    for text in (prompts[0]["instruction"], prompts[1]["previous_attempt"]["correction"]):
+        for required in ("argv[1] is the read-only candidate", "checker directory is also read-only",
+                "tempfile.TemporaryDirectory()", "TEMP/TMP/TMPDIR", "actual selected candidate APIs",
+                "self-created JSON", "known_good must repair actual selected implementation behavior",
+                "not only modify tests", "same standalone assertions"):
+            assert required in text
+    assert all(prompt["request"] == args[0]["text"] and prompt["source"] == args[7] for prompt in prompts)
+
+
+@pytest.mark.parametrize("binding,call", [("from unittest import TestCase", "TestCase().skipTest('fixture skip')"),
+    ("import unittest as ut", "ut.TestCase().skipTest('fixture skip')")])
+def test_review_v6_native_rejects_testcase_skiptest_direct_and_emitted(tmp_path, monkeypatch, binding, call):
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    original = "def test_original():\n    assert True\n"
+    appended = "\ndef test_nonexecution():\n    " + binding + "\n    " + call + "\n"
+    with pytest.raises(ValueError, match="new_test_skip_or_xfail"):
+        preserve_original_tests(original, original + appended, (), profile)
+    result, marker, _ = _native_tests_run_emitted(tmp_path, original, appended, profile)
+    assert result.returncode != 0 and "new_test_skip_or_xfail" in result.stderr and not marker.exists()
+
+
+@pytest.mark.parametrize("kind", ["ValueError", "TypeError", "unknown_discovery_gate"])
+def test_review_v6_scope_does_not_retry_generic_environment_errors(tmp_path, monkeypatch, kind):
+    from ephy_worker.formal_artifacts import GateFailure
+
+    discovery, templates, inventories, _ = _discovery_queue_scope_fixture(tmp_path)
+    error = {"ValueError": ValueError("fixture environment configuration"),
+        "TypeError": TypeError("fixture endpoint protocol"),
+        "unknown_discovery_gate": GateFailure("discovery_response_too_large")}[kind]
+    calls = []
+    def complete(*_):
+        calls.append(True)
+        raise error
+    monkeypatch.setattr(discovery, "completion", complete)
+    directory = tmp_path / "private"
+    with pytest.raises(type(error)) as caught:
+        discovery.select_scope({"text": "Improve search", "previous": None}, templates, inventories, directory)
+    assert caught.value is error and len(calls) == 1
+    assert json.loads((directory / "scope-attempt-1.error.json").read_text())["type"] == type(error).__name__
+    assert not list(directory.glob("*.validation.json")) and not list(directory.glob("scope-attempt-2.*"))
+
+
+@pytest.mark.parametrize("fault", ["identity_json", "endpoint_json", "endpoint_type"])
+def test_review_v6_real_config_and_http_protocol_errors_stop_scope(tmp_path, monkeypatch, fault):
+    discovery, templates, inventories, _ = _discovery_queue_scope_fixture(tmp_path)
+    identity = tmp_path / "identity.json"
+    identity.write_text("{" if fault == "identity_json" else json.dumps({"context": 32768, "model_id": "fixture-model"}),
+        encoding="utf-8")
+    templates["ephy-worker"]["runtime"] = {"models_ini": str(identity), "base_url": "http://127.0.0.1:18080"}
+    monkeypatch.setitem(sys.modules, "ephy_worker.existing_llama_runtime", SimpleNamespace(verify_identity=lambda _: None))
+    calls = []
+    def handler(request):
+        calls.append(request.url.path)
+        if request.url.path == "/apply-template":
+            return httpx.Response(200, content=b"{") if fault == "endpoint_json" else httpx.Response(200, json={"prompt": "fixture"})
+        if request.url.path == "/tokenize":
+            return httpx.Response(200, json={"tokens": [1]})
+        assert request.url.path == "/v1/chat/completions"
+        return httpx.Response(200, json={"choices": None})
+    actual_client = httpx.Client
+    monkeypatch.setattr("ephy_worker.owner_repair_discovery.httpx.Client", lambda **kwargs:
+        actual_client(transport=httpx.MockTransport(handler), **kwargs))
+    directory = tmp_path / "private"
+    expected = TypeError if fault == "endpoint_type" else json.JSONDecodeError
+    with pytest.raises(expected):
+        discovery.select_scope({"text": "Improve search", "previous": None}, templates, inventories, directory)
+    assert calls == {"identity_json": [], "endpoint_json": ["/apply-template"],
+        "endpoint_type": ["/apply-template", "/tokenize", "/v1/chat/completions"]}[fault]
+    assert json.loads((directory / "scope-attempt-1.error.json").read_text())["type"] == expected.__name__
+    assert not list(directory.glob("*.validation.json")) and not list(directory.glob("scope-attempt-2.*"))
+
+
+def test_review_v6_scope_source_decode_failure_is_not_a_model_retry(tmp_path, monkeypatch):
+    discovery, templates, inventories, _ = _discovery_queue_scope_fixture(tmp_path)
+    path = discovery.config.repositories["ephy-worker"].source / inventories["ephy-worker"][0]
+    path.write_bytes(b"\xff")
+    calls = []
+    monkeypatch.setattr(discovery, "completion", lambda *_: calls.append(True))
+    with pytest.raises(UnicodeDecodeError):
+        discovery.select_scope({"text": "Improve search", "previous": None}, templates, inventories, tmp_path / "private")
+    assert calls == []
+
+
+@pytest.mark.parametrize("malformed,code", [
+    ({"repository": [], "allowed_files": [], "semantic_scope": "fixture"}, "discovery_scope_empty_or_invalid"),
+    ({"repository": "ephy-worker", "allowed_files": [["nested"]], "semantic_scope": "fixture"}, "discovery_scope_protected_or_missing_tests"),
+    ({"repository": "ephy-worker", "allowed_files": ["src/ephy_worker/search.py", "tests/test_search.py"], "semantic_scope": {}}, "discovery_scope_protected_or_missing_tests"),
+    ({"read_more": {"ephy-worker": {"path": "src/ephy_worker/search.py"}}}, "discovery_read_more_invalid"),
+    ({"read_more": {"ephy-worker": [{"path": "src/ephy_worker/search.py"}]}}, "discovery_read_more_invalid")])
+def test_review_v6_malformed_selection_field_types_receive_explicit_retry(tmp_path, monkeypatch, malformed, code):
+    discovery, templates, inventories, selected = _discovery_queue_scope_fixture(tmp_path)
+    prompts = []
+    def complete(prompt, _runtime):
+        prompts.append(json.loads(prompt))
+        return malformed if len(prompts) == 1 else selected
+    monkeypatch.setattr(discovery, "completion", complete)
+    directory = tmp_path / "private"
+    assert discovery.select_scope({"text": "Improve search", "previous": "fixture prior"}, templates, inventories, directory) == selected
+    assert len(prompts) == 2 and prompts[1]["previous_selection_error"] == code
+    assert all(prompt["request"] == "Improve search" and prompt["previous_answer"] == "fixture prior" for prompt in prompts)
+    assert json.loads((directory / "scope-attempt-1.response.json").read_text()) == malformed
+    assert json.loads((directory / "scope-attempt-1.validation.json").read_text())["error"] == code
+
+
+@pytest.mark.parametrize("failure", ["json", "compile"])
+def test_replan_v7_retains_measured_guidance_across_unmeasured_proposals(tmp_path, monkeypatch, failure):
+    import hashlib
+
+    from ephy_worker.owner_repair_discovery import _ModelJSONError
+
+    discovery, args, proposal = _controls_loop_fixture(tmp_path, monkeypatch)
+    uncalled = {**proposal, "checker_python": "from ephy_worker.feature import answer\ndef test_answer():\n    assert answer(1) == 2\n"}
+    prompts = []
+    def complete(prompt, _runtime):
+        prompts.append(json.loads(prompt))
+        if len(prompts) == 1:
+            return json.loads(json.dumps(uncalled))
+        if len(prompts) == 2:
+            if failure == "json":
+                raise _ModelJSONError("fixture malformed completed JSON")
+            return {**json.loads(json.dumps(proposal)), "checker_python": "def broken(:\n"}
+        return json.loads(json.dumps(proposal))
+    monkeypatch.setattr(discovery, "completion", complete)
+    calls = []
+    _controls_loop_actual_transport(monkeypatch, calls)
+    artifacts = discovery.prepare_controls(*args)
+    assert artifacts["directory"].name == "attempt-03" and len(calls) == 10
+    feedback = prompts[2]["previous_attempt"]
+    assert feedback["actual_control_diagnostics"] == []
+    guidance = feedback["previous_measured_control_guidance"]
+    assert guidance["origin_attempt"] == 1
+    assert guidance["checker_sha256"] == hashlib.sha256(uncalled["checker_python"].encode()).hexdigest()
+    assert "never current-attempt success evidence" in guidance["use"]
+    assert len(guidance["actual_control_diagnostics"]) == 5
+    assert guidance["actual_control_diagnostics"][1]["name"] == "unchanged"
+    assert guidance["actual_control_diagnostics"][1]["exit_code"] == 0
+    assert not (args[1] / "control-attempts/attempt-02/checker-controls.json").exists()
+    final = json.loads(artifacts["controls_path"].read_bytes())
+    assert len(final) == 5 and all(row["actual"] == row["expected"] for row in final)
+    assert final != json.loads((args[1] / "control-attempts/attempt-01/checker-controls.json").read_bytes())
+    assert all(prompt["request"] == args[0]["text"] and prompt["source"] == args[7] for prompt in prompts)
+
+
+def test_replan_v7_five_identical_failed_checkers_change_strategy_without_stopping(tmp_path, monkeypatch):
+    import hashlib
+
+    discovery, args, proposal = _controls_loop_fixture(tmp_path, monkeypatch)
+    uncalled = {**proposal, "checker_python": "from ephy_worker.feature import answer\ndef test_answer():\n    assert answer(1) == 2\n"}
+    identical = json.loads(json.dumps(uncalled))
+    identical["wrong_answer"] = json.loads(json.dumps(identical["known_good"]))
+    invalid_edit = json.loads(json.dumps(uncalled))
+    invalid_edit["known_good"]["src/ephy_worker/feature.py"][0]["old"] = "absent fixture text"
+    responses = iter([uncalled, identical, invalid_edit, identical, identical, uncalled, proposal])
+    prompts = []
+    def complete(prompt, _runtime):
+        prompts.append(json.loads(prompt))
+        return json.loads(json.dumps(next(responses)))
+    monkeypatch.setattr(discovery, "completion", complete)
+    calls = []
+    _controls_loop_actual_transport(monkeypatch, calls)
+    artifacts = discovery.prepare_controls(*args)
+    assert artifacts["directory"].name == "attempt-07" and len(calls) == 15
+    assert len(prompts) == 7 and all(prompt["provisional_attempt_limit"] == 30 for prompt in prompts)
+    for index in range(1, 5):
+        feedback = prompts[index]["previous_attempt"]
+        assert feedback["checker_repetition"]["consecutive_failed_proposals"] == index
+        assert feedback["checker_repetition"]["fresh_strategy_required"] is False
+        assert feedback["previous_proposal"]["text"] and not feedback["previous_proposal"]["text_omitted_for_replan"]
+    feedback = prompts[5]["previous_attempt"]
+    assert feedback["actual_control_diagnostics"] == []
+    assert feedback["previous_measured_control_guidance"]["origin_attempt"] == 1
+    assert feedback["checker_repetition"]["consecutive_failed_proposals"] == 5
+    assert feedback["checker_repetition"]["fresh_strategy_required"] is True
+    assert feedback["previous_proposal"]["text"] == "" and feedback["previous_proposal"]["text_omitted_for_replan"] is True
+    previous = feedback["previous_proposal"]
+    private = (args[1] / previous["artifact"]).read_bytes()
+    assert len(private) == previous["utf8_bytes"] and hashlib.sha256(private).hexdigest() == previous["sha256"]
+    assert json.loads(private)["checker_python"] == uncalled["checker_python"]
+    for required in ("Fresh strategy required", "retained measured outcomes", "rebuild assertions", "real candidate APIs",
+            "rather than copying the prior self-created fixture", "Keep working within the existing budget"):
+        assert required in feedback["correction"]
+    later = prompts[6]["previous_attempt"]
+    assert later["checker_repetition"]["consecutive_failed_proposals"] == 6
+    assert later["previous_measured_control_guidance"]["origin_attempt"] == 6
+    assert len(later["actual_control_diagnostics"]) == 5
+    final = json.loads(artifacts["controls_path"].read_bytes())
+    assert len(final) == 5 and all(row["actual"] == row["expected"] for row in final)
+    assert all(prompt["request"] == args[0]["text"] and prompt["source"] == args[7] for prompt in prompts)
+
+
+@pytest.mark.parametrize("changed", ["different_checker", "missing_checker"])
+def test_replan_v7_changed_or_missing_checker_resets_failed_repetition(tmp_path, monkeypatch, changed):
+    discovery, args, proposal = _controls_loop_fixture(tmp_path, monkeypatch)
+    uncalled = {**proposal, "checker_python": "from ephy_worker.feature import answer\ndef test_answer():\n    assert answer(1) == 2\n"}
+    altered = {**uncalled, "checker_python": uncalled["checker_python"] + "# different checker\n"}
+    third = altered if changed == "different_checker" else {"unexpected": "no checker text"}
+    responses = iter([uncalled, uncalled, third, uncalled, proposal])
+    prompts = []
+    def complete(prompt, _runtime):
+        prompts.append(json.loads(prompt))
+        return json.loads(json.dumps(next(responses)))
+    monkeypatch.setattr(discovery, "completion", complete)
+    calls = []
+    _controls_loop_actual_transport(monkeypatch, calls)
+    artifacts = discovery.prepare_controls(*args)
+    assert artifacts["directory"].name == "attempt-05"
+    assert [prompt["previous_attempt"]["checker_repetition"]["consecutive_failed_proposals"] for prompt in prompts[1:]] == [
+        1, 2, 1 if changed == "different_checker" else 0, 1]
+    assert all(not prompt["previous_attempt"]["checker_repetition"]["fresh_strategy_required"] for prompt in prompts[1:])
+    assert all(prompt["request"] == args[0]["text"] and prompt["source"] == args[7] for prompt in prompts)
+    assert len(calls) == (25 if changed == "different_checker" else 20)
+
+
+@pytest.mark.parametrize("invoke", ["getattr(pytest, 'skip')('fixture dynamic skip')",
+    "pytest.__dict__['skip']('fixture dictionary skip')"])
+def test_outcomes_v8_dynamic_skip_rejected_by_actual_native_test_result(tmp_path, monkeypatch, invoke):
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    original = "def test_original():\n    assert True\n"
+    appended = "\ndef test_dynamic_skip():\n    import pytest\n    " + invoke + "\n"
+    # Ordinary dynamic access still passes the static native-body guard．
+    preserve_original_tests(original, original + appended, (), profile)
+    result, marker, _ = _native_tests_run_emitted(tmp_path, original, appended, profile)
+    assert result.returncode != 0 and marker.exists()
+    assert "native_added_tests_not_passed" in result.stderr and "1 skipped" in result.stdout
+    summary = json.loads(next(line.split("=", 1)[1] for line in result.stdout.splitlines()
+        if line.startswith("native_added_test_outcomes=")))
+    assert summary["invalid"] == ["case_not_passed"]
+    assert next(iter(summary["reports"].values()))["setup"] == "passed"
+    assert next(iter(summary["reports"].values()))["call"] == "skipped"
+
+
+@pytest.mark.parametrize("fault", ["setup_skip", "teardown_fail", "runtime_xfail", "missing_fixture"])
+def test_outcomes_v8_requires_every_native_case_phase_to_pass(tmp_path, monkeypatch, fault):
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    original = "import pytest\n\ndef test_original():\n    assert True\n"
+    if fault == "setup_skip":
+        original += "\n@pytest.fixture\ndef existing_fixture():\n    pytest.skip('fixture unavailable')\n"
+    elif fault == "teardown_fail":
+        original += "\n@pytest.fixture\ndef existing_fixture():\n    yield 1\n    raise AssertionError('fixture teardown failed')\n"
+    parameter = "existing_fixture" if fault in {"setup_skip", "teardown_fail", "missing_fixture"} else ""
+    body = "    assert True\n" if fault != "runtime_xfail" else "    getattr(pytest, 'xfail')('fixture expected failure')\n"
+    appended = "\ndef test_phase(" + parameter + "):\n" + body
+    preserve_original_tests(original, original + appended, (), profile)
+    result, marker, _ = _native_tests_run_emitted(tmp_path, original, appended, profile)
+    assert result.returncode != 0 and marker.exists() and "native_added_tests_not_passed" in result.stderr
+    summary = json.loads(next(line.split("=", 1)[1] for line in result.stdout.splitlines()
+        if line.startswith("native_added_test_outcomes=")))
+    assert "case_not_passed" in summary["invalid"] and len(summary["collected"]) == 1
+    phases = next(iter(summary["reports"].values()))
+    assert phases.get("setup") == ("skipped" if fault == "setup_skip" else "failed" if fault == "missing_fixture" else "passed")
+    if fault == "teardown_fail":
+        assert phases["call"] == "passed" and phases["teardown"] == "failed"
+    if fault == "runtime_xfail":
+        assert phases["call"] == "skipped"
+
+
+def test_outcomes_v8_valid_dynamic_sync_async_fixture_cases_pass_without_original_suite(tmp_path, monkeypatch):
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    original = ("from pathlib import Path\nimport pytest\n\nclass Feature:\n"
+        "    def answer(self, value):\n        return value + 1\n"
+        "\n@pytest.fixture(params=[1, 2])\ndef existing_value(request):\n    return request.param\n"
+        "\ndef test_original():\n    raise AssertionError('original suite must not run here')\n")
+    appended = ("\ndef test_dynamic(tmp_path: Path, existing_value: int) -> None:\n"
+        "    path = tmp_path / 'answer.txt'\n    path.write_text(str(getattr(Feature(), 'answer')(existing_value)))\n"
+        "    assert int(path.read_text()) == existing_value + 1\n"
+        "\n@pytest.mark.asyncio\nasync def test_async(tmp_path: Path) -> None:\n"
+        "    import asyncio\n    await asyncio.sleep(0)\n    path = tmp_path / 'async.txt'\n"
+        "    path.write_text('done')\n    assert path.read_text() == 'done'\n")
+    preserve_original_tests(original, original + appended, (), profile)
+    result, marker, test = _native_tests_run_emitted(tmp_path, original, appended, profile)
+    assert result.returncode == 0 and marker.exists(), result.stdout + result.stderr
+    summary = json.loads(next(line.split("=", 1)[1] for line in result.stdout.splitlines()
+        if line.startswith("native_added_test_outcomes=")))
+    assert len(summary["collected"]) == 3 and summary["invalid"] == []
+    assert all(phases == {"setup": "passed", "call": "passed", "teardown": "passed"} for phases in summary["reports"].values())
+    assert all("test_original" not in name for name in summary["collected"])
+    assert test.read_text() == original + appended and not list(test.parent.rglob("__pycache__"))
+
+
+def test_outcomes_v8_no_added_tests_preserves_original_acceptance_baseline(tmp_path, monkeypatch):
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    original = "def test_original():\n    raise AssertionError('not an appended regression')\n"
+    result, marker, test = _native_tests_run_emitted(tmp_path, original, "", profile)
+    assert result.returncode == 0 and marker.exists() and "native_added_test_outcomes=" not in result.stdout
+    # No appended targets do not manufacture baseline rejection: the same semantic script still decides．
+    (tmp_path / "checker/acceptance.py").write_text("raise AssertionError('unchanged behavior')\n", encoding="utf-8")
+    failed = subprocess.run([sys.executable, "-I", "-X", "utf8", "-B", str(tmp_path / "checker/checker.py"), str(test.parent)],
+        capture_output=True, text=True, encoding="utf-8", timeout=30, check=False)
+    assert failed.returncode != 0 and "unchanged behavior" in failed.stderr
+    assert "native_added_test_outcomes=" not in failed.stdout
+
+
+def test_outcomes_v8_actual_completion_wrapper_supports_trusted_native_pytest(tmp_path, monkeypatch):
+    from ephy_worker.check_completion import prepare_completion, verify_completion
+    from ephy_worker.formal_runtime import command_environment
+
+    _, profile = _native_tests_bound_fixture(tmp_path, monkeypatch)
+    original = "import pytest\n\ndef test_original():\n    assert True\n"
+    appended = "\n@pytest.mark.asyncio\nasync def test_added(tmp_path):\n    import asyncio\n    await asyncio.sleep(0)\n    assert tmp_path.is_dir()\n"
+    first, _, test = _native_tests_run_emitted(tmp_path, original, appended, profile)
+    assert first.returncode == 0, first.stdout + first.stderr
+    checker = tmp_path / "checker/checker.py"
+    temporary = tmp_path / "trusted-completion-temp"
+    temporary.mkdir()
+    environment = command_environment(test.parent, temporary)
+    helper = Path(sys.modules["ephy_worker.check_completion"].__file__)
+    completion = prepare_completion([sys.executable, "-I", "-X", "utf8", str(checker), str(test.parent)],
+        checker=checker, helper=helper, request_dir=tmp_path / "completion-requests", output_dir=temporary,
+        label="native-added-test-outcomes", cwd=test.parent)
+    result = subprocess.run(completion["argv"], cwd=test.parent, env=environment, capture_output=True,
+        text=True, encoding="utf-8", timeout=30, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    record = verify_completion(completion, result.returncode)["record"]
+    assert record["outcome"] == "returned" and record["exit_code"] == 0
+    assert "native_added_test_outcomes=" in result.stdout and "1 passed" in result.stdout
