@@ -1051,3 +1051,174 @@ async def test_near_threshold_fence_final_delivery_is_proportional_and_all_parts
         assert (len(fixture.calls), len(sent)) == before
     finally:
         await gateway.aclose()
+
+
+@pytest.mark.asyncio
+async def test_discovery_queue_burst_all_three_users_fifo_receipts_and_owner_only_classification(tmp_path):
+    from ephy_worker.owner_repair import OWNER_USER_ID, RepairStore
+    users = (533693210879459338, OWNER_USER_ID, 330903316575944704)
+    config = settings(tmp_path).model_copy(update={"allowed_user_ids": users})
+    started, finish = asyncio.Event(), asyncio.Event()
+    class Gateway:
+        def __init__(self):
+            self.answers, self.classifications = [], []
+        async def classify_repair(self, question, _previous):
+            self.classifications.append(question)
+            return False
+        async def answer(self, question, _previous):
+            self.answers.append(question)
+            if len(self.answers) == 1:
+                started.set()
+                await finish.wait()
+            return "回答：" + question
+    gateway = Gateway()
+    bridge = RuntimeDiscordBridge(config, gateway, BridgeLedger(config))
+    bridge.repairs = RepairStore(tmp_path / "repairs")
+    sent = []
+    def sender(identifier):
+        async def send(text):
+            sent.append((identifier, text))
+            return 1000 + len(sent)
+        return send
+    first = asyncio.create_task(bridge.handle(event(user_id=users[0], content="<@10> 公開の質問1"), sender(1)))
+    await started.wait()
+    await bridge.handle(event(message_id=2, user_id=users[1], content="<@10> 公開の質問2"), sender(2))
+    await bridge.handle(event(message_id=3, user_id=users[2], content="<@10> 公開の質問3"), sender(3))
+    async def recovery(row, text):
+        return await sender(int(row["message"]))(text)
+    await bridge.recover_intakes(recovery)
+    assert gateway.answers == ["公開の質問1"] and gateway.classifications == []
+    assert [identifier for identifier, text in sent if text.startswith(RECEIPT)] == [1, 2, 3]
+    assert all("順番" in text for identifier, text in sent if identifier in (2, 3))
+    finish.set()
+    await first
+    await bridge.recover_intakes(recovery)
+    assert gateway.answers == ["公開の質問1", "公開の質問2", "公開の質問3"]
+    assert gateway.classifications == ["公開の質問2"] and bridge.repairs.next() is None
+    assert [identifier for identifier, text in sent if text.startswith("回答：")] == [1, 2, 3]
+    assert len([text for _, text in sent if text.startswith(RECEIPT)]) == 3
+    await bridge.handle(event(message_id=2, user_id=users[1], content="<@10> 公開の質問2"), sender(2))
+    assert len(gateway.answers) == 3 and bridge.inflight == 0
+
+
+@pytest.mark.asyncio
+async def test_discovery_queue_drain_keeps_pending_and_restart_recovers_without_event_replay(tmp_path):
+    config = settings(tmp_path)
+    class Gateway:
+        def __init__(self):
+            self.calls = []
+        async def answer(self, question, previous):
+            self.calls.append((question, previous))
+            return "回答：" + question
+    gateway = Gateway()
+    bridge = RuntimeDiscordBridge(config, gateway, BridgeLedger(config))
+    marker = config.state_dir / "repair-drain"
+    marker.write_text("fixture-deployment")
+    sent = []
+    async def send(text):
+        sent.append(text)
+    for identifier in range(1, 5):
+        await bridge.handle(event(message_id=identifier, user_id=30 if identifier % 2 else 31,
+            content=f"<@10> 公開の質問{identifier}"), send)
+    assert not sent and not gateway.calls and bridge.inflight == 0
+    assert bridge.ledger.inbox_pending()
+    marker.unlink()
+    restarted = RuntimeDiscordBridge(config, gateway, BridgeLedger(config))
+    delivered = []
+    async def recover(row, text):
+        delivered.append((int(row["message"]), text))
+        return 200 + len(delivered)
+    await asyncio.gather(restarted.recover_inbox(recover), bridge.recover_inbox(recover))
+    await restarted.recover_inbox(recover)
+    assert gateway.calls == [(f"公開の質問{identifier}", None) for identifier in range(1, 5)]
+    assert [identifier for identifier, text in delivered if text.startswith("回答：")] == [1, 2, 3, 4]
+    assert len([text for _, text in delivered if text == RECEIPT]) == 4
+    assert not restarted.ledger.inbox_pending()
+
+
+@pytest.mark.asyncio
+async def test_discovery_queue_receipt_in_progress_is_not_claimed_by_recovery(tmp_path):
+    config = settings(tmp_path)
+    started, finish = asyncio.Event(), asyncio.Event()
+    class Gateway:
+        calls = 0
+        async def answer(self, *_):
+            self.calls += 1
+            return "回答です．"
+    gateway = Gateway()
+    bridge = RuntimeDiscordBridge(config, gateway, BridgeLedger(config))
+    other = RuntimeDiscordBridge(config, gateway, BridgeLedger(config))
+    sent = []
+    async def send(text):
+        sent.append(text)
+        if text == RECEIPT:
+            started.set()
+            await finish.wait()
+    task = asyncio.create_task(bridge.handle(event(), send))
+    await started.wait()
+    async def recovered(_row, text):
+        sent.append(text)
+    await other.recover_inbox(recovered)
+    assert sent == [RECEIPT] and gateway.calls == 0
+    finish.set()
+    await task
+    assert sent == [RECEIPT, "回答です．"] and gateway.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_discovery_queue_dead_process_lease_is_recovered_fifo(tmp_path):
+    import subprocess
+    config = settings(tmp_path)
+    code = ("import os,psutil\nfrom pathlib import Path\n"
+        "from ephy_worker.discord_runtime import BridgeLedger,DiscordRuntimeSettings,DiscordEvent\n"
+        "config=DiscordRuntimeSettings(application_id=10,guild_id=11,allowed_channel_ids=(20,),"
+        "allowed_user_ids=(30,31),state_dir=Path(" + repr(str(config.state_dir)) + "))\n"
+        "ledger=BridgeLedger(config)\n"
+        "for number in (1,2):\n"
+        " ledger.enqueue(DiscordEvent(number,11,20,30,'fixture'),str(number),None,None)\n"
+        "ledger.claim_next(f'{os.getpid()}:{psutil.Process().create_time()}:fixture')\n"
+        "os._exit(0)\n")
+    result = await asyncio.to_thread(subprocess.run, [sys.executable, "-B", "-c", code],
+        capture_output=True, check=False, timeout=20)
+    assert result.returncode == 0, result.stderr
+    class Gateway:
+        def __init__(self):
+            self.calls = []
+        async def answer(self, question, _previous):
+            self.calls.append(question)
+            return "回答です．"
+    gateway = Gateway()
+    restarted = RuntimeDiscordBridge(config, gateway, BridgeLedger(config))
+    async def send(_row, _text):
+        return 1234
+    await restarted.recover_inbox(send)
+    await restarted.recover_inbox(send)
+    assert gateway.calls == ["1", "2"] and not restarted.ledger.inbox_pending()
+
+
+@pytest.mark.asyncio
+async def test_discovery_queue_final_delivery_is_durably_terminal_before_send(tmp_path):
+    config = settings(tmp_path)
+    class Gateway:
+        calls = 0
+        async def answer(self, *_):
+            self.calls += 1
+            return "最終回答です．"
+    gateway = Gateway()
+    bridge = RuntimeDiscordBridge(config, gateway, BridgeLedger(config))
+    sent = []
+    async def send(text):
+        sent.append(text)
+        if text == "最終回答です．":
+            # Inspect the actual durable row before the sender returns/finally runs．
+            with sqlite3.connect(bridge.ledger.path) as db:
+                assert db.execute("SELECT done FROM inbox WHERE message='1'").fetchone() == (1,)
+            restarted = RuntimeDiscordBridge(config, gateway, BridgeLedger(config))
+            async def unexpected_send(*_):
+                pytest.fail("completed final delivery replayed during restart recovery")
+            await restarted.recover_inbox(unexpected_send)
+            await restarted.handle(event(), unexpected_send)
+            assert gateway.calls == 1
+        return 1234
+    await bridge.handle(event(), send)
+    assert sent == [RECEIPT, "最終回答です．"] and not bridge.ledger.inbox_pending()

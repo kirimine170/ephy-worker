@@ -472,6 +472,54 @@ class BridgeLedger:
         with self._db() as db:
             db.execute("CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY)")
             db.execute("CREATE TABLE IF NOT EXISTS answers (id TEXT PRIMARY KEY, guild TEXT, channel TEXT, user TEXT, content TEXT, created REAL)")
+            db.execute("CREATE TABLE IF NOT EXISTS inbox (sequence INTEGER PRIMARY KEY AUTOINCREMENT, message TEXT UNIQUE, "
+                "guild TEXT, channel TEXT, user TEXT, question TEXT, previous TEXT, intake TEXT, "
+                "receipt INTEGER DEFAULT 0, done INTEGER DEFAULT 0, consumer TEXT)")
+
+    def enqueue(self, event: DiscordEvent, question: str, previous: str | None, intake: str | None,
+                consumer: str | None = None) -> bool:
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute("SELECT 1 FROM inbox WHERE message=?", (str(event.message_id),)).fetchone() or db.execute(
+                    "SELECT 1 FROM requests WHERE id=?", (str(event.message_id),)).fetchone():
+                return False
+            db.execute("INSERT INTO inbox(message,guild,channel,user,question,previous,intake,consumer) VALUES (?,?,?,?,?,?,?,?)",
+                (str(event.message_id), str(event.guild_id), str(event.channel_id), str(event.user_id), question, previous, intake, consumer))
+            return True
+
+    def inbox_has(self, message: str) -> bool:
+        with self._db() as db:
+            return db.execute("SELECT 1 FROM inbox WHERE message=?", (str(message),)).fetchone() is not None
+
+    def inbox_pending(self) -> bool:
+        with self._db() as db:
+            return db.execute("SELECT 1 FROM inbox WHERE done=0").fetchone() is not None
+
+    def claim_next(self, consumer: str) -> dict | None:
+        with self._db() as db:
+            db.row_factory = sqlite3.Row
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM inbox WHERE done=0 ORDER BY sequence LIMIT 1").fetchone()
+            if row is None:
+                return None
+            if row["consumer"]:
+                try:
+                    pid, created, _instance = row["consumer"].split(":", 2)
+                    if psutil.Process(int(pid)).create_time() == float(created):
+                        return None
+                except (psutil.Error, ValueError):
+                    pass  # A dead process cannot retain ownership of pending work．
+            db.execute("UPDATE inbox SET consumer=? WHERE sequence=?", (consumer, row["sequence"]))
+            return dict(row)
+
+    def inbox_update(self, message: str, *, receipt=False, done=False, release=False) -> None:
+        with self._db() as db:
+            if receipt:
+                db.execute("UPDATE inbox SET receipt=1 WHERE message=?", (str(message),))
+            if done:
+                db.execute("UPDATE inbox SET done=1 WHERE message=?", (str(message),))
+            if release:
+                db.execute("UPDATE inbox SET consumer=NULL WHERE message=?", (str(message),))
 
     @contextmanager
     def _db(self):
@@ -542,6 +590,9 @@ class RuntimeDiscordBridge:
         self.process_created = psutil.Process().create_time()
         self.intake_consumer = f"{os.getpid()}:{self.process_created}"
         self.intake_active = set()
+        self.inbox_lock = asyncio.Lock()
+        self.inbox_consumer = self.intake_consumer + ":" + str(id(self))
+        self.inbox_senders = {}
         if settings.owner_repair_config is not None:
             from .owner_repair import RepairStore
             from .owner_repair_pipeline import load_config
@@ -606,15 +657,11 @@ class RuntimeDiscordBridge:
                 or event.channel_id not in self.settings.allowed_channel_ids
                 or event.user_id not in self.settings.allowed_user_ids):
             return
-        task, entered = None, False
         try:
             from .owner_repair import OWNER_USER_ID
             owner_route = self.repairs is not None and event.user_id == OWNER_USER_ID
-            previous = self.ledger.previous(event) if owner_route else await asyncio.to_thread(self.ledger.previous, event)
+            previous = self.ledger.previous(event)
             if not event.mentioned and previous is None:
-                return
-            if self.repairs is not None and self.drain_token() is not None:
-                self.activity()
                 return
             question = re.sub(rf"<@!?{self.settings.application_id}>", "", event.content).strip()
             intake = None
@@ -622,32 +669,30 @@ class RuntimeDiscordBridge:
                 # Local durable capture precedes the first receipt/model/network await．
                 intake = self.repairs.capture_intake(guild_id=event.guild_id, channel_id=event.channel_id,
                     message_id=event.message_id, author_id=event.user_id, text=question, previous_answer=previous)
-            if self.inflight >= 2:
-                await send("今は別の調査を進めています．少し待ってからお願いします．")
-                return
-            self.inflight += 1
-            entered = True
-            self.activity()
-            if owner_route:
-                await self.process_intake(intake, send)
-                return
-            try:
-                validate_public_text(question, max_chars=4000)
-            except QueryPrivacyError:
-                raise BridgeError("question_not_public") from None
-            if not await asyncio.to_thread(self.ledger.claim, event.message_id):
-                return
             if not owner_route:
-                await send(RECEIPT)
-            task = asyncio.create_task(self.gateway.answer(question, previous))
-            done, _ = await asyncio.wait({task}, timeout=self.progress_seconds)
-            if not done:
-                await send(PROGRESS)
-            answer = await task
-            for part in split_discord_text(answer):
-                answer_id = await send(part)
-                if type(answer_id) is int and answer_id > 0:
-                    await asyncio.to_thread(self.ledger.remember, answer_id, event, part)
+                try:
+                    validate_public_text(question, max_chars=4000)
+                except QueryPrivacyError:
+                    raise BridgeError("question_not_public") from None
+            self.inbox_senders[str(event.message_id)] = send
+            if not self.ledger.enqueue(event, question, previous, intake, self.inbox_consumer):
+                await self.recover_inbox()
+                return
+            if self.drain_token() is not None:
+                self.ledger.inbox_update(str(event.message_id), release=True)
+                self.activity()
+                return
+            queued = self.inbox_lock.locked()
+            self.outbox_inflight += 1
+            self.activity()
+            try:
+                await send(RECEIPT + (" 順番に確認しますので，このままお待ちください．" if queued else ""))
+                self.ledger.inbox_update(str(event.message_id), receipt=True)
+            finally:
+                self.ledger.inbox_update(str(event.message_id), release=True)
+                self.outbox_inflight -= 1
+                self.activity()
+            await self.recover_inbox()
         except asyncio.CancelledError:
             raise
         except BridgeError as exc:
@@ -655,13 +700,92 @@ class RuntimeDiscordBridge:
         except Exception as exc:  # noqa: BLE001 — event boundary reports failure without exposing secrets．
             logging.getLogger(__name__).error("discord_runtime_unexpected_failure:%s", type(exc).__name__)
             await send("処理に失敗しました．結果を確認できていません．")
-        finally:
-            if task is not None and not task.done():
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-            if entered:
-                self.inflight -= 1
+
+    async def recover_inbox(self, send=None) -> None:
+        if self.inbox_lock.locked():
+            return
+        async with self.inbox_lock:
+            while True:
+                if self.drain_token() is not None:
+                    self.activity()
+                    return
+                row = self.ledger.claim_next(self.inbox_consumer)
+                if row is None:
+                    return
+                message = row["message"]
+                deliver = self.inbox_senders.get(message)
+                if deliver is None and send is not None:
+                    async def deliver(text, current=row):
+                        return await send(current, text)
+                if deliver is None:
+                    self.ledger.inbox_update(message, release=True)
+                    return
+                if (int(row["guild"]) != self.settings.guild_id
+                        or int(row["channel"]) not in self.settings.allowed_channel_ids
+                        or int(row["user"]) not in self.settings.allowed_user_ids):
+                    self.ledger.inbox_update(message, done=True, release=True)
+                    continue
+                # No await between drain check and admission/activity count．
+                self.inflight += 1
                 self.activity()
+                task = None
+                terminal = False
+                try:
+                    if not row["receipt"]:
+                        await deliver(RECEIPT)
+                        self.ledger.inbox_update(message, receipt=True)
+                    if row["intake"] is not None:
+                        from .owner_repair import OWNER_USER_ID
+                        if self.repairs is None or int(row["user"]) != OWNER_USER_ID:
+                            raise BridgeError("owner_repair_scope_mismatch")
+                        with self.repairs.db() as db:
+                            db.execute("UPDATE intakes SET receipt=1 WHERE id=?", (row["intake"],))
+                        await self.process_intake(row["intake"], deliver)
+                        with self.repairs.db() as db:
+                            intake = db.execute("SELECT done FROM intakes WHERE id=?", (row["intake"],)).fetchone()
+                        terminal = intake is not None and bool(intake[0])
+                    else:
+                        self.ledger.claim(int(message))
+                        task = asyncio.create_task(self.gateway.answer(row["question"], row["previous"]))
+                        done, _ = await asyncio.wait({task}, timeout=self.progress_seconds)
+                        if not done:
+                            await deliver(PROGRESS)
+                        answer = await task
+                        event = DiscordEvent(int(message), int(row["guild"]), int(row["channel"]),
+                            int(row["user"]), row["question"])
+                        # Preserve existing ambiguous/partial delivery no-replay behavior．
+                        terminal = True
+                        self.ledger.inbox_update(message, done=True)
+                        for part in split_discord_text(answer):
+                            answer_id = await deliver(part)
+                            if type(answer_id) is int and answer_id > 0:
+                                self.ledger.remember(answer_id, event, part)
+                except asyncio.CancelledError:
+                    terminal = row["intake"] is None
+                    raise
+                except BridgeError as exc:
+                    terminal = exc.code != "repair_classification_failed"
+                    await deliver(_FAILURES.get(exc.code, "処理に失敗しました．結果を確認できていません．"))
+                except Exception as exc:  # noqa: BLE001 — private exception text never reaches Discord．
+                    if row["intake"] is not None and self.repairs is not None:
+                        with self.repairs.db() as db:
+                            intake = db.execute("SELECT done FROM intakes WHERE id=?", (row["intake"],)).fetchone()
+                        terminal = intake is not None and bool(intake[0])
+                    else:
+                        terminal = True
+                    logging.getLogger(__name__).error("discord_inbox_failed:%s", type(exc).__name__)
+                    await deliver("処理に失敗しました．結果を確認できていません．")
+                finally:
+                    if task is not None and not task.done():
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                    self.ledger.inbox_update(message, done=terminal, release=True)
+                    self.inflight -= 1
+                    self.activity()
+                    if terminal:
+                        self.inbox_senders.pop(message, None)
+                if not terminal:
+                    return  # A retryable head item must not be overtaken．
 
     async def process_intake(self, identifier: str, send) -> None:
         from .owner_repair import request_release_limits
@@ -737,8 +861,13 @@ class RuntimeDiscordBridge:
             self.intake_active.discard(identifier)
 
     async def recover_intakes(self, send) -> None:
+        await self.recover_inbox(send)
+        if self.ledger.inbox_pending():
+            return
         for row in self.repairs.pending_intakes(guild_id=self.settings.guild_id,
                 channel_ids=self.settings.allowed_channel_ids):
+            if self.ledger.inbox_has(row["message"]):
+                continue
             if self.drain_token() is not None or self.inflight >= 2:
                 self.activity()
                 return
@@ -784,7 +913,10 @@ async def run_discord(settings: DiscordRuntimeSettings) -> int:
                     raise BridgeError("repair_delivery_scope_mismatch")
                 result = await channel.send(text, allowed_mentions=discord.AllowedMentions.none(), suppress_embeds=True)
                 return result.id
-            await bridge.recover_intakes(send)
+            if bridge.repairs is not None:
+                await bridge.recover_intakes(send)
+            else:
+                await bridge.recover_inbox(send)
             await asyncio.sleep(2)
 
     async def drain_outbox():
@@ -814,7 +946,7 @@ async def run_discord(settings: DiscordRuntimeSettings) -> int:
                 outbox_task = asyncio.create_task(drain_outbox())
             if bridge.repairs is not None and (drain_task is None or drain_task.done()):
                 drain_task = asyncio.create_task(bridge.watch_drain())
-            if bridge.repairs is not None and (intake_task is None or intake_task.done()):
+            if intake_task is None or intake_task.done():
                 intake_task = asyncio.create_task(recover_pending())
 
     @client.event

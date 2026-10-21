@@ -6,7 +6,6 @@ import json
 import os
 import subprocess
 import sys
-import threading
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -427,24 +426,19 @@ async def test_drain_watch_acknowledges_only_current_nonce(tmp_path):
 @pytest.mark.asyncio
 async def test_request_waiting_for_ledger_is_not_admitted_after_drain_marker(tmp_path, monkeypatch):
     bridge, gateway, event = bridge_fixture(tmp_path)
-    event = replace(event, user_id=533693210879459338)
-    started, finish = threading.Event(), threading.Event()
+    event = replace(event, user_id=533693210879459338, content="<@10> 公開の質問")
     def previous(_):
-        started.set()
-        assert finish.wait(5)
+        (bridge.settings.state_dir / "repair-drain").write_text("drain-after-await")
     monkeypatch.setattr(bridge.ledger, "previous", previous)
     sent = []
     async def send(text):
         sent.append(text)
-    handler = asyncio.create_task(bridge.handle(event, send))
-    assert await asyncio.to_thread(started.wait, 5)
-    (bridge.settings.state_dir / "repair-drain").write_text("drain-after-await")
-    finish.set()
-    await handler
+    await bridge.handle(event, send)
     assert gateway.classifications == [] and gateway.answers == [] and sent == []
     assert bridge.repairs.next() is None
     state = json.loads((bridge.settings.state_dir / "repair-active.json").read_text())
     assert state["active"] == 0 and state["drain_token"] == "drain-after-await"
+    assert bridge.ledger.inbox_pending()
 
 
 @pytest.mark.asyncio
@@ -714,16 +708,15 @@ async def test_review_revision_owner_intake_crash_replays_without_losing_or_dupl
 async def test_review_revision_concurrent_owner_delivery_enqueues_one_durable_job_before_claim(tmp_path):
     first, _, event = bridge_fixture(tmp_path)
     second, _, _ = bridge_fixture(tmp_path)
-    ready = asyncio.Event()
+    ready, finish = asyncio.Event(), asyncio.Event()
     classifiers = []
     claims = []
     sent = []
 
     async def classify(text, previous):
         classifiers.append((text, previous))
-        if len(classifiers) == 2:
-            ready.set()
-        await ready.wait()
+        ready.set()
+        await finish.wait()
         return True
 
     def guarded_claim(bridge):
@@ -741,10 +734,14 @@ async def test_review_revision_concurrent_owner_delivery_enqueues_one_durable_jo
     async def send(text):
         sent.append(text)
         return len(sent) + 1000
-    await asyncio.wait_for(asyncio.gather(first.handle(event, send), second.handle(event, send)), 10)
+    handler = asyncio.create_task(first.handle(event, send))
+    await asyncio.wait_for(ready.wait(), 10)
+    await second.handle(event, send)
+    finish.set()
+    await asyncio.wait_for(handler, 10)
     with first.repairs.db() as db:
         assert db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 1
-    assert len(classifiers) == 2 and sorted(claims) == [False, True]
+    assert len(classifiers) == 1 and claims == [True]
     assert sum("修正依頼として" in text for text in sent) == 1
     assert first.ledger.seen(event.message_id) and first.inflight == second.inflight == 0
 
@@ -1192,3 +1189,101 @@ def test_review_v13_actual_prepare_emits_new_collection_guard(tmp_path, monkeypa
     with pytest.raises(GateFailure, match="fixture_emitted_collection_guard_checked"):
         discovery.prepare({"text": "synthetic repair", "previous": None}, tmp_path / "discovery")
     assert observed == ["tests/conftest.py", "src/ephy_worker/test_alias.py"]
+
+
+def _discovery_queue_scope_fixture(tmp_path):
+    source = tmp_path / "source"
+    names = ["src/ephy_worker/search.py", "tests/test_search.py"]
+    for name, text in zip(names, ("def search(query):\n    return query\n", "def test_search():\n    assert 1 == 1\n"), strict=True):
+        path = source / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    profile = SimpleNamespace(source=source, allowed_prefixes=("src/", "tests/"))
+    discovery = LocalDiscovery(SimpleNamespace(repositories={"ephy-worker": profile}))
+    selected = {"repository": "ephy-worker", "allowed_files": list(names), "semantic_scope": "Improve search behavior"}
+    return discovery, {"ephy-worker": {"runtime": {}}}, {"ephy-worker": names}, selected
+
+
+def test_discovery_queue_empty_then_read_more_then_real_code_selection(tmp_path, monkeypatch):
+    discovery, templates, inventories, selected = _discovery_queue_scope_fixture(tmp_path)
+    responses = iter([{}, {"read_more": {"ephy-worker": [inventories["ephy-worker"][0]]}}, selected])
+    prompts = []
+    def complete(prompt, _runtime):
+        prompts.append(json.loads(prompt))
+        return next(responses)
+    monkeypatch.setattr(discovery, "completion", complete)
+    directory = tmp_path / "private-diagnostics"
+    assert discovery.select_scope({"text": "Improve search", "previous": None}, templates, inventories, directory) == selected
+    assert "def search(query)" in prompts[0]["code_context"]["ephy-worker"][inventories["ephy-worker"][0]]["text"]
+    assert prompts[1]["previous_selection_error"] == "discovery_scope_empty_or_invalid"
+    assert prompts[2]["previous_selection_error"] == "discovery_read_more_requested"
+    assert json.loads((directory / "scope-attempt-1.response.json").read_text()) == {}
+    assert (directory / "scope-attempt-2.validation.json").is_file()
+
+
+def test_discovery_queue_malformed_selection_retries_and_context_is_bounded(tmp_path, monkeypatch):
+    discovery, templates, inventories, selected = _discovery_queue_scope_fixture(tmp_path)
+    for index in range(12):
+        name = f"src/ephy_worker/search_{index}.py"
+        (discovery.config.repositories["ephy-worker"].source / name).write_text("# search\n" * 9000, encoding="utf-8")
+        inventories["ephy-worker"].append(name)
+    prompts = []
+    def complete(prompt, _runtime):
+        prompts.append(json.loads(prompt))
+        if len(prompts) == 1:
+            raise ValueError("fixture malformed JSON")
+        if len(prompts) == 2:
+            return {}
+        return selected
+    monkeypatch.setattr(discovery, "completion", complete)
+    directory = tmp_path / "private"
+    assert discovery.select_scope({"text": "search", "previous": None}, templates, inventories, directory) == selected
+    assert len(prompts) == 3
+    assert all(len(json.dumps(prompt["code_context"], ensure_ascii=False).encode()) <= 24000 for prompt in prompts)
+    assert json.loads((directory / "scope-attempt-1.error.json").read_text())["type"] == "ValueError"
+
+
+def test_discovery_queue_exhaustion_retains_responses_and_public_explanation(tmp_path, monkeypatch):
+    from ephy_worker.formal_artifacts import GateFailure
+    discovery, templates, inventories, _ = _discovery_queue_scope_fixture(tmp_path)
+    monkeypatch.setattr(discovery, "completion", lambda *_: {})
+    directory = tmp_path / "private"
+    with pytest.raises(GateFailure, match="discovery_scope_exhausted"):
+        discovery.select_scope({"text": "fixture private directive", "previous": "fixture previous"}, templates, inventories, directory)
+    assert len(list(directory.glob("*.response.json"))) == len(list(directory.glob("*.validation.json"))) == 3
+    def fail(*_):
+        raise GateFailure("discovery_scope_exhausted")
+    config = SimpleNamespace(state_dir=tmp_path / "state", guild_id=11, channel_ids=(20,))
+    controller = RepairController(config, discovery=SimpleNamespace(prepare=fail), release=SimpleNamespace())
+    identifier = controller.store.enqueue(**directive())
+    assert controller.tick() and controller.store.get(identifier)["stage"] == "failed"
+    reply = "".join(row["text"] for row in controller.store.pending(guild_id=11, channel_ids=(20,)))
+    assert "変更するファイルとテストを特定できません" in reply and "具体的" in reply
+    assert "fixture private directive" not in reply and "fixture previous" not in reply
+
+
+@pytest.mark.asyncio
+async def test_discovery_queue_owner_retryable_exception_keeps_fifo_head(tmp_path):
+    bridge, gateway, original = bridge_fixture(tmp_path)
+    event = replace(original, content="<@10> 回答の表示を修正して")
+    attempts = 0
+    async def classify(text, previous):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("fixture transient transport failure")
+        return True
+    gateway.classify_repair = classify
+    sent = []
+    async def send(text):
+        sent.append(text)
+    await bridge.handle(event, send)
+    assert bridge.ledger.inbox_pending() and bridge.repairs.next() is None
+    async def recovered(_row, text):
+        sent.append(text)
+    await bridge.recover_intakes(recovered)
+    await bridge.recover_intakes(recovered)
+    assert attempts == 2 and bridge.repairs.next() is not None and not bridge.ledger.inbox_pending()
+    with bridge.repairs.db() as db:
+        assert db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 1
+    assert sent.count(RECEIPT) == 1

@@ -212,7 +212,10 @@ class RepairController:
             # Avoid returning source/checker exception text or credentials to Discord．
             write_json(directory / "failure.json", {"type": type(exc).__name__, "error": str(exc)[:8192],
                 "stage": self.store.get(job["id"])["stage"]})
-            self.store.finish(job["id"], "failed", "修正を進めましたが，検証または反映の条件を満たせず停止しました．"
+            reason = ("関連コードを追加で確認しましたが，変更するファイルとテストを特定できませんでした．"
+                "直したい動作や該当機能をもう少し具体的に教えてください．" if str(exc) == "discovery_scope_exhausted" else
+                "修正を進めましたが，検証または反映の条件を満たせず停止しました．")
+            self.store.finish(job["id"], "failed", reason +
                 "完了した変更としては扱っていません．調査と実行記録は保存しています．",
                 error_type=type(exc).__name__, failure_sha256=file_hash(directory / "failure.json"))
             return True
