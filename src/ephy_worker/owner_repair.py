@@ -68,27 +68,36 @@ class RepairStore:
             db.execute("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, guild TEXT, channel TEXT, message TEXT, author TEXT, text TEXT, previous TEXT, stage TEXT, data TEXT, created REAL, updated REAL, UNIQUE(guild,channel,message))")
             db.execute("CREATE TABLE IF NOT EXISTS outbox (job TEXT, ordinal INTEGER, text TEXT, state TEXT, message TEXT, PRIMARY KEY(job,ordinal))")
             db.execute("CREATE TABLE IF NOT EXISTS intakes (id TEXT PRIMARY KEY,guild TEXT,channel TEXT,message TEXT,author TEXT,text TEXT,previous TEXT,route TEXT,receipt INTEGER,done INTEGER,consumer TEXT,created REAL,UNIQUE(guild,channel,message))")
+            if "community_context" not in {row["name"] for row in db.execute("PRAGMA table_info(intakes)")}:
+                db.execute("ALTER TABLE intakes ADD COLUMN community_context TEXT")
 
     def capture_intake(self, *, guild_id: int, channel_id: int, message_id: int, author_id: int,
-                       text: str, previous_answer: str | None = None) -> str:
+                       text: str, previous_answer: str | None = None, community_context: dict | None = None) -> str:
         if type(author_id) is not int or author_id != OWNER_USER_ID:
             raise ValueError("repair_owner_required")
         if (any(type(value) is not int or not 0 < value < 2**64 for value in (guild_id, channel_id, message_id))
                 or not isinstance(text, str) or not text.strip() or len(text) > 4000
                 or previous_answer is not None and (not isinstance(previous_answer, str) or len(previous_answer) > 8000)):
             raise ValueError("repair_intake_invalid")
+        if community_context is not None and (
+                not isinstance(community_context, dict) or set(community_context) != {"operation", "period_days"}
+                or community_context["operation"] not in ("report", "snapshot", "activity", "discussion", "unresolved")
+                or type(community_context["period_days"]) is not int or community_context["period_days"] not in (7, 30)):
+            raise ValueError("repair_context_invalid")
+        context = json.dumps(community_context, sort_keys=True, separators=(",", ":")) if community_context else None
         identifier = "repair-" + hashlib.sha256(f"{guild_id}:{channel_id}:{message_id}:{author_id}".encode()).hexdigest()[:32]
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
             old = db.execute("SELECT * FROM intakes WHERE id=?", (identifier,)).fetchone()
             if old:
-                if old["text"] != text or old["previous"] != previous_answer:
+                if old["text"] != text or old["previous"] != previous_answer or old["community_context"] != context:
                     raise RuntimeError("duplicate_repair_payload_changed")
             else:
                 if db.execute("SELECT count(*) FROM intakes").fetchone()[0] >= 10000:
                     raise RuntimeError("repair_queue_full")
-                db.execute("INSERT INTO intakes VALUES (?,?,?,?,?,?,?,NULL,0,0,NULL,?)", (identifier,
-                    str(guild_id), str(channel_id), str(message_id), str(author_id), text, previous_answer, time.time()))
+                db.execute("INSERT INTO intakes(id,guild,channel,message,author,text,previous,route,receipt,done,consumer,created,community_context) "
+                    "VALUES (?,?,?,?,?,?,?,NULL,0,0,NULL,?,?)", (identifier,
+                    str(guild_id), str(channel_id), str(message_id), str(author_id), text, previous_answer, time.time(), context))
         return identifier
 
     def pending_intakes(self, *, guild_id: int, channel_ids: tuple[int, ...]) -> list[dict]:

@@ -49,6 +49,25 @@ class BridgeError(RuntimeError):
         super().__init__(code)
 
 
+def _community_context(value: str | dict | None) -> dict | None:
+    if value is None:
+        return None
+    try:
+        context = json.loads(value) if isinstance(value, str) else value
+    except (ValueError, TypeError):
+        raise BridgeError("community_context_invalid") from None
+    if (not isinstance(context, dict) or set(context) != {"operation", "period_days"}
+            or context["operation"] not in ("report", "snapshot", "activity", "discussion", "unresolved")
+            or type(context["period_days"]) is not int or context["period_days"] not in (7, 30)):
+        raise BridgeError("community_context_invalid")
+    return {"operation": context["operation"], "period_days": context["period_days"]}
+
+
+def _community_context_json(value: dict | None) -> str | None:
+    context = _community_context(value)
+    return json.dumps(context, sort_keys=True, separators=(",", ":")) if context else None
+
+
 class DiscordChannel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     guild_id: Snowflake
@@ -565,7 +584,10 @@ class BridgeLedger:
             db.execute("CREATE TABLE IF NOT EXISTS inbox (sequence INTEGER PRIMARY KEY AUTOINCREMENT, message TEXT UNIQUE, "
                 "guild TEXT, channel TEXT, user TEXT, question TEXT, previous TEXT, intake TEXT, "
                 "receipt INTEGER DEFAULT 0, done INTEGER DEFAULT 0, consumer TEXT)")
-            db.execute("UPDATE inbox SET question='',previous=NULL WHERE done=1")
+            for table in ("answers", "inbox"):
+                if "community_context" not in {row[1] for row in db.execute(f"PRAGMA table_info({table})")}:
+                    db.execute(f"ALTER TABLE {table} ADD COLUMN community_context TEXT")
+            db.execute("UPDATE inbox SET question='',previous=NULL,community_context=NULL WHERE done=1")
             self._prune_inbox(db)
 
     @staticmethod
@@ -589,15 +611,17 @@ class BridgeLedger:
                 self._check_capacity(db)
 
     def enqueue(self, event: DiscordEvent, question: str, previous: str | None, intake: str | None,
-                consumer: str | None = None) -> bool:
+                consumer: str | None = None, *, community_context: dict | None = None) -> bool:
+        context = _community_context_json(community_context)
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             if db.execute("SELECT 1 FROM inbox WHERE message=?", (str(event.message_id),)).fetchone() or db.execute(
                     "SELECT 1 FROM requests WHERE id=?", (str(event.message_id),)).fetchone():
                 return False
             self._check_capacity(db)
-            db.execute("INSERT INTO inbox(message,guild,channel,user,question,previous,intake,consumer) VALUES (?,?,?,?,?,?,?,?)",
-                (str(event.message_id), str(event.guild_id), str(event.channel_id), str(event.user_id), question, previous, intake, consumer))
+            db.execute("INSERT INTO inbox(message,guild,channel,user,question,previous,intake,consumer,community_context) VALUES (?,?,?,?,?,?,?,?,?)",
+                (str(event.message_id), str(event.guild_id), str(event.channel_id), str(event.user_id),
+                 question, previous, intake, consumer, context))
             return True
 
     def inbox_has(self, message: str) -> bool:
@@ -632,7 +656,7 @@ class BridgeLedger:
             if receipt:
                 db.execute("UPDATE inbox SET receipt=1 WHERE message=?", (str(message),))
             if done:
-                db.execute("UPDATE inbox SET done=1,question='',previous=NULL WHERE message=?", (str(message),))
+                db.execute("UPDATE inbox SET done=1,question='',previous=NULL,community_context=NULL WHERE message=?", (str(message),))
                 self._prune_inbox(db)
             if release:
                 db.execute("UPDATE inbox SET consumer=NULL WHERE message=?", (str(message),))
@@ -680,14 +704,26 @@ class BridgeLedger:
                 (str(event.reply_to), str(event.guild_id), str(event.channel_id), str(event.user_id), time.time() - 86400)).fetchone()
             return row[0] if row else None
 
-    def remember(self, answer_id: int, event: DiscordEvent, content: str) -> None:
+    def previous_context(self, event: DiscordEvent) -> tuple[str | None, dict | None]:
+        content = self.previous(event)
+        if content is None:
+            return None, None
         with self._db() as db:
-            db.execute("INSERT OR REPLACE INTO answers VALUES (?,?,?,?,?,?)", (str(answer_id), str(event.guild_id),
-                str(event.channel_id), str(event.user_id), bounded_text(content, 1200), time.time()))
+            row = db.execute("SELECT content,community_context FROM answers WHERE id=? AND guild=? AND channel=? AND user=? AND created>?",
+                (str(event.reply_to), str(event.guild_id), str(event.channel_id), str(event.user_id), time.time() - 86400)).fetchone()
+            return (row[0], _community_context(row[1])) if row and row[0] == content else (None, None)
+
+    def remember(self, answer_id: int, event: DiscordEvent, content: str, *, community_context: dict | None = None) -> None:
+        context = _community_context_json(community_context)
+        with self._db() as db:
+            db.execute("INSERT OR REPLACE INTO answers(id,guild,channel,user,content,created,community_context) VALUES (?,?,?,?,?,?,?)",
+                (str(answer_id), str(event.guild_id), str(event.channel_id), str(event.user_id),
+                 bounded_text(content, 1200), time.time(), context))
             db.execute("DELETE FROM answers WHERE id NOT IN (SELECT id FROM answers ORDER BY created DESC LIMIT 128)")
 
 
 _FAILURES = {
+    "community_context_unavailable": "この返信のコミュニティ情報は，現在の観測設定では利用できません．外部検索へは渡していません．",
     "runtime_observation_stalled": "コミュニティ調査の進捗を一定時間確認できなかったため，待機を停止しました．完了した結果は確認できていません．",
     "search_confirmation_required": "この検索は確認が必要なため，実行していません．",
     "search_blocked": "この内容は検索できません．検索は実行していません．",
@@ -782,24 +818,26 @@ class RuntimeDiscordBridge:
             owner_route = (self.repairs is not None and event.user_id == OWNER_USER_ID
                 and event.guild_id == self.settings.guild_id
                 and event.channel_id in self.settings.allowed_channel_ids)
-            previous = self.ledger.previous(event)
+            previous, previous_community = self.ledger.previous_context(event)
             if not event.mentioned and previous is None:
                 return
             question = re.sub(rf"<@!?{self.settings.application_id}>", "", event.content).strip()
             from .discord_community import community_intent
-            community = event.guild_id in self.settings.community_guild_ids and community_intent(question)
+            intent = community_intent(question) if event.guild_id in self.settings.community_guild_ids else None
+            community = intent._asdict() if intent else previous_community
             self.ledger.check_admission(event.message_id)
             intake = None
             if owner_route:
                 # Local durable capture precedes the first receipt/model/network await．
                 intake = self.repairs.capture_intake(guild_id=event.guild_id, channel_id=event.channel_id,
-                    message_id=event.message_id, author_id=event.user_id, text=question, previous_answer=previous)
+                    message_id=event.message_id, author_id=event.user_id, text=question, previous_answer=previous,
+                    community_context=community)
             if not owner_route and not community:
                 try:
                     validate_public_text(question, max_chars=4000)
                 except QueryPrivacyError:
                     raise BridgeError("question_not_public") from None
-            if not self.ledger.enqueue(event, question, previous, intake, self.inbox_consumer):
+            if not self.ledger.enqueue(event, question, previous, intake, self.inbox_consumer, community_context=community):
                 if self.ledger.inbox_pending(event.message_id):
                     self.inbox_senders[str(event.message_id)] = send
                     await self.recover_inbox()
@@ -827,6 +865,15 @@ class RuntimeDiscordBridge:
         except Exception as exc:  # noqa: BLE001 — event boundary reports failure without exposing secrets．
             logging.getLogger(__name__).error("discord_runtime_unexpected_failure:%s", type(exc).__name__)
             await send("処理に失敗しました．結果を確認できていません．")
+
+    def _community_route(self, question: str, guild_id: int, context: str | dict | None):
+        from .discord_community import CommunityIntent, community_intent
+        stored = _community_context(context)
+        if guild_id not in self.settings.community_guild_ids:
+            if stored:
+                raise BridgeError("community_context_unavailable")
+            return None
+        return CommunityIntent(**stored) if stored else community_intent(question)
 
     async def recover_inbox(self, send=None) -> None:
         if self.inbox_lock.locked():
@@ -881,8 +928,7 @@ class RuntimeDiscordBridge:
                             self.ledger.inbox_update(message, done=True)
                             await deliver(_INTERRUPTED)
                             continue
-                        from .discord_community import community_intent
-                        intent = community_intent(row["question"]) if int(row["guild"]) in self.settings.community_guild_ids else None
+                        intent = self._community_route(row["question"], int(row["guild"]), row["community_context"])
                         if intent:
                             task = asyncio.create_task(self.gateway.observe(row["question"], row["previous"],
                                 request_id=message, guild_id=row["guild"], channel_id=row["channel"],
@@ -906,7 +952,8 @@ class RuntimeDiscordBridge:
                         for part in split_discord_text(answer):
                             answer_id = await deliver(part)
                             if type(answer_id) is int and answer_id > 0:
-                                self.ledger.remember(answer_id, event, part)
+                                self.ledger.remember(answer_id, event, part,
+                                    community_context=intent._asdict() if intent else None)
                 except asyncio.CancelledError:
                     terminal = row["intake"] is None and execution_recorded
                     raise
@@ -978,8 +1025,7 @@ class RuntimeDiscordBridge:
                     await send("修正依頼として受け付けました．修正，テストと独立レビューを進め，"
                         "条件を満たしたら本番への反映と再起動まで行います．受付番号：" + job)
                 return
-            from .discord_community import community_intent
-            intent = community_intent(row["text"]) if int(row["guild"]) in self.settings.community_guild_ids else None
+            intent = self._community_route(row["text"], int(row["guild"]), row["community_context"])
             if not intent:
                 try:
                     validate_public_text(row["text"], max_chars=4000)
@@ -1005,7 +1051,7 @@ class RuntimeDiscordBridge:
             for part in split_discord_text(answer):
                 answer_id = await send(part)
                 if type(answer_id) is int and answer_id > 0:
-                    self.ledger.remember(answer_id, event, part)
+                    self.ledger.remember(answer_id, event, part, community_context=intent._asdict() if intent else None)
             self.repairs.update_intake(identifier, self.intake_consumer, done=True)
         except BridgeError as exc:
             if exc.code != "repair_classification_failed":

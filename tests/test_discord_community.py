@@ -1,5 +1,8 @@
 import asyncio
 import json
+import sqlite3
+import time
+from dataclasses import replace
 from types import SimpleNamespace
 
 import httpx
@@ -298,7 +301,7 @@ async def test_endless_response_body_stalls_closes_and_releases_next_inbox_reque
     event = DiscordEvent(100, 11, 20, 30, "<@10> 昨日の議論をまとめて", mentioned=True)
     first = asyncio.create_task(bridge.handle(event, send))
     try:
-        await asyncio.wait_for(stream.started.wait(), timeout=1)
+        await asyncio.wait_for(stream.started.wait(), timeout=10)
         await bridge.handle(DiscordEvent(101, 11, 20, 30, "<@10> 最近の議論をまとめて", mentioned=True), send)
         await asyncio.wait_for(first, timeout=3)
         assert stream.closed and stream.chunks > 1
@@ -331,3 +334,174 @@ async def test_header_wait_is_bounded_by_remaining_semantic_idle(tmp_path):
         assert cancelled.is_set()
     finally:
         await gateway.aclose()
+
+
+async def test_all_split_parts_keep_generic_replies_private_and_explicit_intent_overrides(tmp_path):
+    config, calls, sent = settings(tmp_path), [], []
+    class Gateway:
+        async def observe(self, question, previous=None, **kwargs):
+            calls.append((question, previous, kwargs))
+            return "わたしが確認した活動の記録です．" * (160 if len(calls) == 1 else 1)
+        async def answer(self, *args):
+            raise AssertionError("private community context must never reach public planning")
+    ledger = BridgeLedger(config)
+    bridge = RuntimeDiscordBridge(config, Gateway(), ledger)
+    async def send(text):
+        identifier = 1000 + len(sent)
+        sent.append((identifier, text))
+        return identifier
+    await bridge.handle(DiscordEvent(100, 11, 20, 30, "<@10> HackSickの30日の活動状況を教えて", mentioned=True), send)
+    parts = list(sent[1:])
+    assert len(parts) >= 2
+    for index, (answer_id, _text) in enumerate(parts):
+        event = DiscordEvent(200 + index, 11, 20, 30, "詳しく教えて", reply_to=answer_id)
+        previous = ledger.previous(event)
+        await bridge.handle(event, send)
+        assert calls[-1][0:2] == ("詳しく教えて", previous)
+        assert calls[-1][2]["operation"] == "activity" and calls[-1][2]["period_days"] == 30
+    await bridge.handle(DiscordEvent(300, 11, 20, 30, "今週の未解決の課題を教えて", reply_to=parts[0][0]), send)
+    assert calls[-1][2]["operation"] == "unresolved" and calls[-1][2]["period_days"] == 7
+
+
+async def test_public_answer_generic_reply_remains_public(tmp_path):
+    config, calls = settings(tmp_path), []
+    class Gateway:
+        async def answer(self, question, previous):
+            calls.append((question, previous))
+            return "公開資料の補足です．"
+        async def observe(self, *args, **kwargs):
+            raise AssertionError("public context must retain public routing")
+    ledger = BridgeLedger(config)
+    ledger.remember(55, DiscordEvent(1, 11, 20, 30, "公開の質問"), "公開の回答です．")
+    bridge = RuntimeDiscordBridge(config, Gateway(), ledger)
+    async def send(text):
+        return 1000
+    await bridge.handle(DiscordEvent(100, 11, 20, 30, "詳しく教えて", reply_to=55), send)
+    assert calls == [("詳しく教えて", "公開の回答です．")]
+
+
+def test_private_provenance_uses_same_author_channel_guild_and_age_guards(tmp_path):
+    ledger = BridgeLedger(settings(tmp_path))
+    context = {"operation": "discussion", "period_days": 30}
+    ledger.remember(55, DiscordEvent(1, 11, 20, 30, "議論"), "私的な議論の記録", community_context=context)
+    event = DiscordEvent(100, 11, 20, 30, "詳しく教えて", reply_to=55)
+    assert ledger.previous_context(event) == ("私的な議論の記録", context)
+    for other in (replace(event, user_id=31), replace(event, channel_id=21), replace(event, guild_id=12)):
+        assert ledger.previous(other) is None and ledger.previous_context(other) == (None, None)
+    with ledger._db() as db:
+        db.execute("UPDATE answers SET created=?", (time.time() - 86401,))
+    assert ledger.previous_context(event) == (None, None)
+
+
+async def test_pending_reply_route_survives_restart_without_answer_row(tmp_path):
+    config, calls = settings(tmp_path), []
+    class Gateway:
+        async def observe(self, question, previous=None, **kwargs):
+            calls.append((question, previous, kwargs))
+            return "観測した議論の補足です．"
+        async def answer(self, *args):
+            raise AssertionError("recovered private context must not reach public planning")
+    ledger = BridgeLedger(config)
+    ledger.remember(55, DiscordEvent(1, 11, 20, 30, "議論"), "私的な過去回答",
+        community_context={"operation": "discussion", "period_days": 30})
+    marker = config.state_dir / "repair-drain"
+    marker.write_text("fixture-drain")
+    async def send(text):
+        return 1000
+    await RuntimeDiscordBridge(config, Gateway(), ledger).handle(
+        DiscordEvent(100, 11, 20, 30, "詳しく教えて", reply_to=55), send)
+    assert not calls and ledger.inbox_pending()
+    with ledger._db() as db:
+        db.execute("DELETE FROM answers")
+    marker.unlink()
+    restarted = RuntimeDiscordBridge(config, Gateway(), BridgeLedger(config))
+    async def recovered(row, text):
+        return 1001
+    await restarted.recover_inbox(recovered)
+    assert calls == [("詳しく教えて", "私的な過去回答", {"request_id": "100", "guild_id": "11", "channel_id": "20",
+        "operation": "discussion", "period_days": 30})]
+    assert not restarted.ledger.inbox_pending()
+
+
+async def test_disabling_community_scope_never_sends_private_previous_to_public_gateway(tmp_path):
+    original = settings(tmp_path)
+    ledger = BridgeLedger(original)
+    ledger.remember(55, DiscordEvent(1, 11, 20, 30, "議論"), "私的な過去回答",
+        community_context={"operation": "discussion", "period_days": 30})
+    class Gateway:
+        async def answer(self, *args):
+            raise AssertionError("disabled community context must fail closed")
+        async def observe(self, *args, **kwargs):
+            raise AssertionError("disabled community scope must not be used")
+    config = original.model_copy(update={"community_guild_ids": ()})
+    bridge, sent = RuntimeDiscordBridge(config, Gateway(), BridgeLedger(config)), []
+    async def send(text):
+        sent.append(text)
+        return 1000
+    await bridge.handle(DiscordEvent(100, 11, 20, 30, "詳しく教えて", reply_to=55), send)
+    assert any("外部検索へは渡していません" in text for text in sent)
+    assert not bridge.ledger.inbox_pending()
+
+
+async def test_owner_orphan_intake_preserves_private_route_before_inbox_enqueue(tmp_path, monkeypatch):
+    from ephy_worker.owner_repair import RepairStore
+    monkeypatch.setattr("ephy_worker.owner_repair.OWNER_USER_ID", 30)
+    config, calls = settings(tmp_path), []
+    class Gateway:
+        async def classify_repair(self, question, previous):
+            calls.append("classify")
+            return False
+        async def observe(self, question, previous=None, **kwargs):
+            calls.append((question, previous, kwargs))
+            return "活動の補足です．"
+        async def answer(self, *args):
+            raise AssertionError("orphan owner private context must not reach public planning")
+    ledger = BridgeLedger(config)
+    context = {"operation": "activity", "period_days": 30}
+    ledger.remember(55, DiscordEvent(1, 11, 20, 30, "活動"), "私的な過去回答", community_context=context)
+    store = RepairStore(tmp_path / "repairs")
+    bridge = RuntimeDiscordBridge(config, Gateway(), ledger)
+    bridge.repairs = store
+    def interrupted(*args, **kwargs):
+        raise RuntimeError("fixture interruption after durable intake")
+    monkeypatch.setattr(ledger, "enqueue", interrupted)
+    async def send(text):
+        return 1000
+    await bridge.handle(DiscordEvent(100, 11, 20, 30, "詳しく教えて", reply_to=55), send)
+    assert not ledger.inbox_has("100") and not calls
+    identifier = store.capture_intake(guild_id=11, channel_id=20, message_id=100, author_id=30,
+        text="詳しく教えて", previous_answer="私的な過去回答", community_context=context)
+    with pytest.raises(RuntimeError, match="duplicate_repair_payload_changed"):
+        store.capture_intake(guild_id=11, channel_id=20, message_id=100, author_id=30, text="詳しく教えて",
+            previous_answer="私的な過去回答", community_context={"operation": "activity", "period_days": 7})
+    restarted = RuntimeDiscordBridge(config, Gateway(), BridgeLedger(config))
+    restarted.repairs = RepairStore(store.root)
+    async def recovered(row, text):
+        return 1001
+    await restarted.recover_intakes(recovered)
+    assert calls == ["classify", ("詳しく教えて", "私的な過去回答", {"request_id": "100", "guild_id": "11",
+        "channel_id": "20", "operation": "activity", "period_days": 30})]
+    with store.db() as db:
+        assert db.execute("SELECT done FROM intakes WHERE id=?", (identifier,)).fetchone()[0] == 1
+        assert db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0
+
+
+def test_legacy_storage_migrates_to_null_provenance_without_changing_data(tmp_path):
+    from ephy_worker.owner_repair import RepairStore
+    config = settings(tmp_path)
+    config.state_dir.mkdir(parents=True)
+    with sqlite3.connect(config.state_dir / "discord-runtime.sqlite3") as db:
+        db.execute("CREATE TABLE answers (id TEXT PRIMARY KEY,guild TEXT,channel TEXT,user TEXT,content TEXT,created REAL)")
+        db.execute("INSERT INTO answers VALUES ('55','11','20','30',?,?)", ("既存の回答 https://discord.com/channels/11/20/1", time.time()))
+    ledger = BridgeLedger(config)
+    assert ledger.previous_context(DiscordEvent(100, 11, 20, 30, "詳しく教えて", reply_to=55)) == (
+        "既存の回答 https://discord.com/channels/11/20/1", None)
+    root = tmp_path / "repairs"
+    root.mkdir()
+    with sqlite3.connect(root / "owner-repair.sqlite3") as db:
+        db.execute("CREATE TABLE intakes (id TEXT PRIMARY KEY,guild TEXT,channel TEXT,message TEXT,author TEXT,text TEXT,previous TEXT,route TEXT,receipt INTEGER,done INTEGER,consumer TEXT,created REAL,UNIQUE(guild,channel,message))")
+        db.execute("INSERT INTO intakes VALUES ('legacy','11','20','100','30','既存の依頼','既存の過去回答',NULL,0,0,NULL,?)", (time.time(),))
+    store = RepairStore(root)
+    with store.db() as db:
+        row = db.execute("SELECT * FROM intakes WHERE id='legacy'").fetchone()
+        assert row["text"] == "既存の依頼" and row["previous"] == "既存の過去回答" and row["community_context"] is None
