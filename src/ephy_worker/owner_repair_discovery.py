@@ -5,12 +5,22 @@ from __future__ import annotations
 import ast
 import inspect
 import json
+import re
 import subprocess
 from pathlib import Path
 
 import httpx
 
-from .formal_artifacts import CONTROL_PATHS, GateFailure, digest, encode, file_hash, read_json, write_json
+from .formal_artifacts import (
+    CONTROL_PATHS,
+    GateFailure,
+    digest,
+    encode,
+    file_hash,
+    read_json,
+    safe_path,
+    write_json,
+)
 from .formal_runtime import (
     command_environment,
     injected_context_pins,
@@ -518,6 +528,21 @@ def registered_test_subjects(original: str, sources: dict[str, str | None]) -> t
 class LocalDiscovery:
     def __init__(self, config):
         self.config = config
+        self.response_path = None
+
+    def ask(self, prompt: str, runtime: dict, directory: Path, stage: str) -> dict:
+        """Retain private model evidence even when parsing or validation fails．"""
+        directory.mkdir(parents=True, exist_ok=True)
+        self.response_path = directory / (stage + ".raw.json")
+        try:
+            response = self.completion(prompt, runtime)
+            write_json(directory / (stage + ".response.json"), response)
+            return response
+        except Exception as exc:
+            write_json(directory / (stage + ".error.json"), {"type": type(exc).__name__, "error": str(exc)[:8192]})
+            raise
+        finally:
+            self.response_path = None
 
     def completion(self, prompt: str, runtime: dict) -> dict:
         from .existing_llama_runtime import verify_identity
@@ -543,8 +568,10 @@ class LocalDiscovery:
                 raise GateFailure("contract_incomplete:discovery_context_budget_exceeded")
             response = client.post(runtime["base_url"] + "/v1/chat/completions", json={
                 "model": identity["model_id"], "stream": False, "temperature": 0,
-                "max_tokens": 4096, "messages": messages})
+                "max_tokens": 4096, "messages": messages, "response_format": {"type": "json_object"}})
         response.raise_for_status()
+        if self.response_path is not None and len(response.content) <= 2097152:
+            self.response_path.write_bytes(response.content)
         if len(response.content) > 2097152:
             raise GateFailure("discovery_response_too_large")
         verify_identity(identity)
@@ -553,25 +580,168 @@ class LocalDiscovery:
             raise GateFailure("contract_incomplete:discovery_generation_incomplete")
         return strict_object(choice["message"]["content"])
 
+    def select_scope(self, job: dict, templates: dict, inventories: dict, directory: Path) -> dict:
+        """Read bounded real code before selecting scope, with explicit read-more rounds．"""
+        runtime = next(iter(templates.values()))["runtime"]
+        query = job["text"].casefold()
+        terms = set(re.findall(r"[a-z_][a-z0-9_-]{2,}", query))
+        for word, extra in (("検索", "search web tool"), ("reasoning", "reasoning prompt llm harness"),
+                ("返信", "discord reply answer"), ("回答", "answer response")):
+            if word in query:
+                terms.update(extra.split())
+        ranked = []
+        for alias, names in inventories.items():
+            for name in names:
+                profile = self.config.repositories[alias]
+                if not allowed_name(name, profile):
+                    continue
+                path = safe_path(profile.source, name, missing=True)
+                if not path.is_file() or path.is_symlink() or path.stat().st_size > 131072:
+                    continue
+                text = path.read_text(encoding="utf-8")
+                score = sum(5 * (term in name.casefold()) + min(text.casefold().count(term), 4) for term in terms)
+                ranked.append((score, alias, name, text))
+        ranked.sort(key=lambda row: (-row[0], row[1], row[2]))
+        context = {}
+        requested_context = set()
+
+        def include_excerpts(matches, *, limit=24000, maximum=4000, automatic=False):
+            # Allocate the whole batch before committing; accepted requested code is immutable．
+            proposed = {alias: dict(files) for alias, files in context.items()}
+            pending = []
+            for _, alias, name, text in matches:
+                if (alias, name) in requested_context:
+                    continue
+                start = 0
+                window_truncated = False
+                if automatic:
+                    original = text
+                    lines = text.splitlines()
+                    hits = [index for index, line in enumerate(lines) if any(term in line.casefold() for term in terms)]
+                    start = max(0, hits[0] - 8) if hits else 0
+                    text = "\n".join(lines[start:start + 100])
+                    window_truncated = text != original
+                entry = {"start_line": start + 1, "text": "", "truncated": True, "utf8_bytes": 0}
+                proposed.setdefault(alias, {})[name] = entry
+                pending.append((entry, text, window_truncated))
+            if not pending:
+                return
+            available = limit - len(json.dumps(proposed, ensure_ascii=False).encode("utf-8")) - 8 * len(pending)
+            share = min(maximum, available // len(pending))
+            if any(share < min(256, len(json.dumps(text, ensure_ascii=False).encode("utf-8")) - 2) for _, text, _ in pending):
+                raise GateFailure("discovery_context_request_too_large")
+            for entry, text, window_truncated in pending:
+                low, high = 0, len(text)
+                while low < high:
+                    middle = (low + high + 1) // 2
+                    if len(json.dumps(text[:middle], ensure_ascii=False).encode("utf-8")) - 2 <= share:
+                        low = middle
+                    else:
+                        high = middle - 1
+                excerpt = text[:low]
+                entry.update(text=excerpt, truncated=window_truncated or low < len(text), utf8_bytes=len(excerpt.encode("utf-8")))
+            if len(json.dumps(proposed, ensure_ascii=False).encode("utf-8")) > limit:
+                raise GateFailure("discovery_context_request_too_large")
+            context.clear()
+            context.update(proposed)
+            if not automatic:
+                requested_context.update((alias, name) for _, alias, name, _ in matches)
+
+        cursor = 0
+        feedback = None
+        for attempt in range(1, 4):
+            # Expand retrieval automatically after an empty/invalid answer, without inventing scope．
+            added = 0
+            automatic_count = 0 if feedback in {"discovery_read_more_requested", "discovery_scope_confirmation_required",
+                "discovery_context_request_too_large"} else (6 if attempt == 1 else 4)
+            while cursor < len(ranked) and added < automatic_count:
+                match = ranked[cursor]
+                _, alias, name, _ = match
+                cursor += 1
+                if name in context.get(alias, {}):
+                    continue
+                try:
+                    include_excerpts([match], limit=12000 if attempt == 1 else 24000, maximum=1500, automatic=True)
+                except GateFailure:
+                    break
+                added += 1
+            prompt = {"request": job["text"], "previous_answer": job.get("previous"),
+                "repositories": inventories, "code_context": context, "previous_selection_error": feedback,
+                "response_schema": {"repository": "registered alias", "allowed_files": ["up to12 exact source/test/doc paths"],
+                    "semantic_scope": "short public-safe repair and acceptance summary"},
+                "read_more_schema": {"read_more": {"registered alias": ["up to4 existing paths to inspect"]}},
+                "instruction": "Inspect the supplied real code and select a bounded implementation repair with an existing tests file. "
+                    "Only confirm selected existing files after inspecting their supplied code_context. Unseen selections will "
+                    "receive code and need confirmation in the next round. Excerpts are explicitly bounded/truncated; accepted "
+                    "read_more excerpts remain available. If a batch exceeds remaining context space, request fewer files. "
+                    "If more code is needed, return only read_more instead of an empty object. Do not change governance, secrets, "
+                    "repair controller, Discord authorization, release settings or unrelated code. Protected paths stay forbidden. "
+                    "semantic_scope is a public-safe implementation summary, not a quotation of the private request/context."}
+            try:
+                initial = self.ask(json.dumps(prompt, ensure_ascii=False), runtime, directory, "scope-attempt-" + str(attempt))
+                if set(initial) == {"read_more"}:
+                    requested = initial["read_more"]
+                    if not isinstance(requested, dict) or not requested or sum(len(names) for names in requested.values() if isinstance(names, list)) > 4:
+                        raise GateFailure("discovery_read_more_invalid")
+                    matches = []
+                    for alias, names in requested.items():
+                        if alias not in inventories or not isinstance(names, list) or not names:
+                            raise GateFailure("discovery_read_more_invalid")
+                        for name in names:
+                            match = next((row for row in ranked if row[1] == alias and row[2] == name), None)
+                            if match is None:
+                                raise GateFailure("discovery_read_more_protected_or_unknown")
+                            matches.append(match)
+                    if len({(row[1], row[2]) for row in matches}) != len(matches):
+                        raise GateFailure("discovery_read_more_invalid")
+                    include_excerpts(matches)
+                    raise GateFailure("discovery_read_more_requested")
+                if (set(initial) != {"repository", "allowed_files", "semantic_scope"}
+                        or initial["repository"] not in self.config.repositories):
+                    raise GateFailure("discovery_scope_empty_or_invalid")
+                profile = self.config.repositories[initial["repository"]]
+                names = initial["allowed_files"]
+                if (not isinstance(names, list) or not 1 <= len(names) <= 12
+                        or any(not isinstance(name, str) or not allowed_name(name, profile) for name in names)
+                        or len(set(names)) != len(names)
+                        or not any(name.startswith("tests/") and (profile.source / name).is_file() for name in names)
+                        or not isinstance(initial["semantic_scope"], str) or not initial["semantic_scope"].strip()):
+                    raise GateFailure("discovery_scope_protected_or_missing_tests")
+                unseen = []
+                for name in names:
+                    if (profile.source / name).exists() and name not in context.get(initial["repository"], {}):
+                        match = next((row for row in ranked if row[1] == initial["repository"] and row[2] == name), None)
+                        if match is None:
+                            raise GateFailure("discovery_selected_source_unreadable")
+                        unseen.append(match)
+                if unseen:
+                    include_excerpts(unseen)
+                    raise GateFailure("discovery_scope_confirmation_required")
+                return initial
+            except (GateFailure, TypeError, ValueError) as exc:
+                if isinstance(exc, GateFailure) and not str(exc).startswith("discovery_"):
+                    raise
+                feedback = str(exc)
+                write_json(directory / ("scope-attempt-" + str(attempt) + ".validation.json"), {"error": feedback})
+        raise GateFailure("discovery_scope_exhausted")
+
     def prepare(self, job: dict, directory: Path) -> dict:
         templates = {}
         for alias, profile in self.config.repositories.items():
             if file_hash(profile.formal_template) != profile.formal_template_sha256:
                 raise GateFailure("formal_template_changed")
             templates[alias] = read_json(profile.formal_template)
-        # Both registered repositories use the same pinned running local service．
-        runtime = next(iter(templates.values()))["runtime"]
         inventories = {}
+        preflight_snapshots = {}
         for alias, profile in self.config.repositories.items():
+            if self._git(profile.source, "remote", "get-url", "origin").decode().strip() != profile.origin:
+                raise GateFailure("discovery_origin_changed")
+            if self._git(profile.source, "status", "--porcelain", "--untracked-files=all").strip():
+                raise GateFailure("registered_source_not_clean")
+            preflight_snapshots[alias] = snapshot(profile.source)
             raw = self._git(profile.source, "ls-files").decode("utf-8").splitlines()
             inventories[alias] = [name for name in raw if allowed_name(name, profile)]
-        initial = self.completion(json.dumps({"request": job["text"], "previous_answer": job["previous"],
-            "repositories": inventories, "response_schema": {"repository": "registered alias", "allowed_files":
-                ["up to 12 exact source/test/doc paths"], "semantic_scope": "bounded repair and acceptance requirements"},
-            "instruction": "Select only an Ephy implementation repair. Do not change governance, secrets, repair controller, "
-                "Discord authorization, release settings or unrelated code. Select concrete existing files; new files only "
-                "under registered prefixes. semantic_scope must be a short public-safe implementation summary, never "
-                "a quotation of the original directive or private context. If no bounded justified scope can be fixed, return {}."}, ensure_ascii=False), runtime)
+        initial = self.select_scope(job, templates, inventories, directory)
         if (set(initial) != {"repository", "allowed_files", "semantic_scope"}
                 or initial["repository"] not in self.config.repositories):
             raise GateFailure("contract_incomplete:discovery_scope")
@@ -589,6 +759,8 @@ class LocalDiscovery:
             raise GateFailure("registered_source_not_clean")
         base = self._git(profile.source, "rev-parse", "HEAD").decode().strip()
         original_snapshot = snapshot(profile.source)
+        if original_snapshot != preflight_snapshots[alias]:
+            raise GateFailure("discovery_source_changed")
         preserve_collection_scope(names, original_snapshot)
         sources = {}
         for name in names:
@@ -600,7 +772,7 @@ class LocalDiscovery:
             raise GateFailure("contract_incomplete:discovery_context_too_large")
         subjects = {name: registered_test_subjects(text, sources) for name, text in sources.items()
             if name.startswith("tests/") and text is not None}
-        prepared = self.completion(json.dumps({"request": job["text"], "scope": initial, "source": sources,
+        prepared = self.ask(json.dumps({"request": job["text"], "scope": initial, "source": sources,
             "approved_subject_calls_by_test_file": subjects,
             "response_schema": {"checker_python": "standalone Python checker; argv[1] candidate root; nonzero on wrong behavior",
                 "known_good": {"scoped/path": [{"old": "exact unique original substring", "new": "replacement"},
@@ -626,7 +798,7 @@ class LocalDiscovery:
                 "Edits are expanded by the trusted controller against the supplied original files; each old string must "
                 "occur exactly once at that step. Each control is based on the original source independently. "
                 "Checker may use standard libraries and offline installed project dependencies."},
-            ensure_ascii=False), template["runtime"])
+            ensure_ascii=False), template["runtime"], directory, "controls")
         if set(prepared) != {"checker_python", "known_good", "wrong_answer"}:
             raise GateFailure("contract_incomplete:checker")
         code = prepared["checker_python"]

@@ -6,7 +6,6 @@ import json
 import os
 import subprocess
 import sys
-import threading
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -427,24 +426,19 @@ async def test_drain_watch_acknowledges_only_current_nonce(tmp_path):
 @pytest.mark.asyncio
 async def test_request_waiting_for_ledger_is_not_admitted_after_drain_marker(tmp_path, monkeypatch):
     bridge, gateway, event = bridge_fixture(tmp_path)
-    event = replace(event, user_id=533693210879459338)
-    started, finish = threading.Event(), threading.Event()
+    event = replace(event, user_id=533693210879459338, content="<@10> 公開の質問")
     def previous(_):
-        started.set()
-        assert finish.wait(5)
+        (bridge.settings.state_dir / "repair-drain").write_text("drain-after-await")
     monkeypatch.setattr(bridge.ledger, "previous", previous)
     sent = []
     async def send(text):
         sent.append(text)
-    handler = asyncio.create_task(bridge.handle(event, send))
-    assert await asyncio.to_thread(started.wait, 5)
-    (bridge.settings.state_dir / "repair-drain").write_text("drain-after-await")
-    finish.set()
-    await handler
+    await bridge.handle(event, send)
     assert gateway.classifications == [] and gateway.answers == [] and sent == []
     assert bridge.repairs.next() is None
     state = json.loads((bridge.settings.state_dir / "repair-active.json").read_text())
     assert state["active"] == 0 and state["drain_token"] == "drain-after-await"
+    assert bridge.ledger.inbox_pending()
 
 
 @pytest.mark.asyncio
@@ -714,16 +708,15 @@ async def test_review_revision_owner_intake_crash_replays_without_losing_or_dupl
 async def test_review_revision_concurrent_owner_delivery_enqueues_one_durable_job_before_claim(tmp_path):
     first, _, event = bridge_fixture(tmp_path)
     second, _, _ = bridge_fixture(tmp_path)
-    ready = asyncio.Event()
+    ready, finish = asyncio.Event(), asyncio.Event()
     classifiers = []
     claims = []
     sent = []
 
     async def classify(text, previous):
         classifiers.append((text, previous))
-        if len(classifiers) == 2:
-            ready.set()
-        await ready.wait()
+        ready.set()
+        await finish.wait()
         return True
 
     def guarded_claim(bridge):
@@ -741,10 +734,14 @@ async def test_review_revision_concurrent_owner_delivery_enqueues_one_durable_jo
     async def send(text):
         sent.append(text)
         return len(sent) + 1000
-    await asyncio.wait_for(asyncio.gather(first.handle(event, send), second.handle(event, send)), 10)
+    handler = asyncio.create_task(first.handle(event, send))
+    await asyncio.wait_for(ready.wait(), 10)
+    await second.handle(event, send)
+    finish.set()
+    await asyncio.wait_for(handler, 10)
     with first.repairs.db() as db:
         assert db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 1
-    assert len(classifiers) == 2 and sorted(claims) == [False, True]
+    assert len(classifiers) == 1 and claims == [True]
     assert sum("修正依頼として" in text for text in sent) == 1
     assert first.ledger.seen(event.message_id) and first.inflight == second.inflight == 0
 
@@ -1192,3 +1189,288 @@ def test_review_v13_actual_prepare_emits_new_collection_guard(tmp_path, monkeypa
     with pytest.raises(GateFailure, match="fixture_emitted_collection_guard_checked"):
         discovery.prepare({"text": "synthetic repair", "previous": None}, tmp_path / "discovery")
     assert observed == ["tests/conftest.py", "src/ephy_worker/test_alias.py"]
+
+
+def _discovery_queue_scope_fixture(tmp_path):
+    source = tmp_path / "source"
+    names = ["src/ephy_worker/search.py", "tests/test_search.py"]
+    for name, text in zip(names, ("def search(query):\n    return query\n", "def test_search():\n    assert 1 == 1\n"), strict=True):
+        path = source / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    profile = SimpleNamespace(source=source, allowed_prefixes=("src/", "tests/"))
+    discovery = LocalDiscovery(SimpleNamespace(repositories={"ephy-worker": profile}))
+    selected = {"repository": "ephy-worker", "allowed_files": list(names), "semantic_scope": "Improve search behavior"}
+    return discovery, {"ephy-worker": {"runtime": {}}}, {"ephy-worker": names}, selected
+
+
+def test_discovery_queue_empty_then_read_more_then_real_code_selection(tmp_path, monkeypatch):
+    discovery, templates, inventories, selected = _discovery_queue_scope_fixture(tmp_path)
+    responses = iter([{}, {"read_more": {"ephy-worker": [inventories["ephy-worker"][0]]}}, selected])
+    prompts = []
+    def complete(prompt, _runtime):
+        prompts.append(json.loads(prompt))
+        return next(responses)
+    monkeypatch.setattr(discovery, "completion", complete)
+    directory = tmp_path / "private-diagnostics"
+    assert discovery.select_scope({"text": "Improve search", "previous": None}, templates, inventories, directory) == selected
+    assert "def search(query)" in prompts[0]["code_context"]["ephy-worker"][inventories["ephy-worker"][0]]["text"]
+    assert prompts[1]["previous_selection_error"] == "discovery_scope_empty_or_invalid"
+    assert prompts[2]["previous_selection_error"] == "discovery_read_more_requested"
+    assert json.loads((directory / "scope-attempt-1.response.json").read_text()) == {}
+    assert (directory / "scope-attempt-2.validation.json").is_file()
+
+
+def test_discovery_queue_malformed_selection_retries_and_context_is_bounded(tmp_path, monkeypatch):
+    discovery, templates, inventories, selected = _discovery_queue_scope_fixture(tmp_path)
+    for index in range(12):
+        name = f"src/ephy_worker/search_{index}.py"
+        (discovery.config.repositories["ephy-worker"].source / name).write_text("# search\n" * 9000, encoding="utf-8")
+        inventories["ephy-worker"].append(name)
+    prompts = []
+    def complete(prompt, _runtime):
+        prompts.append(json.loads(prompt))
+        if len(prompts) == 1:
+            raise ValueError("fixture malformed JSON")
+        if len(prompts) == 2:
+            return {}
+        return selected
+    monkeypatch.setattr(discovery, "completion", complete)
+    directory = tmp_path / "private"
+    assert discovery.select_scope({"text": "search", "previous": None}, templates, inventories, directory) == selected
+    assert len(prompts) == 3
+    assert all(len(json.dumps(prompt["code_context"], ensure_ascii=False).encode()) <= 24000 for prompt in prompts)
+    assert json.loads((directory / "scope-attempt-1.error.json").read_text())["type"] == "ValueError"
+
+
+def test_discovery_queue_exhaustion_retains_responses_and_public_explanation(tmp_path, monkeypatch):
+    from ephy_worker.formal_artifacts import GateFailure
+    discovery, templates, inventories, _ = _discovery_queue_scope_fixture(tmp_path)
+    monkeypatch.setattr(discovery, "completion", lambda *_: {})
+    directory = tmp_path / "private"
+    with pytest.raises(GateFailure, match="discovery_scope_exhausted"):
+        discovery.select_scope({"text": "fixture private directive", "previous": "fixture previous"}, templates, inventories, directory)
+    assert len(list(directory.glob("*.response.json"))) == len(list(directory.glob("*.validation.json"))) == 3
+    def fail(*_):
+        raise GateFailure("discovery_scope_exhausted")
+    config = SimpleNamespace(state_dir=tmp_path / "state", guild_id=11, channel_ids=(20,))
+    controller = RepairController(config, discovery=SimpleNamespace(prepare=fail), release=SimpleNamespace())
+    identifier = controller.store.enqueue(**directive())
+    assert controller.tick() and controller.store.get(identifier)["stage"] == "failed"
+    reply = "".join(row["text"] for row in controller.store.pending(guild_id=11, channel_ids=(20,)))
+    assert "変更するファイルとテストを特定できません" in reply and "具体的" in reply
+    assert "fixture private directive" not in reply and "fixture previous" not in reply
+
+
+@pytest.mark.asyncio
+async def test_discovery_queue_owner_retryable_exception_keeps_fifo_head(tmp_path):
+    bridge, gateway, original = bridge_fixture(tmp_path)
+    event = replace(original, content="<@10> 回答の表示を修正して")
+    attempts = 0
+    async def classify(text, previous):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("fixture transient transport failure")
+        return True
+    gateway.classify_repair = classify
+    sent = []
+    async def send(text):
+        sent.append(text)
+    await bridge.handle(event, send)
+    assert bridge.ledger.inbox_pending() and bridge.repairs.next() is None
+    async def recovered(_row, text):
+        sent.append(text)
+    await bridge.recover_intakes(recovered)
+    await bridge.recover_intakes(recovered)
+    assert attempts == 2 and bridge.repairs.next() is not None and not bridge.ledger.inbox_pending()
+    with bridge.repairs.db() as db:
+        assert db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 1
+    assert sent.count(RECEIPT) == 1
+
+
+def test_context_review_unseen_selection_requires_code_and_next_round_confirmation(tmp_path, monkeypatch):
+    discovery, templates, inventories, _ = _discovery_queue_scope_fixture(tmp_path)
+    source = discovery.config.repositories["ephy-worker"].source
+    for index in range(6):
+        name = f"src/ephy_worker/search_ranked_{index}.py"
+        (source / name).write_text("# search\n" * 1000, encoding="utf-8")
+        inventories["ephy-worker"].append(name)
+    unseen = "src/ephy_worker/z_feature.py"
+    (source / unseen).write_text("def unseen_answer():\n    return 42\n", encoding="utf-8")
+    inventories["ephy-worker"].append(unseen)
+    selected = {"repository": "ephy-worker", "allowed_files": [unseen, "tests/test_search.py"],
+        "semantic_scope": "Improve answer behavior"}
+    prompts = []
+    def complete(prompt, _runtime):
+        prompts.append(json.loads(prompt))
+        return selected
+    monkeypatch.setattr(discovery, "completion", complete)
+    assert discovery.select_scope({"text": "search", "previous": None}, templates, inventories, tmp_path / "private") == selected
+    assert len(prompts) == 2 and unseen not in prompts[0]["code_context"]["ephy-worker"]
+    assert "def unseen_answer()" in prompts[1]["code_context"]["ephy-worker"][unseen]["text"]
+    assert "tests/test_search.py" in prompts[1]["code_context"]["ephy-worker"]
+    assert prompts[1]["previous_selection_error"] == "discovery_scope_confirmation_required"
+    assert len(json.dumps(prompts[0]["code_context"], ensure_ascii=False).encode("utf-8")) <= 12000
+
+
+def test_context_review_four_multibyte_read_more_excerpts_survive_next_prompts(tmp_path, monkeypatch):
+    discovery, templates, inventories, selected = _discovery_queue_scope_fixture(tmp_path)
+    source = discovery.config.repositories["ephy-worker"].source
+    requested = []
+    for index in range(4):
+        name = f"src/ephy_worker/read_extra_{index}.py"
+        (source / name).write_text("# 日本語\n" + "日" * 8000, encoding="utf-8")
+        inventories["ephy-worker"].append(name)
+        requested.append(name)
+    for index in range(4):
+        name = f"src/ephy_worker/z_later_{index}.py"
+        (source / name).write_text("# additional context\n" * 1000, encoding="utf-8")
+        inventories["ephy-worker"].append(name)
+    responses = iter([{"read_more": {"ephy-worker": requested}}, {}, selected])
+    prompts = []
+    def complete(prompt, _runtime):
+        prompts.append(json.loads(prompt))
+        return next(responses)
+    monkeypatch.setattr(discovery, "completion", complete)
+    assert discovery.select_scope({"text": "search", "previous": None}, templates, inventories, tmp_path / "private") == selected
+    for name in requested:
+        second = prompts[1]["code_context"]["ephy-worker"][name]
+        assert second == prompts[2]["code_context"]["ephy-worker"][name]
+        assert second["truncated"] is True and second["utf8_bytes"] == len(second["text"].encode("utf-8"))
+        assert second["text"] and "日本語" in second["text"]
+    assert all(len(json.dumps(prompt["code_context"], ensure_ascii=False).encode("utf-8")) <= 24000 for prompt in prompts)
+
+
+def test_context_review_oversized_read_more_is_atomic_and_preserves_accepted_context(tmp_path, monkeypatch):
+    from ephy_worker.formal_artifacts import GateFailure
+    discovery, templates, inventories, _ = _discovery_queue_scope_fixture(tmp_path)
+    source = discovery.config.repositories["ephy-worker"].source
+    for index in range(6):
+        name = f"src/ephy_worker/search_ranked_{index}.py"
+        (source / name).write_text("# search\n" * 1000, encoding="utf-8")
+        inventories["ephy-worker"].append(name)
+    groups = []
+    for group in ("first", "second"):
+        names = []
+        for index in range(4):
+            name = f"src/ephy_worker/z_{group}_{index}.py"
+            (source / name).write_text("# 日本語\n" + "日" * 8000, encoding="utf-8")
+            inventories["ephy-worker"].append(name)
+            names.append(name)
+        groups.append(names)
+    responses = iter([{"read_more": {"ephy-worker": groups[0]}}, {"read_more": {"ephy-worker": groups[1]}}, {}])
+    prompts = []
+    def complete(prompt, _runtime):
+        prompts.append(json.loads(prompt))
+        return next(responses)
+    monkeypatch.setattr(discovery, "completion", complete)
+    directory = tmp_path / "private"
+    with pytest.raises(GateFailure, match="discovery_scope_exhausted"):
+        discovery.select_scope({"text": "search", "previous": None}, templates, inventories, directory)
+    assert prompts[2]["previous_selection_error"] == "discovery_context_request_too_large"
+    assert prompts[1]["code_context"] == prompts[2]["code_context"]
+    assert all(name in prompts[2]["code_context"]["ephy-worker"] for name in groups[0])
+    assert all(name not in prompts[2]["code_context"]["ephy-worker"] for name in groups[1])
+    assert json.loads((directory / "scope-attempt-2.validation.json").read_text())["error"] == "discovery_context_request_too_large"
+
+
+@pytest.mark.parametrize("content,valid", [('{"selected":true}', True),
+    ('```json\n{"selected":true}\n```', False), ('{"selected":true,"selected":false}', False)])
+def test_discovery_json_http_request_format_and_strict_raw_evidence(tmp_path, monkeypatch, content, valid):
+    identity = tmp_path / "identity.json"
+    identity.write_text(json.dumps({"context": 32768, "model_id": "fixture-model"}), encoding="utf-8")
+    monkeypatch.setitem(sys.modules, "ephy_worker.existing_llama_runtime", SimpleNamespace(verify_identity=lambda _: None))
+    calls = []
+    def handler(request):
+        body = json.loads(request.content)
+        calls.append((request.url.path, body))
+        if request.url.path == "/apply-template":
+            return httpx.Response(200, json={"prompt": "fixture formatted prompt"})
+        if request.url.path == "/tokenize":
+            return httpx.Response(200, json={"tokens": [1, 2, 3]})
+        assert request.url.path == "/v1/chat/completions"
+        assert body["response_format"] == {"type": "json_object"}
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": content}}]})
+    actual_client = httpx.Client
+    monkeypatch.setattr("ephy_worker.owner_repair_discovery.httpx.Client", lambda **kwargs:
+        actual_client(transport=httpx.MockTransport(handler), **kwargs))
+    discovery = LocalDiscovery(SimpleNamespace())
+    runtime = {"models_ini": str(identity), "base_url": "http://127.0.0.1:18080"}
+    directory = tmp_path / "private"
+    if valid:
+        assert discovery.ask("fixture scope", runtime, directory, "scope") == {"selected": True}
+    else:
+        with pytest.raises(ValueError):
+            discovery.ask("fixture scope", runtime, directory, "scope")
+        assert (directory / "scope.error.json").is_file()
+    raw = json.loads((directory / "scope.raw.json").read_bytes())
+    assert raw["choices"][0]["message"]["content"] == content
+    assert calls[-1][1]["messages"] == calls[0][1]["messages"]
+    assert calls[-1][1]["max_tokens"] == 4096 and calls[-1][1]["stream"] is False
+
+
+@pytest.mark.parametrize("fault,expected", [("origin", "discovery_origin_changed"),
+    ("dirty", "registered_source_not_clean"), ("snapshot", "fixture unsafe snapshot")])
+def test_preflight_review_all_registered_sources_checked_before_scope(tmp_path, monkeypatch, fault, expected):
+    from ephy_worker.formal_artifacts import GateFailure, file_hash, write_json
+
+    profiles = {}
+    for alias in ("ephy-worker", "ephy-runtime"):
+        source = tmp_path / alias
+        source.mkdir()
+        template = tmp_path / (alias + ".json")
+        write_json(template, {"runtime": {}})
+        profiles[alias] = SimpleNamespace(source=source, formal_template=template,
+            formal_template_sha256=file_hash(template), allowed_prefixes=("src/",),
+            origin="https://github.com/kirimine170/" + alias + ".git")
+    discovery = LocalDiscovery(SimpleNamespace(repositories=profiles))
+    checked = []
+    def git(root, *args):
+        alias = root.name
+        checked.append((alias, args[0]))
+        if args[0] == "remote":
+            return ("https://example.invalid/replacement.git" if alias == "ephy-runtime" and fault == "origin"
+                else profiles[alias].origin).encode()
+        if args[0] == "status":
+            return b" M src/feature.py" if alias == "ephy-runtime" and fault == "dirty" else b""
+        assert args == ("ls-files",)
+        return b"src/feature.py\n"
+    def safe_snapshot(root):
+        checked.append((root.name, "snapshot"))
+        if root.name == "ephy-runtime" and fault == "snapshot":
+            raise GateFailure("fixture unsafe snapshot")
+        return {}
+    def unexpected(*_):
+        pytest.fail("scope selection/inference ran before registered-source preflight")
+    monkeypatch.setattr(discovery, "_git", git)
+    monkeypatch.setattr("ephy_worker.owner_repair_discovery.snapshot", safe_snapshot)
+    monkeypatch.setattr(discovery, "select_scope", unexpected)
+    monkeypatch.setattr(discovery, "completion", unexpected)
+    with pytest.raises(GateFailure, match=expected):
+        discovery.prepare({"text": "Improve fixture feature", "previous": None}, tmp_path / "private")
+    assert ("ephy-worker", "snapshot") in checked and ("ephy-runtime", "remote") in checked
+
+
+def test_preflight_review_direct_scope_rejects_linked_parent_before_read_or_inference(tmp_path, monkeypatch):
+    from ephy_worker.formal_artifacts import GateFailure
+
+    source = tmp_path / "source"
+    (source / "src").mkdir(parents=True)
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    (replacement / "feature.py").write_text("def fixture_replacement():\n    return 42\n", encoding="utf-8")
+    link = source / "src/ephy_worker"
+    if os.name == "nt":
+        subprocess.run(["cmd.exe", "/c", "mklink", "/J", str(link), str(replacement)],
+            capture_output=True, check=True, timeout=10)
+    else:
+        link.symlink_to(replacement, target_is_directory=True)
+    profile = SimpleNamespace(source=source, allowed_prefixes=("src/",))
+    discovery = LocalDiscovery(SimpleNamespace(repositories={"ephy-worker": profile}))
+    def unexpected(*_):
+        pytest.fail("linked replacement reached inference")
+    monkeypatch.setattr(discovery, "completion", unexpected)
+    with pytest.raises(GateFailure, match="Link/reparse point prohibited"):
+        discovery.select_scope({"text": "Improve fixture feature", "previous": None},
+            {"ephy-worker": {"runtime": {}}}, {"ephy-worker": ["src/ephy_worker/feature.py"]}, tmp_path / "private")
